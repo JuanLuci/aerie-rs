@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <title>Aerie</title>
+  <rect width="512" height="512" rx="112" fill="#EAF3FA"/>
+  <path d="M372 120 C440 222 344 344 196 362 C178 262 252 150 372 120 Z" fill="#2F6FA3"/>
+  <path d="M426 194 L338 240" stroke="#EAF3FA" stroke-width="14" stroke-linecap="round"/>
+  <path d="M166 270 L250 258" stroke="#EAF3FA" stroke-width="14" stroke-linecap="round"/>
+  <path d="M150 406 L356 146" stroke="#16324F" stroke-width="16" stroke-linecap="round"/>
+</svg>

@@ -1,0 +1,14 @@
+/target
+# Never commit decompiled code, captured game data or game files.
+*.class
+*.jar
+Assets.zip
+
+# A server login. Never commit it.
+aerie-account.json
+
+# The world a test server saves (changed blocks).
+aerie-world/
+
+# Tables generated from your own copy of the game (tools/gen.py).
+/gen/

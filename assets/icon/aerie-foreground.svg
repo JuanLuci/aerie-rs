@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="432" height="432" viewBox="-80 -80 672 672">
+  <!-- Android adaptive icon foreground: the feather alone, inside the 66% safe zone.
+       Background layer is the flat colour #EAF3FA. -->
+  <path d="M372 120 C440 222 344 344 196 362 C178 262 252 150 372 120 Z" fill="#2F6FA3"/>
+  <path d="M426 194 L338 240" stroke="#EAF3FA" stroke-width="14" stroke-linecap="round"/>
+  <path d="M166 270 L250 258" stroke="#EAF3FA" stroke-width="14" stroke-linecap="round"/>
+  <path d="M150 406 L356 146" stroke="#16324F" stroke-width="16" stroke-linecap="round"/>
+</svg>
