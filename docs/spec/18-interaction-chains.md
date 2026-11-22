@@ -308,6 +308,31 @@ failed) and, after its own logic, jumps to label 0 when it failed.
   their own, not predicted; with labels, hitting nothing fails the step
   when its fail-on rule says so; otherwise the step takes the client's
   state.
+- **Charging** (waits for the client): compiles to itself with one label
+  per charge time and one for failure, a jump to the end, each charge
+  branch in ascending time with its jump, then the failed branch. A failed
+  client state fails the step (failed branch). While the client names
+  more forks per interaction type than the server made, the server forks
+  the root given for that type (one running at a time) and the step is
+  not finished. A charge value of −1 means still holding; −2 ends the
+  step without a branch; any other value ends it and jumps to the branch
+  of the longest charge time not above it (none: straight to the end).
+- **Modify inventory** (instant; the client waits for the server): only
+  in its required game mode, if any. An item to remove is taken from
+  hotbar, storage and backpack, all of it or the step fails. The held
+  stack's quantity is lowered (failing when it has too few; the context
+  then holds what is left) or that many more are given. An item to add
+  is given. The held stack's durability is changed; when that breaks it,
+  it becomes the configured broken item (or nothing for "Empty"), and
+  the owner gets the item-broke line and sound unless it turned into
+  another item.
+- **Change stat** (instant): each listed stat of the entity changes by
+  the amount (a percentage is of the stat's range): add, set, lower to at
+  most, raise to at least — predicted by the entity's client.
+- **Stats condition** (instant): fails unless every listed stat is at
+  least its cost (or, with "less than", below it); a lenient condition
+  also passes on a positive value of a stat that can go negative.
+  Percent costs compare the stat's fill.
 - **Use entity** (instant, waits for the client): the root the target
   entity gives the chain's type is entered; no entity, out of reach or no
   such root: failed.
@@ -384,6 +409,9 @@ on both servers, same answers:
 - using a furnace (recorded chain): identical packets, the window opens;
 - a use chain that never sends its client data: the same first answer and
   the same cancel after the timeout;
+- eating an apple (a made-up client chain: the charge reported after
+  2.6 s): the same states up to the effect step, and the apple taken;
+  from there the effect types are still to do;
 - hotbar swaps: two accepted, one naming the wrong active slot: the same
   cancel and slot correction;
 - another kind of item moved onto the active slot: the same server chain

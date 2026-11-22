@@ -203,6 +203,29 @@ pub enum Kind {
         hit_entity: bool,
         hit_block: bool,
     },
+    /// Held input: ends when the client lets go, and goes to the branch
+    /// of the longest charge time reached.
+    Charging {
+        next: Vec<(f32, i32)>,
+        failed: i32,
+        forks: Vec<(IT, i32)>,
+    },
+    ModifyInventory(Box<p::ModifyInventoryInteraction>),
+    ChangeStat {
+        stats: Vec<(i32, f32)>,
+        percent: bool,
+        behaviour: p::ChangeStatBehaviour,
+        /// On the entity that runs the chain (other targets: not yet).
+        user: bool,
+        ability_cost: bool,
+    },
+    StatsCondition {
+        costs: Vec<(i32, f32)>,
+        less_than: bool,
+        lenient: bool,
+        percent: bool,
+        ability_cost: bool,
+    },
     /// Changes the active hotbar slot: to a fixed slot, or to the chain's
     /// target slot.
     ChangeActiveSlot(i32),
@@ -570,9 +593,29 @@ impl Book {
                 hit_entity: s.hit_entity != NONE || s.hit_entity_rules.is_some(),
                 hit_block: extra.get("HitBlock").is_some(),
             },
-            I::ChargingInteraction(s) => Kind::Other {
-                branches: Self::charged(&s.charged_next, s.failed),
-                block: false,
+            I::ChargingInteraction(s) => {
+                let mut next = s.charged_next.clone().unwrap_or_default();
+                next.sort_by(|a, b| a.0.total_cmp(&b.0));
+                Kind::Charging {
+                    next,
+                    failed: s.failed,
+                    forks: s.forks.clone().unwrap_or_default(),
+                }
+            }
+            I::ModifyInventoryInteraction(s) => Kind::ModifyInventory(s.clone()),
+            I::ChangeStatInteraction(s) if ty == "ChangeStat" => Kind::ChangeStat {
+                stats: s.stat_modifiers.clone().unwrap_or_default(),
+                percent: s.value_type == p::ValueType::PERCENT,
+                behaviour: s.change_stat_behaviour,
+                user: s.entity_target == p::InteractionTarget::USER,
+                ability_cost: s.use_ability_cost,
+            },
+            I::StatsConditionInteraction(s) if ty == "StatsCondition" => Kind::StatsCondition {
+                costs: s.costs.clone().unwrap_or_default(),
+                less_than: s.less_than,
+                lenient: s.lenient,
+                percent: s.value_type == p::ValueType::PERCENT,
+                ability_cost: s.use_ability_cost,
             },
             I::WieldingInteraction(s) => Kind::Other {
                 branches: Self::charged(&s.charged_next, s.failed),
@@ -826,6 +869,22 @@ impl Book {
                     self.compile(x.next, b, depth);
                 }
             }
+            Kind::Charging { next, failed, .. } => {
+                let end = b.unresolved();
+                let labels: Vec<usize> = (0..next.len() + 1).map(|_| b.unresolved()).collect();
+                b.run(i, labels.clone());
+                b.jump(end);
+                for (n, c) in next.iter().enumerate() {
+                    b.resolve(labels[n]);
+                    self.compile(c.1, b, depth);
+                    b.jump(end);
+                }
+                b.resolve(labels[next.len()]);
+                if *failed != NONE {
+                    self.compile(*failed, b, depth);
+                }
+                b.resolve(end);
+            }
             Kind::Other { branches, .. } => match branches {
                 Branches::Plain => self.plain(i, x.next, x.failed, b, depth),
                 Branches::Click(click, held) => self.plain(i, *click, *held, b, depth),
@@ -989,6 +1048,18 @@ pub trait Host {
     fn set_active_slot(&mut self, section: i32, slot: i32);
     /// The entity's active hotbar slot changes.
     fn change_hotbar_slot(&mut self, slot: i32);
+    /// An interaction changes the inventory (items removed and added, the
+    /// held stack's quantity and durability); false when it cannot.
+    fn modify_inventory(&mut self, m: &p::ModifyInventoryInteraction, ctx: &mut Ctx) -> bool;
+    /// Stat changes of an interaction, predicted by the entity's client.
+    fn change_stats(
+        &mut self,
+        stats: &[(i32, f32)],
+        percent: bool,
+        behaviour: p::ChangeStatBehaviour,
+    );
+    /// A stat's value, minimum and maximum.
+    fn stat(&self, index: i32) -> Option<(f32, f32, f32)>;
     /// The inventory move a slot change was waiting for is made now, and
     /// the whole inventory sent.
     fn move_item(&mut self, m: &Move);
@@ -1051,6 +1122,8 @@ struct Entry {
     forked: i32,
     repeats: i32,
     fork: Option<(i32, i32)>,
+    /// Forks made per interaction type (charging).
+    counts: Vec<(IT, i32)>,
 }
 
 impl Entry {
@@ -1238,6 +1311,7 @@ impl Chain {
                 forked: 0,
                 repeats: 0,
                 fork: None,
+                counts: Vec::new(),
             });
             return self.entries.len() - 1;
         }
@@ -1896,6 +1970,13 @@ impl Manager {
     ) -> bool {
         let index = packet.chain_id;
         let cancel = |host: &mut dyn Host| {
+            tracing::debug!(
+                "chain {index} refused at start ({:?}, held {:?}, slots {} {})",
+                packet.interaction_type,
+                packet.item_in_hand_id,
+                packet.active_hotbar_slot,
+                packet.active_utility_slot
+            );
             host.cancel(index, packet.forked_id.clone());
             true
         };
@@ -2632,6 +2713,115 @@ impl Manager {
                     });
                     s.placed_block_id = id;
                     s.block_rotation = Some(rot);
+                }
+            }
+            Kind::Charging { next, forks, .. } => {
+                let Some(c) = client else { return };
+                if c.state == St::FAILED && !labels.is_empty() {
+                    set(chain, St::FAILED);
+                    if let Some(l) = labels.get(next.len()) {
+                        chain.counter = *l as usize;
+                    }
+                    return;
+                }
+                if let Some(wanted) = c.fork_counts.as_ref().filter(|_| !forks.is_empty()) {
+                    let mut running = chain.entries[e].fork.filter(|k| {
+                        chain
+                            .forks
+                            .iter()
+                            .any(|f| f.0 == *k && f.1.server_state == St::NOT_FINISHED)
+                    });
+                    let mut matches = true;
+                    for &(ty, want) in wanted {
+                        let mut made = chain.entries[e]
+                            .counts
+                            .iter()
+                            .find(|x| x.0 == ty)
+                            .map_or(0, |x| x.1);
+                        if running.is_none()
+                            && made < want
+                            && let Some(root) = forks.iter().find(|f| f.0 == ty).map(|f| f.1)
+                        {
+                            let key = Self::fork(chain, e, ty, chain.ctx.clone(), root, true, None);
+                            running = Some(key);
+                            chain.entries[e].fork = Some(key);
+                            made += 1;
+                            chain.entries[e].counts.retain(|x| x.0 != ty);
+                            chain.entries[e].counts.push((ty, made));
+                        }
+                        matches &= made == want;
+                    }
+                    if !matches {
+                        return set(chain, St::NOT_FINISHED);
+                    }
+                }
+                if c.charge_value == -1.0 {
+                    set(chain, St::NOT_FINISHED);
+                } else {
+                    set(chain, St::FINISHED);
+                    if c.charge_value != -2.0 {
+                        // The longest charge time reached.
+                        let reached = next.iter().rposition(|k| c.charge_value >= k.0);
+                        if let Some(l) = reached.and_then(|n| labels.get(n)) {
+                            chain.counter = *l as usize;
+                        }
+                    }
+                }
+            }
+            Kind::ModifyInventory(m) => {
+                if first {
+                    if !host.modify_inventory(m, &mut chain.ctx) {
+                        set(chain, St::FAILED);
+                    }
+                    tail(chain);
+                }
+            }
+            Kind::ChangeStat {
+                stats,
+                percent,
+                behaviour,
+                user,
+                ability_cost,
+            } => {
+                if first {
+                    if *user && !*ability_cost {
+                        host.change_stats(stats, *percent, *behaviour);
+                    }
+                    tail(chain);
+                }
+            }
+            Kind::StatsCondition {
+                costs,
+                less_than,
+                lenient,
+                percent,
+                ability_cost,
+            } => {
+                if first {
+                    let afford = *ability_cost
+                        || costs.iter().all(|&(i, cost)| {
+                            let Some((value, min, max)) = host.stat(i) else {
+                                return false;
+                            };
+                            let v = if *percent {
+                                if max > min {
+                                    (value - min) / (max - min) * 100.0
+                                } else {
+                                    0.0
+                                }
+                            } else {
+                                value
+                            };
+                            if *less_than {
+                                v < cost
+                            } else {
+                                v >= cost || (*lenient && v > 0.0 && min < 0.0)
+                            }
+                        });
+                    if !afford {
+                        set(chain, St::FAILED);
+                    }
+                    tail(chain);
                 }
             }
             Kind::ChangeActiveSlot(target) => {

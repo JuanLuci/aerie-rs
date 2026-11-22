@@ -678,6 +678,13 @@ impl Hub {
         e.inv.set(inventory::HOTBAR, slot, Some(worn.clone()));
         e.inv_dirty.insert(inventory::HOTBAR);
         if worn.broken() && !st.broken() {
+            self.tell_broken(player, st, out);
+        }
+    }
+
+    /// An item just broke: the chat line and the sound its owner gets.
+    fn tell_broken(&self, player: i32, st: &Stack, out: &mut Outgoing) {
+        {
             let name = proto::FormattedMessage {
                 message_id: Some(self.book.item_name(&st.item)),
                 ..Default::default()
@@ -3268,9 +3275,6 @@ impl Hub {
         let (m, _) = proto::SyncInteractionChains::decode(payload, 0)?;
         if !self.chains.roots.is_empty() {
             // Chains run on the server (spec 18): queued for the tick.
-            for c in &m.updates {
-                self.consume_step(_player, c)?;
-            }
             self.world_step(|hub, g, ground, out| {
                 let Some(mut manager) = g
                     .players
@@ -4635,6 +4639,138 @@ impl crate::chains::Host for ChainHost<'_> {
         {
             e.hotbar_slot = slot;
         }
+    }
+
+    fn modify_inventory(
+        &mut self,
+        m: &proto::ModifyInventoryInteraction,
+        ctx: &mut crate::chains::Ctx,
+    ) -> bool {
+        let Some(e) = self.g.players.get_mut(&self.pid) else {
+            return false;
+        };
+        if m.required_game_mode
+            .is_some_and(|g| (g == proto::GameMode::CREATIVE) != e.creative)
+        {
+            return true;
+        }
+
+        let book = &self.hub.book;
+        let add = |e: &mut Entry, item: &str, n: i32| {
+            let st = book.stack(item, n);
+            let max = book.max_stack(item);
+            e.inv.add(&st, max);
+        };
+        let before = e.inv.clone();
+        let mut ok = true;
+        'run: {
+            // An item taken from the hotbar, storage or backpack: all of
+            // it or nothing.
+            if let Some(r) = &m.item_to_remove {
+                let have: i32 = e
+                    .inv
+                    .all()
+                    .iter()
+                    .filter(|(i, _)| *i == r.item_id)
+                    .map(|(_, n)| *n)
+                    .sum();
+                if have < r.quantity
+                    || e.inv
+                        .take_units(|i| (i == r.item_id).then_some(1), r.quantity)
+                        > 0
+                {
+                    ok = false;
+                    break 'run;
+                }
+            }
+            let held = e
+                .inv
+                .get(ctx.section, ctx.slot)
+                .filter(|s| ctx.held.as_deref() == Some(s.item.as_str()));
+            if let Some(h) = &held {
+                let n = m.adjust_held_item_quantity;
+                if n < 0 {
+                    if h.n < -n {
+                        ok = false;
+                        break 'run;
+                    }
+                    let left = (h.n + n > 0).then(|| h.with_n(h.n + n));
+                    ctx.held = left.as_ref().map(|s| s.item.clone());
+                    e.inv.set(ctx.section, ctx.slot, left);
+                } else if n > 0 {
+                    add(e, &h.item, n);
+                }
+            }
+            if let Some(a) = &m.item_to_add {
+                add(e, &a.item_id, a.quantity);
+            }
+            if m.adjust_held_item_durability != 0.0
+                && let Some(h) = e
+                    .inv
+                    .get(ctx.section, ctx.slot)
+                    .filter(|s| ctx.held.as_deref() == Some(s.item.as_str()))
+            {
+                let mut new = Some(h.worn(m.adjust_held_item_durability));
+                let just_broke = new.as_ref().is_some_and(Stack::broken) && !h.broken();
+                let transforms = m.broken_item.as_ref().is_some_and(|b| *b != h.item);
+                if new.as_ref().is_some_and(Stack::broken)
+                    && let Some(b) = &m.broken_item
+                {
+                    if b == "Empty" {
+                        new = None;
+                    } else if *b != h.item {
+                        new = Some(book.stack(b, 1));
+                    }
+                }
+                ctx.held = new.as_ref().map(|s| s.item.clone());
+                e.inv.set(ctx.section, ctx.slot, new);
+                if just_broke && !transforms {
+                    self.hub.tell_broken(self.pid, &h, self.out);
+                }
+            }
+        }
+        let Some(e) = self.g.players.get_mut(&self.pid) else {
+            return false;
+        };
+        let changed = e.inv.changed_since(&before);
+        e.inv_dirty.extend(changed);
+        ok
+    }
+
+    fn change_stats(
+        &mut self,
+        stats: &[(i32, f32)],
+        percent: bool,
+        behaviour: proto::ChangeStatBehaviour,
+    ) {
+        use crate::stats::Predictable::Own;
+        let types = &self.hub.stat_types;
+        let Some(e) = self.g.players.get_mut(&self.pid) else {
+            return;
+        };
+        for &(i, amount) in stats {
+            let Ok(i) = usize::try_from(i) else { continue };
+            let (Some(cur), Some(max)) = (e.stats.get(i), e.stats.max(i)) else {
+                continue;
+            };
+            let amount = if percent {
+                amount * (max - e.stats.min(i).unwrap_or(0.0)) / 100.0
+            } else {
+                amount
+            };
+            match behaviour {
+                proto::ChangeStatBehaviour::SET => e.stats.set(types, i, amount, Own),
+                proto::ChangeStatBehaviour::MIN => e.stats.set(types, i, cur.min(amount), Own),
+                proto::ChangeStatBehaviour::MAX => e.stats.set(types, i, cur.max(amount), Own),
+                _ => e.stats.add(types, i, amount, Own),
+            };
+        }
+    }
+
+    fn stat(&self, index: i32) -> Option<(f32, f32, f32)> {
+        let e = self.player()?;
+        let i = usize::try_from(index).ok()?;
+        Some((e.stats.get(i)?, e.stats.min(i)?, e.stats.max(i)?))
     }
 
     fn move_item(&mut self, m: &crate::chains::Move) {

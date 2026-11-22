@@ -417,6 +417,10 @@ impl StatMap {
         self.values.get(i).map(|v| v.value)
     }
 
+    pub fn min(&self, i: usize) -> Option<f32> {
+        self.values.get(i).map(|v| v.min)
+    }
+
     pub fn max(&self, i: usize) -> Option<f32> {
         self.values.get(i).map(|v| v.max)
     }
