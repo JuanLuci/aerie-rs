@@ -57,6 +57,36 @@ impl Recorder {
     }
 }
 
+/// The `--after` steps of a sprint (`--sprint N`): a movement packet that
+/// reports sprinting, `N` pauses, one that reports standing. They start 16
+/// pauses in: the official server ignores movement until it takes the
+/// client for ready, which for the probe is its 10 s timeout.
+pub fn sprint_steps(steps: usize, after: Option<String>) -> Result<String> {
+    let movement = |sprinting: bool| -> Result<String> {
+        let mut out = Vec::new();
+        proto::ClientMovement {
+            movement_states: Some(proto::MovementStates {
+                idle: !sprinting,
+                horizontal_idle: !sprinting,
+                sprinting,
+                on_ground: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut out)?;
+        Ok(out.iter().map(|b| format!("{b:02x}")).collect())
+    };
+    let mut s = "wait;".repeat(16);
+    s += &format!("108:{};", movement(true)?);
+    s += &"wait;".repeat(steps);
+    s += &format!("108:{}", movement(false)?);
+    if let Some(a) = after {
+        s += &format!(";{a}");
+    }
+    Ok(s)
+}
+
 /// What the probe does besides listening.
 #[derive(Default)]
 pub struct Options {

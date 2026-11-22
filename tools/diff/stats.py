@@ -7,6 +7,10 @@ and on Aerie and compare; regeneration lines differ only by tick timing.
     aerie-server probe --upstream <server> --capture C --name Prober --listen 16 \
         --chat "$(paste -sd';' tools/diff/stats.txt)"
     python3 tools/diff/stats.py C
+
+A sprint (stamina drain and the regeneration delay after it):
+
+    aerie-server probe --upstream <server> --capture C --name Prober --listen 28 --sprint 3
 """
 import subprocess,os,re,sys
 import pathlib

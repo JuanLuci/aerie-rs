@@ -70,6 +70,18 @@ delay stat is 0 and the player is not sprinting, gliding or blocking;
 mana 1 every 0.3 s; health only for creatures (after 15 s unhurt) and in
 creative.
 
+## Sprinting
+
+Sprinting costs stamina through a rule of the stamina stat itself (0.1
+every 0.1 s while sprinting, never below zero). The server adds one thing:
+in the tick a player stops sprinting (the movement states it reports go
+from sprinting to not), the stat the gameplay configuration names as the
+sprint regeneration delay is set to the configured value (−0.75), unless
+it is already at or below it. This happens before the tick's
+regeneration, so the update the client gets is that value plus the delay
+stat's own first step back toward zero (−0.65). Stamina regenerates again
+once the delay stat is back at zero.
+
 ## Equipment
 
 What an entity wears and holds changes its stats. When its armor, held
@@ -103,6 +115,8 @@ joins.
 
 ## Not done yet
 
+The official server ignores movement packets until it takes the client
+for ready (a join detail, with the players system).
 The interactions a stat runs when it reaches its minimum or maximum, and
 death at no health, need interactions run on the server and the damage
 system. Blocking, damage times and suffocation are never true yet.
@@ -119,4 +133,6 @@ command's change merged with the tick's regeneration, a set followed by
 regeneration, stamina and mana regenerating to full; the same two
 own-entity packets at join; armor put on and taken off: the same
 modifier updates (9, 26, 17 on health) and equipment updates a tick
-later. Differences left: which tick a command lands in.
+later. A sprint of about 2.8 s (`probe --sprint 3 --listen 28`): the same
+28 stamina steps down, the delay set to −0.65, its 7 steps up and stamina
+regenerating after. Differences left: which tick a command lands in.

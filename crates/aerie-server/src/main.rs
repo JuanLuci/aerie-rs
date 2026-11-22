@@ -76,7 +76,10 @@ async fn main() -> Result<()> {
             send: arg(&args, "--send"),
             goto: arg(&args, "--goto"),
             use_block: arg(&args, "--use-block"),
-            after: arg(&args, "--after"),
+            after: match arg(&args, "--sprint").and_then(|s| s.parse().ok()) {
+                Some(steps) => Some(probe::sprint_steps(steps, arg(&args, "--after"))?),
+                None => arg(&args, "--after"),
+            },
             interactions: arg(&args, "--interactions").map(PathBuf::from),
             root_map: arg(&args, "--root-map").map(PathBuf::from),
             listen: arg(&args, "--listen").and_then(|s| s.parse().ok()),

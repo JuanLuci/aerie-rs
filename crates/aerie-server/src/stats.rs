@@ -122,6 +122,9 @@ pub struct Type {
 pub struct Types {
     pub types: Vec<Type>,
     by_key: HashMap<String, usize>,
+    /// The stat set to a (negative) value when a sprint ends, holding
+    /// stamina regeneration back.
+    pub sprint_delay: Option<(usize, f32)>,
 }
 
 fn conds(v: Option<&Value>) -> Vec<Cond> {
@@ -193,6 +196,16 @@ impl Types {
                             regen: Vec::new(),
                         };
                         t.by_key.insert(key.to_owned(), i);
+                    }
+                }
+                Some("D") => {
+                    let v: Vec<&str> = l.split_whitespace().collect();
+                    if let [_, stat, value] = v[..]
+                        && let (Some(i), Ok(v)) = (t.index(stat), value.parse::<f32>())
+                        && i != 0
+                        && v < 0.0
+                    {
+                        t.sprint_delay = Some((i, v));
                     }
                 }
                 Some("R") => {

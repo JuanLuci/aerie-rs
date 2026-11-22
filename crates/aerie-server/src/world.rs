@@ -2951,6 +2951,15 @@ impl Hub {
             e.body = m.body_orientation.clone();
         }
         if let Some(ms) = &m.movement_states {
+            // A sprint that ends holds stamina regeneration back (spec 17).
+            if e.sprinting
+                && !ms.sprinting
+                && let Some((i, v)) = self.stat_types.sprint_delay
+                && e.stats.get(i).is_some_and(|cur| cur > v)
+            {
+                e.stats
+                    .set(&self.stat_types, i, v, crate::stats::Predictable::None);
+            }
             e.sprinting = ms.sprinting;
             e.gliding = ms.gliding;
         }

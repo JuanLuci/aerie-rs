@@ -89,7 +89,8 @@ pub fn build(ctx: &Ctx) -> Result<UpdateEntityStatTypes> {
 /// ignoreInvulnerability` (reset: 0 initial value, 1 max value), and per
 /// `Regenerating` entry, in order, `R index interval amount percentage
 /// clampAtZero <json>`, the JSON holding the entry's `Conditions` and
-/// `Modifiers` as written.
+/// `Modifiers` as written; and `D stat value` for the gameplay config's
+/// `Plugin.Stamina.SprintRegenDelay` (the stat set when a sprint ends).
 pub fn table(ctx: &Ctx) -> Result<String> {
     let store = ctx.store(PATH)?;
     let order = ctx.order(PATH, BUILTIN)?;
@@ -124,6 +125,17 @@ pub fn table(ctx: &Ctx) -> Result<String> {
                 r.bool_or("ClampAtZero", false) as u8,
                 extra,
             );
+        }
+    }
+    if let Ok(gameplay) = ctx.store("GameplayConfigs") {
+        let d = gameplay.resolved("Default", "GameplayConfig");
+        if let Some(s) = d
+            .obj("Plugin")
+            .and_then(|p| p.obj("Stamina"))
+            .and_then(|s| s.obj("SprintRegenDelay"))
+            && let Some(stat) = s.str_at("EntityStatId")
+        {
+            out += &format!("D {stat} {}\n", s.f64_or("Value", 0.0));
         }
     }
     Ok(out)
