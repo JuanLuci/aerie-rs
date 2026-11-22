@@ -2000,6 +2000,266 @@ impl Hub {
         Ok(true)
     }
 
+    /// Whether a door at `at` could stand as its interaction state
+    /// `state`: every cell of that state's shape is free, soft, or the
+    /// door's own.
+    fn door_fits(&self, g: &Inner, ground: &Ground, at: Pos, state: &str) -> bool {
+        use crate::support::World;
+        let view = View {
+            g,
+            ground,
+            hub_rules: &self.rules,
+        };
+        let (block, rot) = view.block(at.0, at.1, at.2);
+        let Some(&(_, variant)) = self
+            .rules
+            .block(block)
+            .and_then(|b| b.states.iter().find(|(n, _)| n == state))
+        else {
+            return false;
+        };
+        self.rules.cells(variant, rot).iter().all(|c| {
+            let p = (at.0 + c[0], at.1 + c[1], at.2 + c[2]);
+            if !(0..crate::support::WORLD_HEIGHT).contains(&p.1) {
+                return false;
+            }
+            let f = unpack_filler(g.fillers.get(&p).copied().unwrap_or(0));
+            if (p.0 - f[0], p.1 - f[1], p.2 - f[2]) == at {
+                return true;
+            }
+            let other = view.block(p.0, p.1, p.2).0;
+            other == 0 || self.rules.block(other).is_some_and(|o| !o.solid)
+        })
+    }
+
+    /// Switches a door to an interaction state: soft blocks where its new
+    /// shape goes break with their drops. The block it becomes.
+    fn switch_door(
+        &self,
+        g: &mut Inner,
+        ground: &Ground,
+        at: Pos,
+        state: &str,
+        out: &mut Outgoing,
+    ) -> Option<i32> {
+        use crate::support::World;
+        let (block, rot) = View {
+            g,
+            ground,
+            hub_rules: &self.rules,
+        }
+        .block(at.0, at.1, at.2);
+        let &(_, variant) = self
+            .rules
+            .block(block)?
+            .states
+            .iter()
+            .find(|(n, _)| n == state)?;
+        for c in self.rules.cells(variant, rot) {
+            if c == [0, 0, 0] {
+                continue;
+            }
+            let p = (at.0 + c[0], at.1 + c[1], at.2 + c[2]);
+            let f = unpack_filler(g.fillers.get(&p).copied().unwrap_or(0));
+            if (p.0 - f[0], p.1 - f[1], p.2 - f[2]) == at {
+                continue;
+            }
+            let other = View {
+                g,
+                ground,
+                hub_rules: &self.rules,
+            }
+            .block(p.0, p.1, p.2)
+            .0;
+            let Some(o) = self.rules.block(other).filter(|o| other != 0 && !o.solid) else {
+                continue;
+            };
+            let drop = o.physics_drop.clone().or_else(|| o.soft_drop.clone());
+            let drops = drop.map_or((None, None, 1), |d| (d.item, d.list, 1));
+            self.break_with(g, ground, p, Some(drops), true, false, out);
+        }
+        self.set_block_state(g, ground, at, state, out);
+        Some(variant)
+    }
+
+    /// A door's state from its block's interaction state: 0 closed, 1
+    /// opened in, 2 opened out.
+    fn door_state(&self, block: i32) -> i8 {
+        match self.rules.state_of(block) {
+            "OpenDoorOut" => 1,
+            "OpenDoorIn" => 2,
+            _ => 0,
+        }
+    }
+
+    /// The interaction state a door switches to, going from one state to
+    /// another.
+    fn door_switch(from: i8, to: i8) -> &'static str {
+        match (to, from) {
+            (0, 1) => "CloseDoorOut",
+            (0, 2) => "CloseDoorIn",
+            (1, _) => "OpenDoorOut",
+            _ => "OpenDoorIn",
+        }
+    }
+
+    /// The door that makes a double door with the one at `at`: next to
+    /// it on its hinge-far side, the same kind of door turned the other
+    /// way, in the state asked for. Its position, block and state.
+    fn double_door(
+        &self,
+        g: &Inner,
+        ground: &Ground,
+        at: Pos,
+        block: i32,
+        rot: i32,
+        state: i8,
+    ) -> Option<(Pos, i32, i8)> {
+        use crate::support::World;
+        let base = self.rules.base(block)?;
+        let shape = *self.blocks.get(&base.key.to_lowercase())?;
+        let width = self.rules.cells(shape, 0).iter().map(|c| c[0]).max()? + 1;
+        let off = width * 2 - 1;
+        let yaw = rot % 4;
+        // The offset turned by the door's yaw (counter-clockwise).
+        let (dx, dz) = match yaw {
+            0 => (off, 0),
+            1 => (0, -off),
+            2 => (-off, 0),
+            _ => (0, off),
+        };
+        let p = (at.0 + dx, at.1, at.2 + dz);
+        let (other, other_rot) = View {
+            g,
+            ground,
+            hub_rules: &self.rules,
+        }
+        .block(p.0, p.1, p.2);
+        let other_base = self.rules.base(other)?;
+        other_base.door?;
+        if other_rot % 4 != (yaw + 2) % 4
+            || self.door_state(other) != state
+            || g.fillers.get(&p).copied().unwrap_or(0) != 0
+            || other_base.hitbox != base.hitbox
+        {
+            return None;
+        }
+        Some((p, other, self.door_state(other)))
+    }
+
+    /// A player uses a door (spec 22). False when it cannot move.
+    fn use_door(
+        &self,
+        g: &mut Inner,
+        ground: &Ground,
+        out: &mut Outgoing,
+        pid: i32,
+        at: Pos,
+        horizontal: bool,
+    ) -> bool {
+        use crate::support::World;
+        let (block, rot) = View {
+            g,
+            ground,
+            hub_rules: &self.rules,
+        }
+        .block(at.0, at.1, at.2);
+        let state = self.door_state(block);
+        let opposite = |s: i8| match s {
+            1 => 2,
+            2 => 1,
+            s => s,
+        };
+        let yaw = (rot % 4) as f64 * std::f64::consts::FRAC_PI_2;
+        let wanted = if state != 0 {
+            0
+        } else {
+            // Opens away from the player: out when the player stands in
+            // front of it.
+            let in_front = g
+                .players
+                .get(&pid)
+                .and_then(|e| e.position.as_ref())
+                .is_some_and(|p| {
+                    let d = [p.x - (at.0 as f64 + 0.5), p.z - (at.2 as f64 + 0.5)];
+                    d[0] * yaw.sin() + d[1] * yaw.cos() < 0.0
+                });
+            if !horizontal && in_front { 2 } else { 1 }
+        };
+        // The way asked for, else the other way, with the second door of
+        // a double door able to follow; else the door shows itself
+        // blocked.
+        let partner = self
+            .double_door(g, ground, at, block, rot, state)
+            .map(|d| d.0);
+        let way = Self::door_switch(state, wanted);
+        let other_way = Self::door_switch(state, opposite(wanted));
+        let fits = |p: Pos, s: &str| self.door_fits(g, ground, p, s);
+        let chosen = if fits(at, way) {
+            if horizontal || partner.is_none_or(|p| fits(p, other_way)) {
+                Some(wanted)
+            } else if fits(at, other_way) && partner.is_some_and(|p| fits(p, way)) {
+                Some(opposite(wanted))
+            } else {
+                self.set_block_state(g, ground, at, "DoorBlocked", out);
+                None
+            }
+        } else if fits(at, other_way) && !horizontal {
+            if partner.is_some_and(|p| !fits(p, way)) {
+                self.set_block_state(g, ground, at, "DoorBlocked", out);
+                None
+            } else {
+                Some(opposite(wanted))
+            }
+        } else {
+            if wanted != 0 {
+                self.set_block_state(g, ground, at, "DoorBlocked", out);
+            }
+            None
+        };
+        let Some(wanted) = chosen else { return false };
+        let switched = Self::door_switch(state, wanted);
+        let moved = self.switch_door(g, ground, at, switched, out).is_some();
+        // The other door of a double door follows, the opposite way (a
+        // horizontal one the same way).
+        let mut double = false;
+        if let Some((p, other, other_state)) =
+            self.double_door(g, ground, at, block, rot, opposite(state))
+        {
+            let other_horizontal = self.rules.base(other).and_then(|b| b.door) == Some(true);
+            let to = if other_horizontal {
+                wanted
+            } else {
+                opposite(wanted)
+            };
+            self.switch_door(g, ground, p, Self::door_switch(other_state, to), out);
+            double = true;
+        }
+        if moved {
+            let base = self.rules.base(block);
+            let sound = base
+                .and_then(|b| b.state_sounds.iter().find(|(n, _)| n == switched))
+                .map_or(0, |s| s.1);
+            if sound > 0 {
+                // At the middle of the door's own (closed) shape; of both
+                // doors for a double door.
+                let shape = base
+                    .and_then(|b| self.blocks.get(&b.key.to_lowercase()))
+                    .copied()
+                    .unwrap_or(block);
+                let mut c = self.block_center(shape, rot, at);
+                if double {
+                    let half = c[0] - at.0 as f64;
+                    let turn = (rot % 4) as f64 * std::f64::consts::FRAC_PI_2;
+                    c[0] += half * turn.cos();
+                    c[2] -= half * turn.sin();
+                }
+                self.sound_near(g, sound, c, out);
+            }
+        }
+        true
+    }
+
     /// Opens the window of a block that holds items (spec 21): the page,
     /// the window with the slots, the open sound, and the block shown open
     /// when this is its first window.
@@ -4890,6 +5150,11 @@ impl crate::chains::Host for ChainHost<'_> {
             Some((tool.map(str::to_owned), match_tool)),
         );
         true
+    }
+
+    fn door(&mut self, pos: Pos, horizontal: bool) -> bool {
+        self.hub
+            .use_door(self.g, self.ground, self.out, self.pid, pos, horizontal)
     }
 
     fn other(&mut self, ty: &str, ctx: &crate::chains::Ctx) {

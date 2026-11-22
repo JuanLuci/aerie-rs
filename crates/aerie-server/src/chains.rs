@@ -174,6 +174,11 @@ pub enum Kind {
     },
     UseBlock,
     PickBlock,
+    /// Opens or closes a door (spec 22); horizontal doors (trapdoors)
+    /// only open one way.
+    Door {
+        horizontal: bool,
+    },
     UseEntity,
     BreakBlock {
         harvest: bool,
@@ -702,6 +707,12 @@ impl Book {
             }
             I::ChangeActiveSlotInteraction(s) => Kind::ChangeActiveSlot(s.target_slot),
             _ if ty == "Simple" => Kind::Simple,
+            I::SimpleBlockInteraction(s) if ty == "Door" => {
+                use_latest = s.use_latest_target;
+                Kind::Door {
+                    horizontal: extra.get("Horizontal").and_then(|v| v.as_bool()) == Some(true),
+                }
+            }
             I::SimpleBlockInteraction(s) => {
                 use_latest = s.use_latest_target;
                 Kind::Other {
@@ -1076,6 +1087,8 @@ pub trait Host {
         tool: Option<&str>,
         match_tool: bool,
     ) -> bool;
+    /// A door is used: it opens or closes; false when it is blocked.
+    fn door(&mut self, pos: Pos, horizontal: bool) -> bool;
     /// A type the server does not run itself starts a step.
     fn other(&mut self, ty: &str, ctx: &Ctx);
     fn cancel(&mut self, chain: i32, fork: Option<p::ForkedChainId>);
@@ -2734,7 +2747,7 @@ impl Manager {
                     None => set(chain, St::FAILED),
                 }
             }
-            Kind::UseBlock | Kind::PickBlock | Kind::BreakBlock { .. } => {
+            Kind::UseBlock | Kind::PickBlock | Kind::BreakBlock { .. } | Kind::Door { .. } => {
                 if first {
                     self.block_step(book, host, chain, e, x, &client);
                     tail(chain);
@@ -3111,6 +3124,11 @@ impl Manager {
                 }
                 _ => fail(chain),
             },
+            Kind::Door { horizontal } => {
+                if !host.door(target, *horizontal) {
+                    fail(chain);
+                }
+            }
             Kind::BreakBlock {
                 harvest,
                 soft_only,

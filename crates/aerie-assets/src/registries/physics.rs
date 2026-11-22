@@ -28,6 +28,32 @@ pub fn table(ctx: &Ctx) -> Result<String> {
     keys.sort();
     for k in keys {
         let a = blocks.resolved(k, "BlockType");
+        // A door, and whether it is a horizontal one (its use
+        // interaction says so): `D key horizontal`.
+        if a.bool_or("IsDoor", false) {
+            let horizontal = a
+                .obj("Interactions")
+                .and_then(|i| i.str_at("Use"))
+                .is_some_and(|u| u.contains("Horizontal"));
+            out += &format!("D {k} {}\n", horizontal as u8);
+        }
+        // The sound of each interaction state: `S key state sound`.
+        for (state, def) in a
+            .obj("State")
+            .and_then(|s| s.obj("Definitions"))
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+        {
+            if state.contains(char::is_whitespace) {
+                continue;
+            }
+            let sound =
+                super::sound_events::index(ctx, def.str_at("InteractionSoundEventId").as_deref())?;
+            if sound > 0 {
+                out += &format!("S {k} {state} {sound}\n");
+            }
+        }
         // A block that holds items: `K key capacity stayOpenWhenEmpty
         // openSound closeSound` (the sounds of its window states).
         if let Some(c) = a

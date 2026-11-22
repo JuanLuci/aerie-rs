@@ -167,7 +167,7 @@ pub struct Block {
     pub transparent: bool,
     pub solid: bool,
     pub unknown: bool,
-    hitbox: i32,
+    pub hitbox: i32,
     support: Faces<Req>,
     supporting: Faces<Sup>,
     all_full: bool,
@@ -190,6 +190,11 @@ pub struct Block {
     pub place_overrides: Vec<i32>,
     /// Interaction states: name → block id (`default` included).
     pub states: Vec<(String, i32)>,
+    /// The sound of switching to an interaction state (on the default
+    /// state's block): state name → sound.
+    pub state_sounds: Vec<(String, i32)>,
+    /// A door (on its default state's block): whether it is horizontal.
+    pub door: Option<bool>,
     /// A block that holds items (on its default state's block).
     pub container: Option<Container>,
 }
@@ -445,6 +450,23 @@ impl Rules {
                         });
                     }
                 }
+                "S" => {
+                    let w: Vec<&str> = rest.split_whitespace().collect();
+                    if let [key, state, sound] = w[..]
+                        && let Some(b) = by_key.get(key).and_then(|&i| r.blocks[i].as_mut())
+                    {
+                        b.state_sounds
+                            .push((state.to_owned(), sound.parse().unwrap_or(0)));
+                    }
+                }
+                "D" => {
+                    let w: Vec<&str> = rest.split_whitespace().collect();
+                    if let [key, horizontal] = w[..]
+                        && let Some(b) = by_key.get(key).and_then(|&i| r.blocks[i].as_mut())
+                    {
+                        b.door = Some(horizontal == "1");
+                    }
+                }
                 "K" => {
                     let w: Vec<&str> = rest.split_whitespace().collect();
                     let [key, capacity, stay, open, close] = w[..] else {
@@ -470,6 +492,26 @@ impl Rules {
             }
         }
         r
+    }
+
+    /// The block of a block's default interaction state (itself without
+    /// states).
+    pub fn base(&self, id: i32) -> Option<&Block> {
+        let b = self.block(id)?;
+        Some(
+            b.states
+                .iter()
+                .find(|(n, _)| n == "default")
+                .and_then(|(_, i)| self.block(*i))
+                .unwrap_or(b),
+        )
+    }
+
+    /// The name of the interaction state a block is (`default` without).
+    pub fn state_of(&self, id: i32) -> &str {
+        self.block(id)
+            .and_then(|b| b.states.iter().find(|(_, i)| *i == id))
+            .map_or("default", |(n, _)| n.as_str())
     }
 
     /// What a block holds items with, through any of its interaction

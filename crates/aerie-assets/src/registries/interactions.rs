@@ -1567,6 +1567,7 @@ pub fn server_table(ctx: &Ctx) -> Result<String> {
     const FIELDS: &[&str] = &[
         "ViewDistance",
         "Duration",
+        "Horizontal",
         "Tool",
         "MatchTool",
         "DefaultOk",
