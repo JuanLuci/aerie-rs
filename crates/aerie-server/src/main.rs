@@ -18,6 +18,7 @@ mod common;
 mod connected;
 mod crafting;
 mod effects;
+mod falling;
 mod gather;
 mod inventory;
 mod items;
@@ -355,38 +356,44 @@ async fn main() -> Result<()> {
     // The world ticks 30 times a second (spec 10).
     {
         let settings = settings.clone();
-        tokio::spawn(async move {
-            // As the official loop: a tick starts one step after the last
-            // one started, never earlier — the timer wakes a little
-            // before and the rest is spun, so a tick's time step is the
-            // step plus a few microseconds (periodic effects count on it).
-            let step = std::time::Duration::from_nanos(1_000_000_000 / 30);
-            let mut last = std::time::Instant::now();
-            // How long each tick takes (spec 13): the panel each second, a
-            // `perf:` line every 10 s.
-            let mut perf = perf::Perf::default();
-            loop {
-                let next = last + step;
-                let early = next - std::time::Duration::from_micros(1500);
-                if early > std::time::Instant::now() {
-                    tokio::time::sleep_until(early.into()).await;
+        // A thread of its own: the ticks keep their pace whatever the
+        // connections' tasks are busy with.
+        let runtime = tokio::runtime::Handle::current();
+        std::thread::Builder::new()
+            .name("world".into())
+            .spawn(move || {
+                let _runtime = runtime.enter();
+                // As the official loop: a tick starts one step after the last
+                // one started, never earlier — the thread wakes a little
+                // before and the rest is spun, so a tick's time step is the
+                // step plus a few microseconds (periodic effects count on it).
+                let step = std::time::Duration::from_nanos(1_000_000_000 / 30);
+                let mut last = std::time::Instant::now();
+                // How long each tick takes (spec 13): the panel each second, a
+                // `perf:` line every 10 s.
+                let mut perf = perf::Perf::default();
+                loop {
+                    let next = last + step;
+                    let early = next - std::time::Duration::from_micros(1500);
+                    if let Some(wait) = early.checked_duration_since(std::time::Instant::now()) {
+                        std::thread::sleep(wait);
+                    }
+                    while std::time::Instant::now() < next {
+                        std::hint::spin_loop();
+                    }
+                    let start = std::time::Instant::now();
+                    last = start;
+                    settings.hub.tick();
+                    let end = std::time::Instant::now();
+                    let due = perf.tick(end - start, end, || settings.hub.perf_counts());
+                    if let Some(s) = &due.second {
+                        settings.hub.perf_panel(s);
+                    }
+                    if let Some(s) = &due.ten {
+                        tracing::info!("{}", s.log_line());
+                    }
                 }
-                while std::time::Instant::now() < next {
-                    std::hint::spin_loop();
-                }
-                let start = std::time::Instant::now();
-                last = start;
-                settings.hub.tick();
-                let end = std::time::Instant::now();
-                let due = perf.tick(end - start, end, || settings.hub.perf_counts());
-                if let Some(s) = &due.second {
-                    settings.hub.perf_panel(s);
-                }
-                if let Some(s) = &due.ten {
-                    tracing::info!("{}", s.log_line());
-                }
-            }
-        });
+            })?;
     }
     let mode = if settings.account.is_some() {
         "authenticated"

@@ -388,6 +388,10 @@ struct Inner {
     items: BTreeMap<i32, crate::items::Item>,
     /// Picked-up copies flying to players.
     flights: BTreeMap<i32, crate::items::Flight>,
+    /// Blocks on their way down (spec 24), by network id.
+    falling: BTreeMap<i32, crate::falling::Falling>,
+    /// The falling blocks that moved this tick.
+    falling_moved: Vec<i32>,
     /// Item entities removed since clients last heard.
     gone: Vec<i32>,
     /// Inside a world tick (items made now start moving the next tick).
@@ -3965,6 +3969,13 @@ impl Hub {
                 theirs.push(v);
             }
         }
+        // Blocks falling right now.
+        theirs.extend(
+            g.falling
+                .iter()
+                .filter(|(_, f)| f.announced)
+                .map(|(n, f)| falling_entity(*n, f)),
+        );
         // Items lying around.
         theirs.extend(
             g.items
@@ -4761,6 +4772,55 @@ fn item_entity(nid: i32, st: &Stack, pos: [f64; 3]) -> proto::EntityUpdate {
             transform_update(pos),
         ]),
     }
+}
+
+/// A falling block as clients first hear of it (spec 24).
+fn falling_entity(nid: i32, f: &crate::falling::Falling) -> proto::EntityUpdate {
+    let mut updates = vec![proto::ComponentUpdate::BlockUpdate(Box::new(
+        proto::BlockUpdate {
+            block_id: f.block,
+            entity_scale: 1.0,
+        },
+    ))];
+    if f.collision >= 0 {
+        updates.push(proto::ComponentUpdate::HitboxCollisionUpdate(Box::new(
+            proto::HitboxCollisionUpdate {
+                hitbox_collision_config_index: f.collision,
+            },
+        )));
+    }
+    updates.push(falling_transform(f));
+    proto::EntityUpdate {
+        network_id: nid,
+        removed: None,
+        updates: Some(updates),
+    }
+}
+
+/// Where a falling block is: its block's rotation turned half around,
+/// and a level look.
+fn falling_transform(f: &crate::falling::Falling) -> proto::ComponentUpdate {
+    let (yaw, pitch, roll) = crate::support::rotation(f.rot);
+    let quarter = |n: i32| (n as f64 * 90.0).to_radians() as f32;
+    proto::ComponentUpdate::TransformUpdate(Box::new(proto::TransformUpdate {
+        transform: proto::ModelTransform {
+            position: Some(proto::Position {
+                x: f.pos[0],
+                y: f.pos[1],
+                z: f.pos[2],
+            }),
+            body_orientation: Some(proto::Direction {
+                yaw: quarter(yaw) + std::f32::consts::PI,
+                pitch: quarter(pitch),
+                roll: quarter(roll),
+            }),
+            look_orientation: Some(proto::Direction {
+                yaw: 0.0,
+                pitch: 0.0,
+                roll: 0.0,
+            }),
+        },
+    }))
 }
 
 fn item_update(st: &Stack) -> proto::ComponentUpdate {
@@ -5577,6 +5637,9 @@ impl crate::chains::Host for ChainHost<'_> {
 struct Outgoing {
     all: Vec<Packet>,
     to: Vec<(i32, Packet)>,
+    /// Packets for one player that keep their place among `all`: how
+    /// many of those were queued before each.
+    placed: Vec<(usize, i32, Packet)>,
     drops: Vec<(Vec<(String, i32)>, [f64; 3])>,
     /// Stacks a player drops (speed 1, spec 11).
     throws: Vec<(i32, Stack)>,
@@ -5932,8 +5995,15 @@ impl Hub {
             let mut g = self.inner.lock().unwrap();
             f(self, &mut g, &ground, &mut out)
         };
-        for p in &out.all {
+        let mut placed = out.placed.into_iter().peekable();
+        for (i, p) in out.all.iter().enumerate() {
+            while let Some((_, to, q)) = placed.next_if(|(at, _, _)| *at <= i) {
+                self.send(to, q);
+            }
             self.broadcast(p);
+        }
+        for (_, to, q) in placed {
+            self.send(to, q);
         }
         for (to, p) in out.to {
             self.send(to, p);
@@ -5982,6 +6052,7 @@ impl Hub {
             // Before the flush: a bench's new block state goes out with
             // this tick's block changes, ahead of its window.
             hub.processing_step(g, ground, dt, out);
+            hub.falling_step(g, ground, dt, out);
             hub.flush(g, ground, out);
             hub.health_step(g, dt, out);
             hub.stats_step(g, dt);
@@ -6161,10 +6232,22 @@ impl Hub {
             return;
         };
         if b.drop_type == 2 {
-            // Falling blocks become entities (spec 11), not done yet.
-            warn!(
-                "{} at {x} {y} {z} would fall (falling blocks not done)",
-                b.key
+            // It becomes an entity that falls (spec 24).
+            let how = How {
+                physics: true,
+                ..Default::default()
+            };
+            if self.change(g, ground, (x, y, z), 0, 0, how, out).is_none() {
+                return;
+            }
+            self.mark_area(g, x, y, z, id, rot);
+            let collision = b.falling.map_or(-1, |f| f.collision);
+            let bounds = self.rules.bounds_exact(id, rot);
+            g.next_item = g.next_item.max(FIRST_ITEM_ID) + 1;
+            let nid = g.next_item;
+            g.falling.insert(
+                nid,
+                crate::falling::Falling::new(id, rot, (x, y, z), bounds, collision),
             );
             return;
         }
@@ -6206,6 +6289,164 @@ impl Hub {
             let stacks = self.rules.roll(&b.physics_drops());
             out.drops
                 .push((stacks, [x as f64 + 0.5, y as f64, z as f64 + 0.5]));
+        }
+    }
+
+    /// Falling blocks (spec 24): each moves, and one that reached the
+    /// ground acts on where it landed and is gone.
+    fn falling_step(&self, g: &mut Inner, ground: &Ground, dt: f32, out: &mut Outgoing) {
+        let ids: Vec<i32> = g.falling.keys().copied().collect();
+        for nid in ids {
+            let Some(mut f) = g.falling.get(&nid).cloned() else {
+                continue;
+            };
+            let step = f.step(
+                dt,
+                &View {
+                    g,
+                    ground,
+                    hub_rules: &self.rules,
+                },
+            );
+            if f.pos[1] < -32.0 {
+                g.falling.remove(&nid);
+                if f.announced {
+                    g.gone.push(nid);
+                }
+                continue;
+            }
+            if !step.landed {
+                if step.moved {
+                    g.falling_moved.push(nid);
+                }
+                g.falling.insert(nid, f);
+                continue;
+            }
+            g.falling.remove(&nid);
+            if f.announced {
+                g.gone.push(nid);
+            }
+            self.falling_impact(g, ground, &f, out);
+        }
+    }
+
+    /// What a landed falling block does (spec 24, "Landing").
+    fn falling_impact(
+        &self,
+        g: &mut Inner,
+        ground: &Ground,
+        f: &crate::falling::Falling,
+        out: &mut Outgoing,
+    ) {
+        use crate::support::World;
+        let Some(b) = self.rules.block(f.block).cloned() else {
+            return;
+        };
+        let cell = (
+            f.pos[0].floor() as i32,
+            f.pos[1].floor() as i32,
+            f.pos[2].floor() as i32,
+        );
+        let settings = b.falling.unwrap_or(crate::support::Falling {
+            impact: 0,
+            drop_items: true,
+            collision: -1,
+        });
+        match settings.impact {
+            0 => {
+                // Back into the world if every cell it needs is free.
+                let free = self.rules.cells(f.block, f.rot).iter().all(|c| {
+                    let (other, _) = View {
+                        g,
+                        ground,
+                        hub_rules: &self.rules,
+                    }
+                    .block(cell.0 + c[0], cell.1 + c[1], cell.2 + c[2]);
+                    other == 0 || self.rules.block(other).is_some_and(|o| !o.solid)
+                });
+                if free {
+                    let how = How {
+                        physics: true,
+                        ..Default::default()
+                    };
+                    self.change(g, ground, cell, f.block, f.rot, how, out);
+                    return;
+                }
+                self.falling_break(g, &b, f, true, out);
+            }
+            1 => self.falling_break(g, &b, f, settings.drop_items, out),
+            _ => {
+                // Explosions are not done yet: the block is just gone.
+                warn!(
+                    "{} landed at {} {} {} and would explode (explosions not done)",
+                    b.key, cell.0, cell.1, cell.2
+                );
+            }
+        }
+    }
+
+    /// A falling block breaking where it landed: particles for each of
+    /// its cells, its break sound, and what it drops.
+    fn falling_break(
+        &self,
+        g: &mut Inner,
+        b: &crate::support::Block,
+        f: &crate::falling::Falling,
+        drops: bool,
+        out: &mut Outgoing,
+    ) {
+        for c in self.rules.cells(f.block, f.rot) {
+            if let Ok(p) = packet(
+                id::SPAWN_BLOCK_PARTICLE_SYSTEM,
+                &proto::SpawnBlockParticleSystem {
+                    block_id: f.block,
+                    particle_type: proto::BlockParticleEvent::BREAK,
+                    position: Some(proto::Position {
+                        x: f.pos[0] + c[0] as f64,
+                        y: f.pos[1] + c[1] as f64,
+                        z: f.pos[2] + c[2] as f64,
+                    }),
+                },
+            ) {
+                out.all.push(p);
+            }
+        }
+        // The sound keeps its place after the particles.
+        if b.break_sound > 0
+            && let Ok(p) = sound_3d_packet(b.break_sound, proto::SoundCategory::SFX, f.pos)
+        {
+            let reach = self.rules.sound_distance(b.break_sound) as f64;
+            for (&pid, e) in &g.players {
+                if let Some(q) = &e.position
+                    && dist2([q.x, q.y, q.z], f.pos) <= reach * reach
+                {
+                    out.placed.push((out.all.len(), pid, p.clone()));
+                }
+            }
+        }
+        if !drops {
+            return;
+        }
+        // The soft drop when it has one, else the breaking drop.
+        let drop = b
+            .soft_drop
+            .clone()
+            .or_else(|| b.breaking_drop.clone())
+            .map(|d| crate::support::Drop { quantity: 1, ..d });
+        if let Some(d) = drop {
+            let d = if d.item.is_none() && d.list.is_none() {
+                crate::support::Drop {
+                    item: b.item.clone(),
+                    ..d
+                }
+            } else {
+                d
+            };
+            let stacks = self.rules.roll(&d);
+            if !stacks.is_empty() {
+                out.drops
+                    .push((stacks, [f.pos[0] + 0.5, f.pos[1], f.pos[2] + 0.5]));
+            }
         }
     }
 
@@ -6552,6 +6793,20 @@ impl Hub {
                 });
             }
             g.flights.insert(fid, f);
+        }
+        // What clients see of the falling blocks.
+        let falling_moved = std::mem::take(&mut g.falling_moved);
+        for (nid, f) in g.falling.iter_mut() {
+            if !f.announced {
+                f.announced = true;
+                updates.push(falling_entity(*nid, f));
+            } else if falling_moved.contains(nid) {
+                updates.push(proto::EntityUpdate {
+                    network_id: *nid,
+                    removed: None,
+                    updates: Some(vec![falling_transform(f)]),
+                });
+            }
         }
         // What clients see of the items.
         for (nid, it) in g.items.iter_mut() {

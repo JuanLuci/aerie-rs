@@ -361,6 +361,25 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
                 // Chat lines and extra packets once the server has put the
                 // player in the world (it drops them before), one by one.
                 let mut later = Vec::new();
+                // Going somewhere comes first, so that what the lines do
+                // happens around the player.
+                if let Some(g) = &opts.goto {
+                    let v: Vec<f64> = g
+                        .split_whitespace()
+                        .filter_map(|x| x.parse().ok())
+                        .collect();
+                    if let [x, y, z] = v[..] {
+                        let mut payload = Vec::new();
+                        proto::ClientMovement {
+                            absolute_position: Some(proto::Position { x, y, z }),
+                            ..Default::default()
+                        }
+                        .encode(&mut payload)?;
+                        let mut w = Vec::new();
+                        frame::encode(108, &payload, &mut w)?;
+                        later.push(w);
+                    }
+                }
                 for line in opts.chat.iter().flat_map(|c| c.split(';')) {
                     let mut payload = Vec::new();
                     proto::ChatMessage {
@@ -381,23 +400,6 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
                     let mut w = Vec::new();
                     frame::encode(id.parse()?, &bytes, &mut w)?;
                     later.push(w);
-                }
-                if let Some(g) = &opts.goto {
-                    let v: Vec<f64> = g
-                        .split_whitespace()
-                        .filter_map(|x| x.parse().ok())
-                        .collect();
-                    if let [x, y, z] = v[..] {
-                        let mut payload = Vec::new();
-                        proto::ClientMovement {
-                            absolute_position: Some(proto::Position { x, y, z }),
-                            ..Default::default()
-                        }
-                        .encode(&mut payload)?;
-                        let mut w = Vec::new();
-                        frame::encode(108, &payload, &mut w)?;
-                        later.push(w);
-                    }
                 }
                 if let Some(b) = &opts.use_block {
                     let v: Vec<i32> = b

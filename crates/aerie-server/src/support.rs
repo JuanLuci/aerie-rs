@@ -161,6 +161,16 @@ pub struct Container {
     pub close_sound: i32,
 }
 
+/// What a falling block does when it lands (spec 24).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Falling {
+    /// 0 place, 1 break, 2 explode.
+    pub impact: u8,
+    pub drop_items: bool,
+    /// The hitbox collision config its entity carries, -1 for none.
+    pub collision: i32,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Block {
     pub key: String,
@@ -198,6 +208,8 @@ pub struct Block {
     pub connected: Option<proto::ConnectedBlockRuleSet>,
     /// A door (on its default state's block): whether it is horizontal.
     pub door: Option<bool>,
+    /// Its falling block settings, when it has any.
+    pub falling: Option<Falling>,
     /// A block that holds items (on its default state's block).
     pub container: Option<Container>,
 }
@@ -471,6 +483,18 @@ impl Rules {
                             .push((state.to_owned(), sound.parse().unwrap_or(0)));
                     }
                 }
+                "F" => {
+                    let w: Vec<&str> = rest.split_whitespace().collect();
+                    if let [key, impact, drops, collision] = w[..]
+                        && let Some(b) = by_key.get(key).and_then(|&i| r.blocks[i].as_mut())
+                    {
+                        b.falling = Some(Falling {
+                            impact: impact.parse().unwrap_or(0),
+                            drop_items: drops == "1",
+                            collision: collision.parse().unwrap_or(-1),
+                        });
+                    }
+                }
                 "D" => {
                     let w: Vec<&str> = rest.split_whitespace().collect();
                     if let [key, horizontal] = w[..]
@@ -598,6 +622,42 @@ impl Rules {
     /// Whether a block, turned so, has a supporting top face.
     pub fn supports_up(&self, id: i32, rot: i32) -> bool {
         self.rotated(id, rot).is_some_and(|r| !r.1[0].is_empty())
+    }
+
+    /// The block's bounding box for a rotation in doubles, as physics
+    /// uses it (the unit box for a plain block). The registry keeps
+    /// floats; their shortest decimal form gives back the asset's value.
+    pub fn bounds_exact(&self, id: i32, rot: i32) -> [f64; 6] {
+        let exact = |v: f32| v.to_string().parse::<f64>().unwrap_or(v as f64);
+        let unit = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let Some(boxes) = self
+            .block(id)
+            .filter(|b| b.hitbox != 0)
+            .and_then(|b| self.boxes.get(&b.hitbox))
+        else {
+            return unit;
+        };
+        if rot == 0 {
+            let mut bb = [f64::MAX, f64::MAX, f64::MAX, f64::MIN, f64::MIN, f64::MIN];
+            for h in boxes {
+                for a in 0..3 {
+                    bb[a] = bb[a].min(exact(h[a]));
+                    bb[a + 3] = bb[a + 3].max(exact(h[a + 3]));
+                }
+            }
+            return bb;
+        }
+        match self.bounds(id, rot) {
+            Some(b) => [
+                exact(b[0]),
+                exact(b[1]),
+                exact(b[2]),
+                exact(b[3]),
+                exact(b[4]),
+                exact(b[5]),
+            ],
+            None => unit,
+        }
     }
 
     /// The block's hitbox for a rotation, as one bounding box; `None` for a

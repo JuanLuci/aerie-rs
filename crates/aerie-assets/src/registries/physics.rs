@@ -2,6 +2,8 @@
 //! per block with any of them, `SupportDropType`, the `Gathering.Physics`
 //! drop and `Gathering.UseDefaultDropWhenPlaced`; and every drop list.
 //!
+//! Falling blocks (spec 24) add `F key impact dropItems collision`.
+//!
 //! Text lines for the start-up cache: `P key drop item list deco`
 //! (drop: 0 Break, 1 Destroy, 2 Fall; `-` for none; deco 1 when placed
 //! blocks become decoration) and `L list <json>` (the list's `Container`,
@@ -76,6 +78,25 @@ pub fn table(ctx: &Ctx) -> Result<String> {
                 sound("OpenWindow")?,
                 sound("CloseWindow")?
             );
+        }
+        // What a falling block does when it lands: `F key impact
+        // dropItems collision` (impact: 0 Place, 1 Break, 2 Explode;
+        // collision: the hitbox collision config's index, -1 for none).
+        if let Some(f) = a.obj("FallingBlockSettings") {
+            let impact = f.obj("Impact");
+            let kind = match impact.and_then(|i| i.str_at("Type")).as_deref() {
+                Some("Break") => 1,
+                Some("Explode") => 2,
+                _ => 0,
+            };
+            let drops = impact.is_none_or(|i| i.bool_or("DropItems", true));
+            let collision = ctx.index_or(
+                super::entity_configs::HITBOX,
+                &[],
+                f.str_at("HitboxCollisionConfig").as_deref(),
+                -1,
+            )?;
+            out += &format!("F {k} {kind} {} {collision}\n", drops as u8);
         }
         let drop = match a.str_at("SupportDropType").as_deref() {
             Some("Destroy") => 1,

@@ -147,7 +147,7 @@ By `SupportDropType`:
 
 - `Break`: removed with drops, a break sound and a physics particle;
 - `Destroy`: removed with the sound and particle, no drops;
-- `Fall`: becomes a falling block entity (spec 11).
+- `Fall`: becomes a falling block entity (spec 24).
 
 Drops: `Gathering.Physics` (item and/or drop list), else `Breaking`
 (with its quantity), else `Soft`, else `Harvest`; with neither item nor

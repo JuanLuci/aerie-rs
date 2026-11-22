@@ -133,7 +133,13 @@ fn signum(v: f64) -> f64 {
 /// Gravity for one tick (spec 11, step 2).
 pub fn gravity(vel: &mut [f64; 3], dt: f32) {
     let area = (BOX[3] - BOX[0]) * (BOX[5] - BOX[2]);
-    let terminal = -(64.0 * MASS * 1000.0 / (AIR_DENSITY * area * 1_000_000.0 * DRAG)).sqrt();
+    gravity_with(vel, dt, MASS, DRAG, area);
+}
+
+/// Gravity for a body of the given mass, drag coefficient and
+/// horizontal area (width × depth of its box).
+pub fn gravity_with(vel: &mut [f64; 3], dt: f32, mass: f64, drag: f64, area: f64) {
+    let terminal = -(64.0 * mass * 1000.0 / (AIR_DENSITY * area * 1_000_000.0 * drag)).sqrt();
     let ratio = (vel[1] / terminal).abs();
     let accel = 32.0 * (signum(terminal) - signum(vel[1]) * (ratio * ratio * ratio));
     let step = accel * dt as f64;
@@ -242,15 +248,22 @@ pub struct Hit {
     pub point: [f64; 3],
 }
 
-/// The item's box moving by `step` against one block box at `at`.
-fn against(pos: [f64; 3], step: [f64; 3], block: [f64; 6], at: [f64; 3]) -> Option<Hit> {
+/// The box `bx` (around `pos`) moving by `step` against one block box
+/// at `at`.
+fn against(
+    pos: [f64; 3],
+    step: [f64; 3],
+    bx: [f64; 6],
+    block: [f64; 6],
+    at: [f64; 3],
+) -> Option<Hit> {
     let mut axes = [(0.0, 0.0, 0.0, 0u8); 3];
     for a in 0..3 {
         axes[a] = axis(
             pos[a] - at[a],
             step[a],
-            block[a] - BOX[a + 3],
-            block[a + 3] - BOX[a],
+            block[a] - bx[a + 3],
+            block[a + 3] - bx[a],
         )?;
     }
     if axes.iter().all(|x| x.3 == 1) {
@@ -293,11 +306,16 @@ fn against(pos: [f64; 3], step: [f64; 3], block: [f64; 6], at: [f64; 3]) -> Opti
 
 /// The first block hit moving the item from `pos` by `step`.
 pub fn sweep(pos: [f64; 3], step: [f64; 3], w: &impl Blocks) -> Option<Hit> {
+    sweep_box(pos, step, BOX, w)
+}
+
+/// The first block hit moving the box `bx` from `pos` by `step`.
+pub fn sweep_box(pos: [f64; 3], step: [f64; 3], bx: [f64; 6], w: &impl Blocks) -> Option<Hit> {
     let lo: Vec<i32> = (0..3)
-        .map(|a| ((pos[a] + BOX[a]).min(pos[a] + step[a] + BOX[a]) - EPS).floor() as i32)
+        .map(|a| ((pos[a] + bx[a]).min(pos[a] + step[a] + bx[a]) - EPS).floor() as i32)
         .collect();
     let hi: Vec<i32> = (0..3)
-        .map(|a| ((pos[a] + BOX[a + 3]).max(pos[a] + step[a] + BOX[a + 3]) + EPS).floor() as i32)
+        .map(|a| ((pos[a] + bx[a + 3]).max(pos[a] + step[a] + bx[a + 3]) + EPS).floor() as i32)
         .collect();
     let mut best: Option<Hit> = None;
     for x in lo[0]..=hi[0] {
@@ -308,7 +326,7 @@ pub fn sweep(pos: [f64; 3], step: [f64; 3], w: &impl Blocks) -> Option<Hit> {
                 };
                 let at = [x as f64, y as f64, z as f64];
                 for b in boxes {
-                    if let Some(h) = against(pos, step, b, at)
+                    if let Some(h) = against(pos, step, bx, b, at)
                         && best.is_none_or(|bh| h.t < bh.t)
                     {
                         best = Some(h);
