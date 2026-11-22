@@ -20,6 +20,7 @@ mod inventory;
 mod items;
 mod join;
 mod login;
+mod perf;
 mod probe;
 mod proxy;
 mod support;
@@ -264,6 +265,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_default();
             let hub = world::Hub::with_names(blocks, block_names)
                 .with_gather(gather)
+                .with_perf_hud(args.iter().any(|a| a == "--perf-hud"))
                 .with_book(book)
                 .with_consume(&consume)
                 .with_rules(rules)
@@ -290,9 +292,21 @@ async fn main() -> Result<()> {
             let mut every =
                 tokio::time::interval(std::time::Duration::from_nanos(1_000_000_000 / 30));
             every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // How long each tick takes (spec 13): the panel each second, a
+            // `perf:` line every 10 s.
+            let mut perf = perf::Perf::default();
             loop {
                 every.tick().await;
+                let start = std::time::Instant::now();
                 settings.hub.tick();
+                let end = std::time::Instant::now();
+                let due = perf.tick(end - start, end, || settings.hub.perf_counts());
+                if let Some(s) = &due.second {
+                    settings.hub.perf_panel(s);
+                }
+                if let Some(s) = &due.ten {
+                    tracing::info!("{}", s.log_line());
+                }
             }
         });
     }

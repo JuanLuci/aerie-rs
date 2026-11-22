@@ -21,6 +21,7 @@ pub mod id {
     pub const SERVER_MESSAGE: u32 = 210;
     pub const SERVER_SET_BLOCK: u32 = 140;
     pub const CHAT_MESSAGE: u32 = 211;
+    pub const CUSTOM_HUD: u32 = 217;
     pub const SYNC_INTERACTION_CHAINS: u32 = 290;
     pub const ENTITY_UPDATES: u32 = 161;
     pub const UPDATE_BLOCK_DAMAGE: u32 = 144;
@@ -96,6 +97,11 @@ struct Entry {
     consuming: HashMap<i32, (String, i32)>,
     /// Inventory sections changed this tick (sent at its end).
     inv_dirty: std::collections::BTreeSet<i32>,
+    /// The performance panel (spec 13): wanted, and already on screen.
+    perf_hud: bool,
+    perf_shown: bool,
+    /// Columns this player's client has.
+    columns: std::collections::HashSet<(i32, i32)>,
 }
 
 #[derive(Default)]
@@ -124,6 +130,8 @@ pub struct Hub {
     eye_height: f64,
     /// When the last world tick ran.
     last_tick: Mutex<Option<std::time::Instant>>,
+    /// New players see the performance panel (`--perf-hud`).
+    perf_hud: bool,
 }
 
 /// A position.
@@ -683,6 +691,68 @@ impl Hub {
         600.0
     }
 
+    pub fn with_perf_hud(mut self, on: bool) -> Self {
+        self.perf_hud = on;
+        self
+    }
+
+    /// Columns a player's client now has (for the loaded count).
+    pub fn columns_sent(&self, id: i32, cols: impl IntoIterator<Item = (i32, i32)>) {
+        if let Some(e) = self.inner.lock().unwrap().players.get_mut(&id) {
+            e.columns.extend(cols);
+        }
+    }
+
+    /// What the world holds, for the performance numbers: columns some
+    /// client has, entities (players, items, flying pickups), players.
+    pub fn perf_counts(&self) -> crate::perf::Counts {
+        let g = self.inner.lock().unwrap();
+        let mut cols: std::collections::HashSet<(i32, i32)> = Default::default();
+        for e in g.players.values() {
+            cols.extend(e.columns.iter().copied());
+        }
+        crate::perf::Counts {
+            columns: cols.len(),
+            entities: g.players.len() + g.items.len() + g.flights.len(),
+            players: g.players.len(),
+        }
+    }
+
+    /// Sends the second's numbers to the players who have the panel on.
+    pub fn perf_panel(&self, s: &crate::perf::Sample) {
+        let mut g = self.inner.lock().unwrap();
+        for e in g.players.values_mut() {
+            if !e.perf_hud || e.position.is_none() {
+                continue;
+            }
+            let hud = if e.perf_shown {
+                crate::perf::update(s)
+            } else {
+                crate::perf::show(s)
+            };
+            if let Ok(p) = packet(id::CUSTOM_HUD, &hud) {
+                let _ = e.outbox.send(p);
+                e.perf_shown = true;
+            }
+        }
+    }
+
+    /// `/perf`: the panel on or off for one player.
+    fn toggle_perf(&self, id: i32) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        let Some(e) = g.players.get_mut(&id) else {
+            return false;
+        };
+        e.perf_hud = !e.perf_hud;
+        if !e.perf_hud && e.perf_shown {
+            e.perf_shown = false;
+            if let Ok(p) = packet(id::CUSTOM_HUD, &crate::perf::hide()) {
+                let _ = e.outbox.send(p);
+            }
+        }
+        e.perf_hud
+    }
+
     pub fn with_eye_height(mut self, h: f64) -> Self {
         self.eye_height = h;
         self
@@ -728,6 +798,9 @@ impl Hub {
                     queue: Default::default(),
                     next_window: 0,
                     consuming: HashMap::new(),
+                    perf_hud: self.perf_hud,
+                    perf_shown: false,
+                    columns: Default::default(),
                     inv_dirty: Default::default(),
                 },
             );
@@ -2174,8 +2247,19 @@ impl Hub {
                 id,
                 "Commands: /help, /list, /pos, /tp <x> <y> <z>, /gamemode <creative|adventure>, \
                  /setblock <x> <y> <z> <block>, /fill <x1> <y1> <z1> <x2> <y2> <z2> <block>, \
-                 /blocks <part of a name>, /give <item> [amount], /clear",
+                 /blocks <part of a name>, /give <item> [amount], /clear, /perf",
             ),
+            ("perf", _) => {
+                let on = self.toggle_perf(id);
+                self.tell(
+                    id,
+                    if on {
+                        "Performance panel on"
+                    } else {
+                        "Performance panel off"
+                    },
+                );
+            }
             ("block", ["set", x, y, z, block]) => {
                 let here = self.position(id);
                 let b = if block.eq_ignore_ascii_case("empty") {

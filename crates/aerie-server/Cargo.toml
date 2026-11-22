@@ -12,6 +12,7 @@ aerie-auth = { path = "../aerie-auth" }
 aerie-protocol = { path = "../aerie-protocol" }
 reqwest = { version = "0.12", default-features = false }
 anyhow = "1"
+memory-stats = "1"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rand = "0.8"
 rcgen = "0.13"

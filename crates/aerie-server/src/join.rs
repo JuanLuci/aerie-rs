@@ -1052,6 +1052,9 @@ async fn in_world(
             .flat_map(|x| (ccz - BUILT_RADIUS..=ccz + BUILT_RADIUS).map(move |z| (x, z)))
             .collect()
     };
+    settings
+        .hub
+        .columns_sent(client_id, columns.iter().copied());
     let mut stream_tick = tokio::time::interval(Duration::from_millis(500));
     let mut ping_id = 0i32;
     let mut last_pos = None;
@@ -1098,6 +1101,7 @@ async fn in_world(
                             streams.chunks.write_all(&wire).await?;
                         }
                         columns.insert((cx, cz));
+                        hub.columns_sent(client_id, [(cx, cz)]);
                     }
                 }
             }
