@@ -61,6 +61,31 @@ For the stair at a cell:
 
 The answer is that shape's block with the stair's own rotation.
 
+## Roofs
+
+A roof rule set has the stair shapes twice — regular and, optionally,
+hollow — an optional top piece, a width (1 or more: a wide roof is one
+block over several cells) and a material name; it connects like a stair
+of that material, with these differences:
+
+- A corner (in front or behind) only counts when the roof's width is
+  fulfilled: the cells beside it toward the corner, up to the width, hold
+  the same block with the same rotation (as their own base cell or as
+  this block's part). The stair behind is looked for a width away (for a
+  wide roof also one cell further, when that one is not straight).
+- A roof still straight looks one level up: a roof behind it there
+  turned the same way, and a roof on exactly one side turned a quarter
+  toward it (corner shapes count a quarter further), make it an inverted
+  corner on that side — a valley. Still straight, it looks one level down
+  the other way round (in front, sides swapped, inverted corners instead
+  of corners) and becomes a corner — the end of a ridge.
+- A straight roof whose four neighbours one level down all slope away
+  from it (each turned to its side, no outward corners) becomes the top
+  piece.
+- Otherwise, when the block under it has no supporting top face, the
+  hollow shape is used; else the regular one. A wide corner that changes
+  side also puts the new block at the cell on its old side.
+
 ## In Aerie
 
 `connected.rs` answers for a cell through a small view of the world; the
@@ -69,8 +94,7 @@ Rule sets come with the block types' registry packets.
 
 ## Not done yet
 
-Roofs (hollow and regular shapes, valleys, toppers, widths); the
-templated pattern rules of walls, fences, doors, chests, rails and
+The templated pattern rules of walls, fences, doors, chests, rails and
 bookshelves; the "update, place, update" and "ignore updates" modes;
 extra blocks an answer carries.
 
@@ -79,3 +103,6 @@ extra blocks an answer carries.
 Stairs placed next to each other with a recorded place chain turned to
 each yaw (seven layouts: corners both ways, inverted corners, rows, a
 ring of four): the same blocks and rotations after every placement.
+Roofs the same way, on two levels (rows, a ring, a valley, corners on
+the upper level, a top piece over four slopes, a wide roof): the same
+blocks, rotations and batches.

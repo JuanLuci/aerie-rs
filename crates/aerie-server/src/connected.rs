@@ -11,6 +11,24 @@ pub type Pos = (i32, i32, i32);
 pub trait Cells {
     fn at(&self, p: Pos) -> Option<(i32, i32, i32)>;
     fn rules(&self, block: i32) -> Option<&RuleSet>;
+    /// Whether a block, turned so, supports what stands on top of it.
+    fn supports_up(&self, block: i32, rot: i32) -> bool;
+}
+
+/// What a rule set wants at a cell: a block and rotation, and blocks at
+/// offsets from it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Want {
+    pub block: i32,
+    pub rot: i32,
+    pub extra: Vec<([i32; 3], i32, i32)>,
+}
+
+const WEST: [i32; 3] = [-1, 0, 0];
+const EAST: [i32; 3] = [1, 0, 0];
+
+fn scaled(v: [i32; 3], n: i32) -> [i32; 3] {
+    [v[0] * n, v[1] * n, v[2] * n]
 }
 
 const NORTH: [i32; 3] = [0, 0, -1];
@@ -221,11 +239,203 @@ fn stair(
     Some((block_of(s, shape), rot))
 }
 
-/// What a rule set wants at a cell: block and rotation. `None`: no
-/// opinion (also for the rule sets not done yet).
-pub fn desired(w: &dyn Cells, at: Pos, block: i32, rot: i32) -> Option<(i32, i32)> {
+/// A wide roof corner needs the cells beside it (toward the corner) to
+/// hold the same block turned the same way, as their own base cell or as
+/// this block's part.
+#[allow(clippy::too_many_arguments)]
+fn width_fulfilled(
+    w: &dyn Cells,
+    at: Pos,
+    right: bool,
+    yaw: i32,
+    block: i32,
+    rot: i32,
+    width: i32,
+) -> bool {
+    for i in 0..width - 1 {
+        let v = turn(yaw, scaled(if right { EAST } else { WEST }, i + 1));
+        let required = (v[0] & 31) | (v[2] & 31) << 5 | (v[1] & 31) << 10;
+        let Some((other, other_rot, filler)) = w.at(add(at, v)) else {
+            continue;
+        };
+        let same = other == block && other_rot == rot;
+        if !(same && (filler == 0 || filler == required)) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether a stair fits a valley (or, inverted, a ridge) seen from a
+/// roof turned `rot`, a number of quarter turns round.
+fn valley_compatible(rot: i32, other: Option<(Stair, i32)>, offset: i32, inverted: bool) -> bool {
+    let Some((shape, other_rot)) = other else {
+        return false;
+    };
+    let target = (rot % 4 + offset) % 4;
+    let other_yaw = other_rot % 4;
+    if other_rot / 4 % 4 != rot / 4 % 4 {
+        return false;
+    }
+    let corner = matches!(shape, Stair::CornerLeft | Stair::CornerRight);
+    let inverted_corner = matches!(
+        shape,
+        Stair::InvertedCornerLeft | Stair::InvertedCornerRight
+    );
+    if (inverted && corner) || (!inverted && inverted_corner) {
+        return false;
+    }
+    let (right, left) = if inverted {
+        (Stair::InvertedCornerRight, Stair::InvertedCornerLeft)
+    } else {
+        (Stair::CornerRight, Stair::CornerLeft)
+    };
+    other_yaw == target
+        || (shape == right && other_yaw == (target + 1) % 4)
+        || (shape == left && other_yaw == (target + 3) % 4)
+}
+
+/// The corner a roof makes with the roofs one level up (a valley) or,
+/// reversed, one level down (a ridge end): left (false) or right.
+#[allow(clippy::too_many_arguments)]
+fn valley(
+    w: &dyn Cells,
+    material: Option<&str>,
+    place: Pos,
+    check: Pos,
+    rot: i32,
+    reverse: bool,
+    block: i32,
+    width: i32,
+) -> Option<bool> {
+    let yaw = rot % 4;
+    let cell = |dir: [i32; 3]| stair_at(w, add(check, turn(yaw, scaled(dir, width))), material);
+    let back = cell(if reverse { SOUTH } else { NORTH })?;
+    if !valley_compatible(rot, Some(back), 0, reverse) {
+        return None;
+    }
+    let left = valley_compatible(rot, cell(if reverse { EAST } else { WEST }), 1, reverse);
+    let right = valley_compatible(rot, cell(if reverse { WEST } else { EAST }), 3, reverse);
+    if left == right {
+        return None;
+    }
+    width_fulfilled(w, place, right, yaw, block, rot, width).then_some(right)
+}
+
+/// The block a roof should be.
+fn roof(
+    w: &dyn Cells,
+    r: &p::RoofConnectedBlockRuleSet,
+    at: Pos,
+    block: i32,
+    rot: i32,
+) -> Option<Want> {
+    let regular = r.regular.as_ref()?;
+    let material = r.material_name.as_deref();
+    let width = r.width;
+    let (yaw, upside_down) = facing(rot);
+    let mut shape = Stair::Straight;
+    if let Some(right) = inverted_corner_connection(w, material, at, yaw, upside_down)
+        && width_fulfilled(w, at, right, yaw, block, rot, width)
+    {
+        shape = Stair::inverted_corner(right);
+    }
+    if let Some(right) = corner_connection(w, material, at, rot, yaw, upside_down, width)
+        && width_fulfilled(w, at, right, yaw, block, rot, width)
+    {
+        shape = Stair::corner(right);
+    }
+    if shape == Stair::Straight
+        && let Some(right) = valley(
+            w,
+            material,
+            at,
+            add(at, [0, 1, 0]),
+            rot,
+            false,
+            block,
+            width,
+        )
+    {
+        shape = Stair::inverted_corner(right);
+    }
+    if shape == Stair::Straight
+        && let Some(right) = valley(
+            w,
+            material,
+            at,
+            add(at, [0, -1, 0]),
+            rot,
+            true,
+            block,
+            width,
+        )
+    {
+        shape = Stair::corner(right);
+    }
+    if upside_down {
+        shape = match shape {
+            Stair::CornerLeft => Stair::CornerRight,
+            Stair::CornerRight => Stair::CornerLeft,
+            Stair::InvertedCornerLeft => Stair::InvertedCornerRight,
+            Stair::InvertedCornerRight => Stair::InvertedCornerLeft,
+            s => s,
+        };
+    }
+    let plain = |block: i32| Want {
+        block,
+        rot,
+        extra: Vec::new(),
+    };
+    // A straight roof with roofs sloping away on all four sides below it
+    // is the ridge's top piece.
+    if r.topper_block_id != -1 && shape == Stair::Straight {
+        let below = add(at, [0, -1, 0]);
+        let level = rot - rot % 4;
+        let sides = [(NORTH, 2), (SOUTH, 0), (EAST, 1), (WEST, 3)];
+        if sides.iter().all(|(dir, off)| {
+            valley_compatible(level, stair_at(w, add(below, *dir), material), *off, true)
+        }) {
+            return Some(plain(r.topper_block_id));
+        }
+    }
+    // Over a block that does not support its top face the hollow shapes
+    // are used.
+    if let Some(hollow) = &r.hollow {
+        let under = w.at(add(at, [0, -1, 0])).unwrap_or((0, 0, 0));
+        if !w.supports_up(under.0, under.1) {
+            return Some(plain(block_of(hollow, shape)));
+        }
+    }
+    let mut want = plain(block_of(regular, shape));
+    // A wide corner that changes side leaves the cell on its old side to
+    // the new block.
+    if width > 0
+        && let Some(old) = shape_in(regular, block).filter(|s| *s != Stair::Straight)
+    {
+        let side = |s: Stair| match s {
+            Stair::CornerLeft | Stair::InvertedCornerLeft => -(width - 1),
+            Stair::CornerRight | Stair::InvertedCornerRight => width - 1,
+            Stair::Straight => 0,
+        };
+        if side(shape) != side(old) {
+            want.extra
+                .push((turn(rot % 4, scaled(EAST, side(old))), want.block, rot));
+        }
+    }
+    Some(want)
+}
+
+/// What a rule set wants at a cell. `None`: no opinion (also for the
+/// rule sets not done yet).
+pub fn desired(w: &dyn Cells, at: Pos, block: i32, rot: i32) -> Option<Want> {
     match w.rules(block)? {
-        RuleSet::StairConnectedBlockRuleSet(s) => stair(w, s, at, rot),
+        RuleSet::StairConnectedBlockRuleSet(s) => stair(w, s, at, rot).map(|(block, rot)| Want {
+            block,
+            rot,
+            extra: Vec::new(),
+        }),
+        RuleSet::RoofConnectedBlockRuleSet(r) => roof(w, r, at, block, rot),
         _ => None,
     }
 }
@@ -240,7 +450,7 @@ fn only_on_placement(r: &RuleSet) -> bool {
 
 /// The changes the cells around `origin` want (spec 23): every
 /// neighbour with a rule set, asked at its base cell.
-fn collect(w: &dyn Cells, origin: Pos, found: &mut Vec<(Pos, (i32, i32))>) {
+fn collect(w: &dyn Cells, origin: Pos, found: &mut Vec<(Pos, Want)>) {
     for x in -1..=1 {
         for z in -1..=1 {
             for y in -1..=1 {
@@ -266,7 +476,7 @@ fn collect(w: &dyn Cells, origin: Pos, found: &mut Vec<(Pos, (i32, i32))>) {
                     );
                 }
                 if let Some(want) = desired(w, at, block, rot)
-                    && want != (block, rot)
+                    && (want.block, want.rot) != (block, rot)
                     && !found.iter().any(|f| f.0 == at)
                 {
                     found.push((at, want));
@@ -279,7 +489,7 @@ fn collect(w: &dyn Cells, origin: Pos, found: &mut Vec<(Pos, (i32, i32))>) {
 /// One round of neighbour updates at `at`: the cells that want to change
 /// and what to. The caller applies them and asks again at each changed
 /// cell, three steps deep.
-pub fn neighbours(w: &dyn Cells, at: Pos) -> Vec<(Pos, (i32, i32))> {
+pub fn neighbours(w: &dyn Cells, at: Pos) -> Vec<(Pos, Want)> {
     let mut found = Vec::new();
     collect(w, at, &mut found);
     found

@@ -595,6 +595,11 @@ impl Rules {
         Some(r)
     }
 
+    /// Whether a block, turned so, has a supporting top face.
+    pub fn supports_up(&self, id: i32, rot: i32) -> bool {
+        self.rotated(id, rot).is_some_and(|r| !r.1[0].is_empty())
+    }
+
     /// The block's hitbox for a rotation, as one bounding box; `None` for a
     /// plain block.
     fn bounds(&self, id: i32, rot: i32) -> Option<[f32; 6]> {

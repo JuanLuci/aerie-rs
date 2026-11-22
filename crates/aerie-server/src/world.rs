@@ -2029,6 +2029,9 @@ impl Hub {
             fn rules(&self, block: i32) -> Option<&proto::ConnectedBlockRuleSet> {
                 self.rules.block(block)?.connected.as_ref()
             }
+            fn supports_up(&self, block: i32, rot: i32) -> bool {
+                self.rules.supports_up(block, rot)
+            }
         }
         let how = How {
             quiet: true,
@@ -2047,9 +2050,9 @@ impl Hub {
                 })
             };
             if let Some((want, have)) = want
-                && want != have
+                && (want.block, want.rot) != have
             {
-                self.change(g, ground, at, want.0, want.1, how, out);
+                self.change(g, ground, at, want.block, want.rot, how, out);
             }
         }
         let mut queue = std::collections::VecDeque::from([(at, 0)]);
@@ -2063,11 +2066,15 @@ impl Hub {
                 },
                 here,
             );
-            for (p, (block, rot)) in changes {
+            for (p, want) in changes {
                 if !seen.insert(p) || p == here {
                     continue;
                 }
-                self.change(g, ground, p, block, rot, how, out);
+                self.change(g, ground, p, want.block, want.rot, how, out);
+                for (off, block, rot) in want.extra {
+                    let q = (p.0 + off[0], p.1 + off[1], p.2 + off[2]);
+                    self.change(g, ground, q, block, rot, how, out);
+                }
                 if depth + 1 < 3 {
                     queue.push_back((p, depth + 1));
                 }
