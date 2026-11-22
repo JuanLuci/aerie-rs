@@ -1507,6 +1507,11 @@ impl Hub {
     /// Puts `qty` of `item` in the hotbar slot that has it, else the first
     /// free one (or the last), and sends the inventory. Returns the slot.
     pub fn give(&self, id: i32, item: &str, qty: i32) -> Result<usize> {
+        // Only items that exist: a stack of anything else jams the
+        // chains that name the held item.
+        if !self.book.known(item) {
+            return Ok(0);
+        }
         let slot = self.with_inventory(id, |inv| {
             let slot = (0..9)
                 .find(|&i| {
@@ -3462,6 +3467,16 @@ impl Hub {
 
     fn saved_inventory(&self, uuid: uuid::Uuid) -> Option<Inventory> {
         let text = std::fs::read_to_string(self.inventory_file(uuid)?).ok()?;
+        // Items that no longer exist (or never did) are left behind.
+        let text: String = text
+            .lines()
+            .filter(|l| {
+                l.split_whitespace()
+                    .nth(2)
+                    .is_none_or(|i| self.book.known(i))
+            })
+            .map(|l| format!("{l}\n"))
+            .collect();
         Some(Inventory::from_text(&text, |i| self.book.max_durability(i)))
     }
 
@@ -4541,8 +4556,11 @@ impl Hub {
             // The official form: `/give <player> <item> [--quantity=N]`,
             // into the target's pickup sections, with the official reply.
             ("give", [who, item, rest @ ..])
-                if self.names().iter().any(|n| n.eq_ignore_ascii_case(who)) =>
+                if who.starts_with('@')
+                    || self.names().iter().any(|n| n.eq_ignore_ascii_case(who)) =>
             {
+                // `@s` and the like: the player who typed it.
+                let own = who.starts_with('@');
                 let qty = rest
                     .iter()
                     .find_map(|a| a.strip_prefix("--quantity="))
@@ -4553,13 +4571,19 @@ impl Hub {
                     .get(&item.to_lowercase())
                     .cloned()
                     .unwrap_or_else(|| item.to_string());
+                if !self.book.known(&key) {
+                    self.tell(id, &format!("No item is called {item}"));
+                    return Ok(());
+                }
                 let left = {
                     let mut g = self.inner.lock().unwrap();
-                    let Some((_, e)) = g
-                        .players
-                        .iter_mut()
-                        .find(|(_, e)| e.name.eq_ignore_ascii_case(who))
-                    else {
+                    let Some((_, e)) = g.players.iter_mut().find(|(pid, e)| {
+                        if own {
+                            **pid == id
+                        } else {
+                            e.name.eq_ignore_ascii_case(who)
+                        }
+                    }) else {
                         return Ok(());
                     };
                     let items = ItemsView {
@@ -4628,6 +4652,10 @@ impl Hub {
                     .get(&item.to_lowercase())
                     .cloned()
                     .unwrap_or_else(|| item.to_string());
+                if !self.book.known(&key) {
+                    self.tell(id, &format!("No item is called {item}"));
+                    return Ok(());
+                }
                 let slot = self.give(id, &key, qty)?;
                 self.tell(id, &format!("Gave {qty} {key} (hotbar slot {})", slot + 1));
             }

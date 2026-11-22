@@ -577,6 +577,12 @@ impl Book {
         self.items.get(item).map_or(0.0, |i| i.max_durability)
     }
 
+    /// Whether there is such an item (anything goes without the item
+    /// registry, as in tests).
+    pub fn known(&self, item: &str) -> bool {
+        self.items.is_empty() || self.items.contains_key(item)
+    }
+
     /// A new stack of `item` at full durability, as the official server
     /// makes one from an item id.
     pub fn stack(&self, item: &str, n: i32) -> crate::inventory::Stack {
