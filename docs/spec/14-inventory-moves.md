@@ -94,3 +94,12 @@ all, put all, quick stack).
 The same moves sent to both servers (stacks split into storage, moved onto
 themselves, double clicks, shift clicks both ways, a move to the backpack)
 give the same inventories and the same inventory packets.
+
+## Kept between sessions
+
+A player's inventory is kept with the world, and with it the active
+hotbar, utility and tools slots: a player who comes back holds what was
+held when leaving, and the server names those slots right after the
+inventory at join. Aerie writes both when the player leaves and, when
+they changed, with the periodic save (every 150 ticks), so a server that
+stops without warning loses a few seconds at most.

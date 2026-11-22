@@ -91,6 +91,9 @@ pub fn sprint_steps(steps: usize, after: Option<String>) -> Result<String> {
 #[derive(Default)]
 pub struct Options {
     pub name: Option<String>,
+    /// The player's id, to come back as the same player (random
+    /// otherwise).
+    pub uuid: Option<String>,
     /// Chat lines to send once in the world (`;` separates lines).
     pub chat: Option<String>,
     /// Packets to send after the chat lines: `id:hex;id:hex`.
@@ -300,7 +303,11 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
         let mut wire = Vec::new();
         match f.id {
             364 => InsecurePlayerOptionsOut {
-                uuid: Uuid::new_v4(),
+                uuid: opts
+                    .uuid
+                    .as_deref()
+                    .and_then(|u| Uuid::parse_str(u).ok())
+                    .unwrap_or_else(Uuid::new_v4),
                 username: opts.name.clone().unwrap_or_else(|| "AerieProbe".into()),
             }
             .write_frame(&mut wire)?,

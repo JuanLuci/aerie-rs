@@ -111,6 +111,8 @@ struct Entry {
     /// Active utility and tools slots (-1: none).
     utility_slot: i32,
     tools_slot: i32,
+    /// The inventory and active slots as last written to the save.
+    saved_carry: Option<(String, [i32; 3])>,
     /// Its stats (spec 17) and what regeneration asks about it.
     stats: crate::stats::StatMap,
     /// Its item modifiers must be worked out again (equipment changed).
@@ -1408,6 +1410,7 @@ impl Hub {
             if let Ok(p) = player_list_add(everyone) {
                 let _ = tx.send(p);
             }
+            let slots = self.saved_slots(uuid).unwrap_or([0, -1, -1]);
             g.players.insert(
                 id,
                 Entry {
@@ -1429,8 +1432,9 @@ impl Hub {
                     perf_shown: false,
                     columns: Default::default(),
                     prefs: Default::default(),
-                    utility_slot: -1,
-                    tools_slot: -1,
+                    utility_slot: slots[1],
+                    tools_slot: slots[2],
+                    saved_carry: None,
                     stats: {
                         let mut m = crate::stats::StatMap::new(&self.stat_types);
                         if let Some(t) = self.saved_stats(uuid) {
@@ -1440,7 +1444,7 @@ impl Hub {
                     },
                     mods_dirty: true,
                     stats_to_clear: Vec::new(),
-                    hotbar_slot: 0,
+                    hotbar_slot: slots[0],
                     last_held: (None, None),
                     equipment: None,
                     equipment_pending: None,
@@ -1465,6 +1469,7 @@ impl Hub {
         let gone = self.inner.lock().unwrap().players.remove(&id);
         if let Some(e) = gone {
             self.save_inventory(e.uuid, &e.inv);
+            self.save_slots(e.uuid, [e.hotbar_slot, e.utility_slot, e.tools_slot]);
             self.save_stats(e.uuid, &e.stats);
             if let Some(p) = &e.position {
                 self.save_position(e.uuid, p);
@@ -3460,6 +3465,36 @@ impl Hub {
         Some(Inventory::from_text(&text, |i| self.book.max_durability(i)))
     }
 
+    /// The active hotbar, utility and tools slots a player left with
+    /// (kept with the inventory, as on the official server).
+    fn saved_slots(&self, uuid: uuid::Uuid) -> Option<[i32; 3]> {
+        let file = self.inventory_file(uuid)?.with_extension("slots");
+        let text = std::fs::read_to_string(file).ok()?;
+        let v: Vec<i32> = text
+            .split_whitespace()
+            .filter_map(|w| w.parse().ok())
+            .collect();
+        match v[..] {
+            [h, u, t] if (0..9).contains(&h) && u >= -1 && t >= -1 => Some([h, u, t]),
+            _ => None,
+        }
+    }
+
+    fn save_slots(&self, uuid: uuid::Uuid, slots: [i32; 3]) {
+        let Some(f) = self.inventory_file(uuid) else {
+            return;
+        };
+        let r = std::fs::create_dir_all(f.parent().unwrap()).and_then(|_| {
+            std::fs::write(
+                f.with_extension("slots"),
+                format!("{} {} {}\n", slots[0], slots[1], slots[2]),
+            )
+        });
+        if let Err(e) = r {
+            tracing::warn!("saving active slots failed: {e}");
+        }
+    }
+
     fn save_inventory(&self, uuid: uuid::Uuid, inv: &Inventory) {
         let Some(f) = self.inventory_file(uuid) else {
             return;
@@ -3706,6 +3741,17 @@ impl Hub {
     /// lines, an empty line.
     fn save_states(&self, g: &mut Inner) {
         let Some(file) = &self.save else { return };
+        // What players carry, so that a server that stops without
+        // warning loses a few seconds at most.
+        for e in g.players.values_mut() {
+            let slots = [e.hotbar_slot, e.utility_slot, e.tools_slot];
+            let text = e.inv.to_text();
+            if e.saved_carry.as_ref() != Some(&(text.clone(), slots)) {
+                self.save_inventory(e.uuid, &e.inv);
+                self.save_slots(e.uuid, slots);
+                e.saved_carry = Some((text, slots));
+            }
+        }
         let mut text = String::new();
         for (at, st) in &g.processing {
             text += &format!(
