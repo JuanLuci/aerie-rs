@@ -72,3 +72,18 @@ light, creatures and real world generation are next. No Aerie client yet.
 
 Contributions: never paste decompiled code or captured game data into issues,
 pull requests or commits. Describe behaviour in your own words.
+
+## License
+
+Aerie is **source-available**: the code is public, but it is not "open
+source" in the strict sense, because selling it is not allowed. The license is
+the [Apache License 2.0 with the Commons Clause](LICENSE).
+
+In plain words (the [LICENSE](LICENSE) file is what counts):
+
+- **You may** read, build, use and change the code, fork it under the same
+  terms, contribute back, and run your own servers with it.
+- **You may** make videos, streams and guides with it, monetized or not.
+- **You may not** sell Aerie or a product or service whose value comes mainly
+  from it: no paid copies or paid forks, no paid hosting of Aerie as a service.
+- Running a server is also subject to the game's own rules for servers.

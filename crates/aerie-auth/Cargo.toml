@@ -4,6 +4,7 @@ description = "Hytale account login and session-service calls for Aerie (spec 04
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license-file.workspace = true
 
 [dependencies]
 base64 = "0.22"

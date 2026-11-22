@@ -4,6 +4,7 @@ description = "Reads the player's Hytale assets and builds the registries the cl
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license-file.workspace = true
 
 [dependencies]
 aerie-protocol = { path = "../aerie-protocol" }
