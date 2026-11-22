@@ -266,6 +266,9 @@ async fn main() -> Result<()> {
             let hub = world::Hub::with_names(blocks, block_names)
                 .with_gather(gather)
                 .with_perf_hud(args.iter().any(|a| a == "--perf-hud"))
+                .with_creative(
+                    arg(&args, "--game-mode").is_some_and(|m| m.eq_ignore_ascii_case("creative")),
+                )
                 .with_book(book)
                 .with_consume(&consume)
                 .with_rules(rules)

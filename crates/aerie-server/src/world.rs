@@ -184,6 +184,9 @@ pub struct Hub {
     last_tick: Mutex<Option<std::time::Instant>>,
     /// New players see the performance panel (`--perf-hud`).
     perf_hud: bool,
+    /// New players start in creative (`--game-mode creative`; adventure by
+    /// default, as the official server).
+    creative: bool,
 }
 
 /// A position.
@@ -743,6 +746,15 @@ impl Hub {
         600.0
     }
 
+    pub fn with_creative(mut self, on: bool) -> Self {
+        self.creative = on;
+        self
+    }
+
+    pub fn default_creative(&self) -> bool {
+        self.creative
+    }
+
     pub fn with_perf_hud(mut self, on: bool) -> Self {
         self.perf_hud = on;
         self
@@ -842,7 +854,7 @@ impl Hub {
                     position: None,
                     teleport_id: 0,
                     inv: self.saved_inventory(uuid).unwrap_or_default(),
-                    creative: true,
+                    creative: self.creative,
                     view: None,
                     body: None,
                     look: None,
@@ -2813,7 +2825,8 @@ mod interaction_tests {
 
     #[test]
     fn break_and_place() {
-        let hub = Hub::new(HashMap::new());
+        // Creative: a hit breaks at once.
+        let hub = Hub::new(HashMap::new()).with_creative(true);
         hub.set_ground(vec![1; 64], None);
         let (a, mut ra) = hub.join("Ana", uuid::Uuid::from_u128(1));
         hub.interactions(a, &sync(proto::InteractionType::PRIMARY, true, None))

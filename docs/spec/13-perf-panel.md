@@ -8,15 +8,16 @@ server runs, for players and for the test logs.
 The world tick task times each tick (the hub's tick: support checks,
 flushes, block health, items, crafting, inventories). Every second it
 takes a sample: the average and longest tick of that second in ms (the
-budget is 33.3 ms for 30 Hz), ticks per second, the process's resident
-memory, the columns some client has, the entities (players, dropped items,
+budget is 33.3 ms for 30 Hz), ticks per second, the process's memory
+(private bytes on Windows, whose resident set shrinks when another program
+needs memory; the resident set elsewhere) and its resident set, the columns some client has, the entities (players, dropped items,
 items flying to a player) and the players.
 
 ## Log
 
 Every 10 s, with or without the panel, one line:
 `perf: ram <MB> MB, tick avg <ms> ms max <ms> ms (budget 33.3), tps <n>,
-columns <n>, entities <n>, players <n>`, over those 10 s (memory: the
+columns <n>, entities <n>, players <n>, resident <MB> MB`, over those 10 s (memory: the
 highest sample).
 
 ## Panel

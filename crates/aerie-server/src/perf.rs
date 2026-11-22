@@ -50,6 +50,7 @@ struct Window {
     sum_ms: f64,
     max_ms: f64,
     peak_ram: u64,
+    peak_resident: u64,
 }
 
 impl Window {
@@ -79,7 +80,11 @@ pub struct Counts {
 /// One second's (or ten seconds') numbers.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sample {
+    /// The process's own memory: private bytes on Windows (its resident
+    /// set shrinks when other programs need memory), the resident set
+    /// elsewhere.
     pub ram: u64,
+    pub resident: u64,
     pub avg_ms: f64,
     pub max_ms: f64,
     pub tps: f64,
@@ -91,7 +96,7 @@ impl Sample {
     pub fn log_line(&self) -> String {
         format!(
             "perf: ram {:.1} MB, tick avg {:.2} ms max {:.2} ms (budget {:.1}), tps {:.1}, \
-             columns {}, entities {}, players {}",
+             columns {}, entities {}, players {}, resident {:.1} MB",
             mb(self.ram),
             self.avg_ms,
             self.max_ms,
@@ -99,7 +104,8 @@ impl Sample {
             self.tps,
             self.counts.columns,
             self.counts.entities,
-            self.counts.players
+            self.counts.players,
+            mb(self.resident)
         )
     }
 
@@ -111,7 +117,10 @@ impl Sample {
                 format!("tick {:.2} / {:.2} ms", self.avg_ms, self.max_ms),
             ),
             ("#PerfTps.Text", format!("TPS {:.1}", self.tps)),
-            ("#PerfRam.Text", format!("RAM {:.0} MB", mb(self.ram))),
+            (
+                "#PerfRam.Text",
+                format!("RAM {:.0} MB ({:.0} res)", mb(self.ram), mb(self.resident)),
+            ),
             (
                 "#PerfWorld.Text",
                 format!(
@@ -127,9 +136,19 @@ fn mb(b: u64) -> f64 {
     b as f64 / (1024.0 * 1024.0)
 }
 
-/// The process's resident memory in bytes (0 if the system does not say).
-pub fn ram() -> u64 {
-    memory_stats::memory_stats().map_or(0, |m| m.physical_mem as u64)
+/// The process's memory in bytes (0 if the system does not say): its own
+/// (private on Windows, resident elsewhere) and resident.
+pub fn ram() -> (u64, u64) {
+    let Some(m) = memory_stats::memory_stats() else {
+        return (0, 0);
+    };
+    let resident = m.physical_mem as u64;
+    let own = if cfg!(windows) {
+        m.virtual_mem as u64
+    } else {
+        resident
+    };
+    (own, resident)
 }
 
 /// Tick times as the tick task reports them.
@@ -171,11 +190,13 @@ impl Perf {
         let mut due = Due::default();
         let s = now.duration_since(self.second_from);
         if s >= Duration::from_secs(1) {
-            let r = ram();
+            let (r, res) = ram();
             self.ten.peak_ram = self.ten.peak_ram.max(r);
+            self.ten.peak_resident = self.ten.peak_resident.max(res);
             let c = counts();
             due.second = Some(Sample {
                 ram: r,
+                resident: res,
                 avg_ms: self.second.avg_ms(),
                 max_ms: self.second.max_ms,
                 tps: self.second.ticks as f64 / s.as_secs_f64(),
@@ -187,6 +208,7 @@ impl Perf {
             if t >= Duration::from_secs(10) {
                 due.ten = Some(Sample {
                     ram: self.ten.peak_ram,
+                    resident: self.ten.peak_resident,
                     avg_ms: self.ten.avg_ms(),
                     max_ms: self.ten.max_ms,
                     tps: self.ten.ticks as f64 / t.as_secs_f64(),
@@ -287,6 +309,7 @@ mod tests {
     fn panel_commands() {
         let s = Sample {
             ram: 64 << 20,
+            resident: 10 << 20,
             avg_ms: 1.25,
             max_ms: 3.5,
             tps: 30.0,
@@ -295,7 +318,7 @@ mod tests {
         let h = show(&s);
         let c = h.commands.unwrap();
         assert_eq!(c[0].r#type, proto::CustomUICommandType::APPEND_INLINE);
-        assert_eq!(c[3].data.as_deref(), Some(r#"{"0":"RAM 64 MB"}"#));
+        assert_eq!(c[3].data.as_deref(), Some(r#"{"0":"RAM 64 MB (10 res)"}"#));
         assert!(hide().commands.is_none());
     }
 }

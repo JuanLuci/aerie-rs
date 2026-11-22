@@ -614,7 +614,8 @@ fn column(
     Ok(out)
 }
 
-/// Aerie's own world: creative mode on flat terrain (spec 08), sent in the
+/// Aerie's own world: the server's game mode (adventure unless
+/// `--game-mode creative`) on Aerie's terrain (spec 08), sent in the
 /// official server's order: per column a `SetColumn`, then each section with
 /// its environment and fluids. `player` comes from a capture when one is
 /// given (see `captured_player`); otherwise only the client id and game mode.
@@ -636,6 +637,7 @@ fn built(
     overlay: Overlay,
     opaque: &dyn Fn(i32) -> bool,
     damage: &dyn Fn(i32, i32) -> Vec<(u32, Vec<u8>)>,
+    creative: bool,
 ) -> Result<World> {
     let (ccx, ccz) = column_of(start);
     let join = Out::new(
@@ -663,7 +665,11 @@ fn built(
         v.push(Out::new(
             id::SET_GAME_MODE,
             &proto::SetGameMode {
-                game_mode: proto::GameMode::CREATIVE,
+                game_mode: if creative {
+                    proto::GameMode::CREATIVE
+                } else {
+                    proto::GameMode::ADVENTURE
+                },
             },
         )?);
         v.extend(hud_and_time(parts)?);
@@ -945,6 +951,7 @@ async fn in_world(
                     &overlay,
                     &|b| hub.opaque(b),
                     &|x, z| hub.damage_packets(x, z),
+                    hub.default_creative(),
                 )?,
                 false,
             )
@@ -1211,6 +1218,7 @@ mod tests {
             &|_, _, _| Vec::new(),
             &|_| true,
             &|_, _| Vec::new(),
+            false,
         )
         .unwrap();
         let solid = w
