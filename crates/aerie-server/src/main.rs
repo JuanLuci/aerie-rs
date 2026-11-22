@@ -24,6 +24,7 @@ mod perf;
 mod probe;
 mod processing;
 mod proxy;
+mod stats;
 mod support;
 mod terrain;
 mod tls;
@@ -269,6 +270,13 @@ async fn main() -> Result<()> {
             let hub = world::Hub::with_names(blocks, block_names)
                 .with_gather(gather)
                 .with_perf_hud(args.iter().any(|a| a == "--perf-hud"))
+                .with_stats(stats::Types::parse(
+                    &extras
+                        .iter()
+                        .find(|(n, _)| n == stats::TABLE)
+                        .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+                        .unwrap_or_default(),
+                ))
                 .with_creative(
                     arg(&args, "--game-mode").is_some_and(|m| m.eq_ignore_ascii_case("creative")),
                 )
@@ -440,6 +448,11 @@ fn build_registries(assets: Option<String>, capture: Option<&[(u32, Vec<u8>)]>) 
     match registries::physics::table(&ctx) {
         Ok(t) => extras.push((crate::support::TABLE.to_string(), t.into_bytes())),
         Err(e) => warn!("physics table not built: {e}"),
+    }
+    // Stat types as the server runs them.
+    match registries::entity_stat_types::table(&ctx) {
+        Ok(t) => extras.push((crate::stats::TABLE.to_string(), t.into_bytes())),
+        Err(e) => warn!("stats table not built: {e}"),
     }
     // Crafting benches.
     match registries::benches::table(&ctx) {

@@ -109,6 +109,22 @@ struct Entry {
     /// Active utility and tools slots (-1: none).
     utility_slot: i32,
     tools_slot: i32,
+    /// Its stats (spec 17) and what regeneration asks about it.
+    stats: crate::stats::StatMap,
+    /// Its item modifiers must be worked out again (equipment changed).
+    mods_dirty: bool,
+    /// Stats to empty at the next recalculation (a newly held weapon's).
+    stats_to_clear: Vec<i32>,
+    /// The hotbar slot its last interaction chain named.
+    hotbar_slot: i32,
+    /// The held and utility items at the last recalculation.
+    last_held: (Option<String>, Option<String>),
+    /// What clients were last told it wears and holds (armor, right hand,
+    /// left hand), and an update waiting for the next tick.
+    equipment: Option<(Vec<String>, String, String)>,
+    equipment_pending: Option<proto::ComponentUpdate>,
+    sprinting: bool,
+    gliding: bool,
     /// Creative settings from `SyncPlayerPreferences`: reach and no
     /// physics.
     creative_distance: i32,
@@ -262,6 +278,35 @@ pub struct Hub {
     /// New players start in creative (`--game-mode creative`; adventure by
     /// default, as the official server).
     creative: bool,
+    /// The stat types (spec 17).
+    stat_types: crate::stats::Types,
+}
+
+/// Who gets a player's component update.
+#[derive(Clone, Copy, PartialEq)]
+enum Audience {
+    Own,
+    Others,
+    All,
+}
+
+/// What stat regeneration asks about a player.
+struct StatWho {
+    creative: bool,
+    sprinting: bool,
+    gliding: bool,
+}
+
+impl crate::stats::Who for StatWho {
+    fn creative(&self) -> bool {
+        self.creative
+    }
+    fn sprinting(&self) -> bool {
+        self.sprinting
+    }
+    fn gliding(&self) -> bool {
+        self.gliding
+    }
 }
 
 /// A position.
@@ -285,6 +330,9 @@ struct Inner {
     /// Particles of placements, sent after the tick's block changes and
     /// before its heights (as the official server's command buffer does).
     deferred_particles: Vec<Packet>,
+    /// This tick's component updates of players: (player, who sees it,
+    /// the update).
+    stat_updates: Vec<(i32, Audience, proto::ComponentUpdate)>,
     /// Processing bench blocks (spec 16), by main cell.
     processing: BTreeMap<Pos, crate::processing::State>,
     next_id: i32,
@@ -912,6 +960,288 @@ impl Hub {
         600.0
     }
 
+    pub fn with_stats(mut self, t: crate::stats::Types) -> Self {
+        self.stat_types = t;
+        self
+    }
+
+    /// A player's stat values in the order of its first update (spec 17).
+    pub fn stat_values(&self, id: i32) -> Option<Vec<(i32, f32)>> {
+        let g = self.inner.lock().unwrap();
+        let e = g.players.get(&id)?;
+        Some(
+            e.stats
+                .init(&self.stat_types, true)
+                .entity_stat_updates
+                .into_iter()
+                .map(|(i, u)| (i, u[0].value))
+                .collect(),
+        )
+    }
+
+    fn stats_file(&self, uuid: uuid::Uuid) -> Option<std::path::PathBuf> {
+        Some(
+            self.save
+                .as_ref()?
+                .with_file_name("stats")
+                .join(format!("{uuid}.txt")),
+        )
+    }
+
+    fn saved_stats(&self, uuid: uuid::Uuid) -> Option<String> {
+        std::fs::read_to_string(self.stats_file(uuid)?).ok()
+    }
+
+    fn save_stats(&self, uuid: uuid::Uuid, stats: &crate::stats::StatMap) {
+        let Some(f) = self.stats_file(uuid) else {
+            return;
+        };
+        let r = std::fs::create_dir_all(f.parent().unwrap())
+            .and_then(|_| std::fs::write(&f, stats.to_text(&self.stat_types)));
+        if let Err(e) = r {
+            tracing::warn!("saving stats failed: {e}");
+        }
+    }
+
+    /// Stats for one tick (spec 17): regeneration, then each player's
+    /// pending updates are set aside for the tick's entity updates.
+    fn stats_step(&self, g: &mut Inner, dt: f32) {
+        for (pid, e) in g.players.iter_mut() {
+            let who = StatWho {
+                creative: e.creative,
+                sprinting: e.sprinting,
+                gliding: e.gliding,
+            };
+            self.recalculate_modifiers(e);
+            // Creative players are invulnerable.
+            e.stats.regenerate(&self.stat_types, &who, dt, e.creative);
+            if e.view.is_none() {
+                continue;
+            }
+            let (own, others) = e.stats.take_updates();
+            if let Some(u) = own {
+                g.stat_updates.push((
+                    *pid,
+                    Audience::Own,
+                    proto::ComponentUpdate::EntityStatsUpdate(Box::new(u)),
+                ));
+            }
+            if let Some(u) = others {
+                g.stat_updates.push((
+                    *pid,
+                    Audience::Others,
+                    proto::ComponentUpdate::EntityStatsUpdate(Box::new(u)),
+                ));
+            }
+            // What it wears and holds, shown to everyone the tick after it
+            // changed (spec 17).
+            if let Some(u) = e.equipment_pending.take() {
+                g.stat_updates.push((*pid, Audience::All, u));
+            }
+            let mut armor = vec![String::new(); 4];
+            for (i, a) in armor.iter_mut().enumerate() {
+                if let Some(s) = e.inv.get(inventory::ARMOR, i as i32) {
+                    *a = s.item;
+                }
+            }
+            let hand = |s: Option<Stack>| s.map_or("Empty".to_owned(), |s| s.item);
+            let now = (
+                armor,
+                hand(e.inv.get(inventory::HOTBAR, e.hotbar_slot)),
+                hand(
+                    (e.utility_slot >= 0)
+                        .then(|| e.inv.get(inventory::UTILITY, e.utility_slot))
+                        .flatten(),
+                ),
+            );
+            if e.equipment.as_ref() != Some(&now) {
+                let first = e.equipment.is_none();
+                e.equipment = Some(now.clone());
+                let u = proto::ComponentUpdate::EquipmentUpdate(Box::new(proto::EquipmentUpdate {
+                    armor_ids: Some(now.0),
+                    right_hand_item_id: Some(now.1),
+                    left_hand_item_id: Some(now.2),
+                }));
+                // New joiners see it as it is now.
+                if let Some(v) = e.view.as_mut() {
+                    for c in v.updates.iter_mut().flatten() {
+                        if matches!(c, proto::ComponentUpdate::EquipmentUpdate(_)) {
+                            *c = u.clone();
+                        }
+                    }
+                }
+                let empty = e.equipment.as_ref().is_some_and(|q| {
+                    q.0.iter().all(String::is_empty) && q.1 == "Empty" && q.2 == "Empty"
+                });
+                if !(first && empty) {
+                    e.equipment_pending = Some(u);
+                }
+            }
+        }
+    }
+
+    /// A player's stat modifiers from what it wears and holds (spec 17),
+    /// worked out again when its equipment changed: a newly held weapon's
+    /// or utility item's stats are emptied first, then the armor's summed
+    /// modifiers, the held weapon's and (when the held item allows a
+    /// utility item) the utility item's.
+    fn recalculate_modifiers(&self, e: &mut Entry) {
+        let t = &self.stat_types;
+        let held = e.inv.get(inventory::HOTBAR, e.hotbar_slot);
+        let utility = (e.utility_slot >= 0)
+            .then(|| e.inv.get(inventory::UTILITY, e.utility_slot))
+            .flatten();
+        let now = (
+            held.as_ref().map(|s| s.item.clone()),
+            utility.as_ref().map(|s| s.item.clone()),
+        );
+        if now != e.last_held {
+            if now.0 != e.last_held.0
+                && let Some(s) = now.0.as_deref().and_then(|i| self.book.item_stats(i))
+            {
+                e.stats_to_clear.extend(&s.weapon_clear);
+            }
+            if now.1 != e.last_held.1
+                && let Some(s) = now.1.as_deref().and_then(|i| self.book.item_stats(i))
+            {
+                e.stats_to_clear.extend(&s.utility_clear);
+            }
+            e.last_held = now;
+            e.mods_dirty = true;
+        }
+        if !e.mods_dirty {
+            return;
+        }
+        e.mods_dirty = false;
+        for i in std::mem::take(&mut e.stats_to_clear) {
+            e.stats
+                .minimize(t, i as usize, crate::stats::Predictable::Own);
+        }
+        // Effects give none yet.
+        e.stats.apply_summed(t, "Effect", &[]);
+        let mut sums = Vec::new();
+        for slot in 0..4 {
+            let Some(st) = e.inv.get(inventory::ARMOR, slot) else {
+                continue;
+            };
+            let Some(s) = self.book.item_stats(&st.item) else {
+                continue;
+            };
+            for (stat, mods) in &s.armor {
+                for m in mods {
+                    let mut a = m.amount;
+                    if st.broken() {
+                        a *= self.gather.broken_armor_penalty as f32;
+                    }
+                    sums.push((*stat, m.multiplicative, a));
+                }
+            }
+        }
+        e.stats.apply_summed(t, "Armor", &sums);
+        let held_stats = held.as_ref().and_then(|s| self.book.item_stats(&s.item));
+        e.stats
+            .apply_item(t, "*Weapon_", held_stats.and_then(|s| s.weapon.as_deref()));
+        if held_stats.is_none_or(|s| s.utility_compatible) {
+            let u = utility
+                .as_ref()
+                .and_then(|s| self.book.item_stats(&s.item))
+                .and_then(|s| s.utility.as_deref());
+            e.stats.apply_item(t, "*Utility_", u);
+        }
+    }
+
+    /// `/player stats …` as the official command: add, set, get, reset,
+    /// settomax; the reply is the official message.
+    fn stats_command(&self, id: i32, args: &[&str]) -> Result<()> {
+        let reply = |key: &str, name: &str, value: Option<f32>| -> Result<Packet> {
+            let mut params = vec![(
+                "name".to_owned(),
+                proto::ParamValue::StringParamValue(Box::new(proto::StringParamValue {
+                    value: Some(name.to_owned()),
+                })),
+            )];
+            if let Some(v) = value {
+                params.push((
+                    "value".to_owned(),
+                    proto::ParamValue::DoubleParamValue(Box::new(proto::DoubleParamValue {
+                        value: v as f64,
+                    })),
+                ));
+            }
+            packet(
+                id::SERVER_MESSAGE,
+                &proto::ServerMessage {
+                    r#type: proto::ChatType::CHAT,
+                    message: Some(proto::FormattedMessage {
+                        message_id: Some(key.to_owned()),
+                        params: Some(params),
+                        ..Default::default()
+                    }),
+                },
+            )
+        };
+        let (op, name, amount) = match args {
+            [op, name] => (*op, *name, None),
+            [op, name, n] => (*op, *name, n.parse::<i32>().ok()),
+            _ => {
+                self.tell(
+                    id,
+                    "Usage: /player stats <add|set|get|reset|settomax> <stat> [value]",
+                );
+                return Ok(());
+            }
+        };
+        let t = &self.stat_types;
+        let Some(i) = t.index(name) else {
+            self.send(
+                id,
+                reply("server.commands.entityStats.entityStatNotFound", name, None)?,
+            );
+            return Ok(());
+        };
+        use crate::stats::Predictable::None as NoPrediction;
+        let answer = {
+            let mut g = self.inner.lock().unwrap();
+            let Some(e) = g.players.get_mut(&id) else {
+                return Ok(());
+            };
+            match (op, amount) {
+                ("add", Some(n)) => Some((
+                    "server.commands.entityStats.success",
+                    e.stats.add(t, i, n as f32, NoPrediction),
+                )),
+                ("set", Some(n)) => Some((
+                    "server.commands.entityStats.success",
+                    e.stats.set(t, i, n as f32, NoPrediction),
+                )),
+                ("settomax", _) => {
+                    let max = e.stats.max(i).unwrap_or(0.0);
+                    Some((
+                        "server.commands.entityStats.success",
+                        e.stats.set(t, i, max, NoPrediction),
+                    ))
+                }
+                ("reset", _) => Some((
+                    "server.commands.entityStats.valueReset",
+                    e.stats.reset(t, i),
+                )),
+                ("get", _) => Some((
+                    "server.commands.entityStats.value",
+                    e.stats.get(i).unwrap_or(0.0),
+                )),
+                _ => None,
+            }
+        };
+        match answer {
+            Some((key, v)) => self.send(id, reply(key, name, Some(v))?),
+            None => self.tell(
+                id,
+                "Usage: /player stats <add|set|get|reset|settomax> <stat> [value]",
+            ),
+        }
+        Ok(())
+    }
+
     pub fn with_creative(mut self, on: bool) -> Self {
         self.creative = on;
         self
@@ -1034,6 +1364,21 @@ impl Hub {
                     prefs: Default::default(),
                     utility_slot: -1,
                     tools_slot: -1,
+                    stats: {
+                        let mut m = crate::stats::StatMap::new(&self.stat_types);
+                        if let Some(t) = self.saved_stats(uuid) {
+                            m.load(&self.stat_types, &t);
+                        }
+                        m
+                    },
+                    mods_dirty: true,
+                    stats_to_clear: Vec::new(),
+                    hotbar_slot: 0,
+                    last_held: (None, None),
+                    equipment: None,
+                    equipment_pending: None,
+                    sprinting: false,
+                    gliding: false,
                     creative_distance: 10,
                     no_physics: false,
                     placed_ops: Default::default(),
@@ -1050,6 +1395,7 @@ impl Hub {
         let gone = self.inner.lock().unwrap().players.remove(&id);
         if let Some(e) = gone {
             self.save_inventory(e.uuid, &e.inv);
+            self.save_stats(e.uuid, &e.stats);
             if let Some(p) = &e.position {
                 self.save_position(e.uuid, p);
             }
@@ -2281,6 +2627,9 @@ impl Hub {
                 w.dirty = true;
             }
             if !e.inv_dirty.is_empty() {
+                if e.inv_dirty.contains(&inventory::ARMOR) {
+                    e.mods_dirty = true;
+                }
                 let which: Vec<i32> = std::mem::take(&mut e.inv_dirty).into_iter().collect();
                 if let Ok(p) = packet(id::UPDATE_PLAYER_INVENTORY, &e.inv.packet_of(&which)) {
                     out.to.push((pid, p));
@@ -2601,6 +2950,10 @@ impl Hub {
         if m.body_orientation.is_some() {
             e.body = m.body_orientation.clone();
         }
+        if let Some(ms) = &m.movement_states {
+            e.sprinting = ms.sprinting;
+            e.gliding = ms.gliding;
+        }
         if m.look_orientation.is_some() {
             e.look = m.look_orientation.clone();
         }
@@ -2653,6 +3006,58 @@ impl Hub {
         let Some(e) = g.players.get_mut(&id) else {
             return Ok(());
         };
+        // Its own client sees it once more as the entity tracker shows it
+        // (spec 17): model, name plate, hitbox collision, equipment, UI
+        // components, every stat, effects.
+        {
+            use proto::ComponentUpdate as C;
+            let all = e.stats.init(&self.stat_types, true);
+            let rank = |c: &C| match c {
+                C::ModelUpdate(_) => Some(0),
+                C::NameplateUpdate(_) => Some(1),
+                C::HitboxCollisionUpdate(_) => Some(2),
+                C::EquipmentUpdate(_) => Some(3),
+                C::UIComponentsUpdate(_) => Some(4),
+                C::EntityStatsUpdate(_) => Some(5),
+                C::EntityEffectsUpdate(_) => Some(6),
+                _ => None,
+            };
+            let mut parts: Vec<(i32, C)> = view
+                .updates
+                .iter()
+                .flatten()
+                .filter_map(|c| Some((rank(c)?, c.clone())))
+                .collect();
+            parts.sort_by_key(|(r, _)| *r);
+            let parts: Vec<C> = parts
+                .into_iter()
+                .map(|(_, c)| match c {
+                    C::EntityStatsUpdate(_) => C::EntityStatsUpdate(Box::new(all.clone())),
+                    c => c,
+                })
+                .collect();
+            if let Ok(p) = packet(
+                id::ENTITY_UPDATES,
+                &proto::EntityUpdates {
+                    removed: None,
+                    updates: Some(vec![proto::EntityUpdate {
+                        network_id: id,
+                        removed: None,
+                        updates: Some(parts),
+                    }]),
+                },
+            ) {
+                let _ = e.outbox.send(p);
+            }
+        }
+        // Others see its shared stats only, at their current values.
+        let mut view = view;
+        let shared = e.stats.init(&self.stat_types, false);
+        for c in view.updates.iter_mut().flatten() {
+            if let proto::ComponentUpdate::EntityStatsUpdate(s) = c {
+                **s = shared.clone();
+            }
+        }
         e.view = Some(view.clone());
         let mine = packet(
             id::ENTITY_UPDATES,
@@ -2669,8 +3074,12 @@ impl Hub {
             if let Some(v) = &o.view {
                 let _ = o.outbox.send(mine.clone());
                 let mut v = v.clone();
-                // Where it is now.
+                // Where it is now, with its stats as they are.
+                let stats = o.stats.init(&self.stat_types, false);
                 for c in v.updates.iter_mut().flatten() {
+                    if let proto::ComponentUpdate::EntityStatsUpdate(s) = c {
+                        **s = stats.clone();
+                    }
                     if let proto::ComponentUpdate::TransformUpdate(t) = c {
                         t.transform.position = o.position.clone().or(t.transform.position.take());
                         if o.body.is_some() {
@@ -2770,6 +3179,14 @@ impl Hub {
             }
             Ok(())
         };
+        // The hotbar slot the client's chains name (until chains run on
+        // the server, the held item follows the client).
+        if let Some(c) = m.updates.first()
+            && let Some(e) = self.inner.lock().unwrap().players.get_mut(&_player)
+            && (0..9).contains(&c.active_hotbar_slot)
+        {
+            e.hotbar_slot = c.active_hotbar_slot;
+        }
         for c in &m.updates {
             self.consume_step(_player, c)?;
             walk(c)?;
@@ -3158,6 +3575,86 @@ impl Hub {
                 self.with_inventory(id, |inv| *inv = Inventory::default())?;
                 self.tell(id, "Inventory cleared");
             }
+            // The official form: `/give <player> <item> [--quantity=N]`,
+            // into the target's pickup sections, with the official reply.
+            ("give", [who, item, rest @ ..])
+                if self.names().iter().any(|n| n.eq_ignore_ascii_case(who)) =>
+            {
+                let qty = rest
+                    .iter()
+                    .find_map(|a| a.strip_prefix("--quantity="))
+                    .and_then(|q| q.parse::<i32>().ok())
+                    .unwrap_or(1);
+                let key = self
+                    .names
+                    .get(&item.to_lowercase())
+                    .cloned()
+                    .unwrap_or_else(|| item.to_string());
+                let left = {
+                    let mut g = self.inner.lock().unwrap();
+                    let Some((_, e)) = g
+                        .players
+                        .iter_mut()
+                        .find(|(_, e)| e.name.eq_ignore_ascii_case(who))
+                    else {
+                        return Ok(());
+                    };
+                    let items = ItemsView {
+                        book: &self.book,
+                        rules: &self.rules,
+                        bench: None,
+                        processing: None,
+                    };
+                    let order = e.prefs.order_for(inventory::Items::kind(&items, &key));
+                    let before = e.inv.clone();
+                    let left = e.inv.add_to(&items, &order, &self.book.stack(&key, qty));
+                    let changed = e.inv.changed_since(&before);
+                    e.inv_dirty.extend(changed);
+                    left
+                };
+                let name = proto::FormattedMessage {
+                    message_id: Some(self.book.item_name(&key)),
+                    ..Default::default()
+                };
+                let int = |v: i32| {
+                    proto::ParamValue::IntParamValue(Box::new(proto::IntParamValue { value: v }))
+                };
+                let msg = if left > 0 {
+                    proto::FormattedMessage {
+                        message_id: Some("server.commands.give.insufficientInvSpace".into()),
+                        params: Some(vec![("quantity".into(), int(qty))]),
+                        message_params: Some(vec![("item".into(), name)]),
+                        ..Default::default()
+                    }
+                } else {
+                    proto::FormattedMessage {
+                        message_id: Some("server.commands.give.gave".into()),
+                        params: Some(vec![
+                            (
+                                "targetUsername".into(),
+                                proto::ParamValue::StringParamValue(Box::new(
+                                    proto::StringParamValue {
+                                        value: Some((*who).to_owned()),
+                                    },
+                                )),
+                            ),
+                            ("quantity".into(), int(qty)),
+                        ]),
+                        message_params: Some(vec![("item".into(), name)]),
+                        ..Default::default()
+                    }
+                };
+                self.send(
+                    id,
+                    packet(
+                        id::SERVER_MESSAGE,
+                        &proto::ServerMessage {
+                            r#type: proto::ChatType::CHAT,
+                            message: Some(msg),
+                        },
+                    )?,
+                );
+            }
             ("give", [item, rest @ ..]) => {
                 let qty = rest.first().and_then(|q| q.parse().ok()).unwrap_or(100);
                 // Block keys are matched case-insensitively; anything else is
@@ -3265,6 +3762,7 @@ impl Hub {
                     _ => self.tell(id, "Usage: /tp <x> <y> <z> (numbers, or ~ for relative)"),
                 }
             }
+            ("player", ["stats", rest @ ..]) => self.stats_command(id, rest)?,
             ("gamemode", [mode]) => {
                 let m = match mode.to_ascii_lowercase().as_str() {
                     "creative" | "c" | "1" => Some(proto::GameMode::CREATIVE),
@@ -4161,6 +4659,7 @@ impl Hub {
             hub.processing_step(g, ground, dt, out);
             hub.flush(g, ground, out);
             hub.health_step(g, dt, out);
+            hub.stats_step(g, dt);
             hub.items_step(g, ground, dt, out);
             hub.crafting_step(g, ground, dt, out);
             hub.send_player_updates(g, out);
@@ -4670,15 +5169,55 @@ impl Hub {
         ) {
             out.all.push(p);
         }
-        if !updates.is_empty() || !gone.is_empty() {
-            if let Ok(p) = packet(
-                id::ENTITY_UPDATES,
-                &proto::EntityUpdates {
-                    removed: (!gone.is_empty()).then_some(gone),
-                    updates: (!updates.is_empty()).then_some(updates),
-                },
-            ) {
+        let stat_updates = std::mem::take(&mut g.stat_updates);
+        if stat_updates.is_empty() {
+            if (!updates.is_empty() || !gone.is_empty())
+                && let Ok(p) = packet(
+                    id::ENTITY_UPDATES,
+                    &proto::EntityUpdates {
+                        removed: (!gone.is_empty()).then_some(gone),
+                        updates: (!updates.is_empty()).then_some(updates),
+                    },
+                )
+            {
                 out.all.push(p);
+            }
+            return;
+        }
+        // Stats changed: each player gets its own stats in full and the
+        // others' shared stats, with the tick's other entity updates.
+        let viewers: Vec<i32> = g
+            .players
+            .iter()
+            .filter(|(_, e)| e.view.is_some())
+            .map(|(i, _)| *i)
+            .collect();
+        for viewer in viewers {
+            let mut mine = updates.clone();
+            for (pid, audience, u) in &stat_updates {
+                let sees = match audience {
+                    Audience::Own => *pid == viewer,
+                    Audience::Others => *pid != viewer,
+                    Audience::All => true,
+                };
+                if sees {
+                    mine.push(proto::EntityUpdate {
+                        network_id: *pid,
+                        removed: None,
+                        updates: Some(vec![u.clone()]),
+                    });
+                }
+            }
+            if (!mine.is_empty() || !gone.is_empty())
+                && let Ok(p) = packet(
+                    id::ENTITY_UPDATES,
+                    &proto::EntityUpdates {
+                        removed: (!gone.is_empty()).then_some(gone.clone()),
+                        updates: (!mine.is_empty()).then_some(mine),
+                    },
+                )
+            {
+                out.to.push((viewer, p));
             }
         }
     }

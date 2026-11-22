@@ -271,6 +271,7 @@ pub fn table(ctx: &Ctx) -> Result<String> {
             .and_then(|x| x.obj("BrokenPenalties"))
         {
             out += &format!("X tool {}\n", p.f64_or("Tool", 0.0));
+            out += &format!("X armor {}\n", p.f64_or("Armor", 0.0));
         }
         if let Some(g) = d.obj("Gathering") {
             for (name, key) in [

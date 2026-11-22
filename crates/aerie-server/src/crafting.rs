@@ -240,6 +240,41 @@ struct ItemInfo {
     ability: Option<crate::inventory::Ability>,
     /// `InteractionConfig.UseDistance` (adventure, creative).
     use_distance: (Option<f32>, Option<f32>),
+    /// Stat modifiers and stats to clear (spec 17): armor, weapon, utility.
+    stat_mods: ItemStats,
+}
+
+/// What an item does to its holder's stats (spec 17).
+#[derive(Clone, Debug, Default)]
+pub struct ItemStats {
+    pub armor: Vec<(i32, Vec<crate::stats::Modifier>)>,
+    pub weapon: Option<Vec<(i32, Vec<crate::stats::Modifier>)>>,
+    pub weapon_clear: Vec<i32>,
+    pub utility: Option<Vec<(i32, Vec<crate::stats::Modifier>)>>,
+    pub utility_clear: Vec<i32>,
+    pub utility_compatible: bool,
+}
+
+fn stat_mods(
+    v: &Option<Vec<(i32, Vec<proto::Modifier>)>>,
+) -> Option<Vec<(i32, Vec<crate::stats::Modifier>)>> {
+    v.as_ref().map(|v| {
+        v.iter()
+            .map(|(i, ms)| {
+                (
+                    *i,
+                    ms.iter()
+                        .map(|m| crate::stats::Modifier {
+                            max: m.target == proto::ModifierTarget::MAX,
+                            multiplicative: m.calculation_type
+                                == proto::CalculationType::MULTIPLICATIVE,
+                            amount: m.amount,
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
+    })
 }
 
 #[derive(Default)]
@@ -323,6 +358,35 @@ impl Book {
                                     usable: it.utility.as_ref().is_some_and(|u| u.usable),
                                     weapon_or_tool: it.weapon.is_some() || it.tool.is_some(),
                                     block_id: it.block_id,
+                                    stat_mods: ItemStats {
+                                        armor: it
+                                            .armor
+                                            .as_ref()
+                                            .and_then(|a| stat_mods(&a.stat_modifiers))
+                                            .unwrap_or_default(),
+                                        weapon: it
+                                            .weapon
+                                            .as_ref()
+                                            .and_then(|w| stat_mods(&w.stat_modifiers)),
+                                        weapon_clear: it
+                                            .weapon
+                                            .as_ref()
+                                            .and_then(|w| w.entity_stats_to_clear.clone())
+                                            .unwrap_or_default(),
+                                        utility: it
+                                            .utility
+                                            .as_ref()
+                                            .and_then(|u| stat_mods(&u.stat_modifiers)),
+                                        utility_clear: it
+                                            .utility
+                                            .as_ref()
+                                            .and_then(|u| u.entity_stats_to_clear.clone())
+                                            .unwrap_or_default(),
+                                        utility_compatible: it
+                                            .utility
+                                            .as_ref()
+                                            .is_some_and(|u| u.compatible),
+                                    },
                                     use_distance: it
                                         .interaction_config
                                         .as_ref()
@@ -452,6 +516,10 @@ impl Book {
         } else {
             d.0.unwrap_or(5.0)
         }
+    }
+
+    pub fn item_stats(&self, item: &str) -> Option<&ItemStats> {
+        self.items.get(item).map(|i| &i.stat_mods)
     }
 
     pub fn armor_slot(&self, item: &str) -> Option<i32> {

@@ -83,3 +83,48 @@ pub fn build(ctx: &Ctx) -> Result<UpdateEntityStatTypes> {
         types: Some(map),
     })
 }
+
+/// What the server needs to run stats (spec 17), as text lines for the
+/// start-up cache: per stat `S index key initial min max shared reset
+/// ignoreInvulnerability` (reset: 0 initial value, 1 max value), and per
+/// `Regenerating` entry, in order, `R index interval amount percentage
+/// clampAtZero <json>`, the JSON holding the entry's `Conditions` and
+/// `Modifiers` as written.
+pub fn table(ctx: &Ctx) -> Result<String> {
+    let store = ctx.store(PATH)?;
+    let order = ctx.order(PATH, BUILTIN)?;
+    let mut out = String::new();
+    for (i, k) in order.iter().enumerate() {
+        let nul = Value::Null;
+        let a = store.assets.get(k).unwrap_or(&nul);
+        out += &format!(
+            "S {i} {k} {} {} {} {} {} {}\n",
+            a.f64_or("InitialValue", 0.0),
+            a.f64_or("Min", 0.0),
+            a.f64_or("Max", 0.0),
+            a.bool_or("Shared", false) as u8,
+            (a.str_at("ResetType").as_deref() == Some("MaxValue")) as u8,
+            a.bool_or("IgnoreInvulnerability", false) as u8,
+        );
+        for r in a
+            .get("Regenerating")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let extra = serde_json::json!({
+                "Conditions": r.get("Conditions").cloned().unwrap_or(Value::Null),
+                "Modifiers": r.get("Modifiers").cloned().unwrap_or(Value::Null),
+            });
+            out += &format!(
+                "R {i} {} {} {} {} {}\n",
+                r.f64_or("Interval", 0.0),
+                r.f64_or("Amount", 0.0),
+                (r.str_at("RegenType").as_deref() == Some("Percentage")) as u8,
+                r.bool_or("ClampAtZero", false) as u8,
+                extra,
+            );
+        }
+    }
+    Ok(out)
+}

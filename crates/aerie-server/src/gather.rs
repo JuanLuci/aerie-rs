@@ -78,6 +78,8 @@ pub struct Table {
     /// The gameplay config's broken tool penalty (0.75: a quarter of the
     /// power left).
     pub broken_tool_penalty: f64,
+    /// The gameplay config's broken armor penalty.
+    pub broken_armor_penalty: f64,
 }
 
 /// What one hit does (spec 12).
@@ -206,6 +208,7 @@ impl Table {
                     );
                 }
                 ["X", "tool", v] => t.broken_tool_penalty = v.parse().unwrap_or(0.0),
+                ["X", "armor", v] => t.broken_armor_penalty = v.parse().unwrap_or(0.0),
                 ["E", kind, particle, sound] => {
                     let e = Effect {
                         particle: opt(particle),

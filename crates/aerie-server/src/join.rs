@@ -120,7 +120,7 @@ pub(crate) mod settings_id {
 /// What the player's own entity is built from: the `Player` model (from the
 /// assets) and the initial value of each entity stat type (from the built
 /// `UpdateEntityStatTypes` registry).
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PlayerParts {
     model: Option<proto::Model>,
     stats: Vec<(i32, f32)>,
@@ -142,6 +142,21 @@ impl PlayerParts {
                     None
                 }
             });
+        // An entity's model lists its animation sets in the official
+        // server's map order (spec 17).
+        let model = model.map(|mut m: proto::Model| {
+            if let Some(sets) = m.animation_sets.take() {
+                let keys: Vec<String> = sets.iter().map(|(k, _)| k.clone()).collect();
+                let mut sets: Vec<Option<_>> = sets.into_iter().map(Some).collect();
+                m.animation_sets = Some(
+                    crate::changes::string_map_order(&keys)
+                        .into_iter()
+                        .filter_map(|i| sets[i].take())
+                        .collect(),
+                );
+            }
+            m
+        });
         let stats = registries
             .iter()
             .find(|(i, _)| *i == id::UPDATE_ENTITY_STAT_TYPES)
@@ -945,7 +960,14 @@ async fn in_world(
                     client_id,
                     &layers,
                     generator.as_ref(),
-                    &settings.player,
+                    &{
+                        // The player's own stats as saved (spec 17).
+                        let mut p = settings.player.clone();
+                        if let Some(s) = hub.stat_values(client_id) {
+                            p.stats = s;
+                        }
+                        p
+                    },
                     captured,
                     start,
                     &overlay,

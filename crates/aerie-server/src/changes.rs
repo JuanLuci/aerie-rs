@@ -20,6 +20,63 @@ pub fn map_order(keys: impl IntoIterator<Item = i32>) -> Vec<i32> {
     s.iter()
 }
 
+/// `String.hashCode` over UTF-16 code units.
+fn java_hash(s: &str) -> u32 {
+    s.encode_utf16()
+        .fold(0u32, |h, c| h.wrapping_mul(31).wrapping_add(c as u32))
+}
+
+/// The order the official server lists a string-keyed map in an entity's
+/// model (its animation sets): the keys as a Java hash map iterates them
+/// (buckets of `h ^ h >>> 16` in a table of the smallest power of two the
+/// entries fit at 3/4 load, insertion order inside a bucket), put into an
+/// open addressing table made for that many entries (mixed hash, linear
+/// probing), read from its last slot down, and put through such a table
+/// once more.
+pub fn string_map_order(keys: &[String]) -> Vec<usize> {
+    let n = keys.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut table = 16usize;
+    while n as f64 > table as f64 * 0.75 {
+        table *= 2;
+    }
+    let mut first: Vec<(usize, usize)> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| {
+            let h = java_hash(k);
+            (((h ^ (h >> 16)) as usize) & (table - 1), i)
+        })
+        .collect();
+    first.sort();
+    // Two open addressing tables in a row: the asset keeps its sets in
+    // one, and the packet's map is filled from that one's order.
+    let open = |order: Vec<usize>| -> Vec<usize> {
+        let size = table_size(n);
+        let mut slots: Vec<Option<usize>> = vec![None; size];
+        for i in order {
+            let mut pos = mix(java_hash(&keys[i]) as i32) as usize & (size - 1);
+            while slots[pos].is_some() {
+                pos = (pos + 1) & (size - 1);
+            }
+            slots[pos] = Some(i);
+        }
+        slots.into_iter().rev().flatten().collect()
+    };
+    open(open(first.into_iter().map(|(_, i)| i).collect()))
+}
+
+/// [`map_order`] for a table made for `expected` entries.
+pub fn order_in(expected: usize, keys: impl IntoIterator<Item = i32>) -> Vec<i32> {
+    let mut s = IntSet::with_capacity(table_size(expected));
+    for k in keys {
+        s.insert(k);
+    }
+    s.iter()
+}
+
 /// An integer set iterated in the official server's order.
 #[derive(Clone, Debug)]
 pub struct IntSet {

@@ -1,0 +1,4 @@
+/player stats add Stamina -5
+/player stats add Health -30
+/player stats set Mana 40
+/give Prober Armor_Trooper_Head
