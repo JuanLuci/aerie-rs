@@ -1505,6 +1505,9 @@ impl Hub {
         match packet_id {
             self::id::MOVE_ITEM_STACK => {
                 let (m, _) = proto::MoveItemStack::decode(payload, 0)?;
+                if self.swap_move(id, &m) {
+                    return Ok(());
+                }
                 self.inventory_move(id, |inv, items, _, _| {
                     inv.move_to_slot(
                         items,
@@ -1608,6 +1611,16 @@ impl Hub {
         f: impl FnOnce(&mut Inventory, &ItemsView, &inventory::Preferences, Option<i32>),
     ) {
         let mut g = self.inner.lock().unwrap();
+        self.inventory_move_in(&mut g, id, f);
+    }
+
+    /// [`Hub::inventory_move`] with the world already in hand.
+    fn inventory_move_in(
+        &self,
+        g: &mut Inner,
+        id: i32,
+        f: impl FnOnce(&mut Inventory, &ItemsView, &inventory::Preferences, Option<i32>),
+    ) {
         let Inner {
             players,
             processing,
@@ -1703,6 +1716,62 @@ impl Hub {
         if window_touched && let Some(w) = e.window.as_mut() {
             w.dirty = true;
         }
+    }
+
+    /// A move that changes the kind of item in the active hotbar slot does
+    /// not happen at once: the server starts a swap chain for the held
+    /// item, and the move is made when that chain changes the slot (spec
+    /// 18). False when the move is a plain one.
+    fn swap_move(&self, id: i32, m: &proto::MoveItemStack) -> bool {
+        use aerie_protocol::proto::InteractionType as IT;
+        let mut g = self.inner.lock().unwrap();
+        let Some(e) = g.players.get_mut(&id) else {
+            return false;
+        };
+        let active = e.hotbar_slot;
+        let to_active = m.to_section_id == inventory::HOTBAR && m.to_slot_id == active;
+        let from_active = m.from_section_id == inventory::HOTBAR && m.from_slot_id == active;
+        if !(to_active || from_active) || m.from_section_id >= 0 || m.to_section_id >= 0 {
+            return false;
+        }
+        let from = e.inv.get(m.from_section_id, m.from_slot_id);
+        let to = e.inv.get(m.to_section_id, m.to_slot_id);
+        let (Some(from), Some(to)) = (from, to) else {
+            return false;
+        };
+        if from.item == to.item {
+            return false;
+        }
+        let held = e
+            .inv
+            .get(inventory::HOTBAR, active)
+            .map(|s| s.item)
+            .filter(|i| !i.is_empty() && i != "Empty");
+        let Some(root) = self.chains.held_root(held.as_deref(), IT::SWAP_FROM) else {
+            return false;
+        };
+        let slot = if to_active { m.to_slot_id } else { active };
+        let ctx = crate::chains::Ctx {
+            section: inventory::HOTBAR,
+            slot: active,
+            original: held.clone(),
+            held,
+            target_slot: Some(slot),
+            moved: Some(crate::chains::Move {
+                from: (m.from_section_id, m.from_slot_id),
+                quantity: m.quantity,
+                to: (m.to_section_id, m.to_slot_id),
+            }),
+            ..Default::default()
+        };
+        let data = proto::InteractionChainData {
+            entity_id: -1,
+            target_slot: -slot - 1,
+            ..Default::default()
+        };
+        e.chains
+            .start_server(&self.chains, IT::SWAP_FROM, ctx, root, data);
+        true
     }
 
     /// `SetActiveSlot` (spec 14): the utility or tools slot in use. The
@@ -2771,6 +2840,36 @@ impl Hub {
             packet(id::UPDATE_PLAYER_INVENTORY, &e.inv.packet())?
         };
         self.send(id, p);
+        Ok(())
+    }
+
+    /// The player's active slots (hotbar, utility, tools), as the official
+    /// server tells them right after the inventory at join: chains name
+    /// them and are refused when they differ (spec 18).
+    pub fn send_active_slots(&self, id: i32) -> Result<()> {
+        let slots = {
+            let g = self.inner.lock().unwrap();
+            let Some(e) = g.players.get(&id) else {
+                return Ok(());
+            };
+            [
+                (inventory::HOTBAR, e.hotbar_slot),
+                (inventory::UTILITY, e.utility_slot),
+                (-8, e.tools_slot),
+            ]
+        };
+        for (section, slot) in slots {
+            self.send(
+                id,
+                packet(
+                    id::SET_ACTIVE_SLOT,
+                    &proto::SetActiveSlot {
+                        inventory_section_id: section,
+                        active_slot: slot,
+                    },
+                )?,
+            );
+        }
         Ok(())
     }
 
@@ -4535,6 +4634,18 @@ impl crate::chains::Host for ChainHost<'_> {
             && let Some(e) = self.g.players.get_mut(&self.pid)
         {
             e.hotbar_slot = slot;
+        }
+    }
+
+    fn move_item(&mut self, m: &crate::chains::Move) {
+        self.hub
+            .inventory_move_in(self.g, self.pid, |inv, items, _, _| {
+                inv.move_to_slot(items, m.from, m.quantity, m.to);
+            });
+        if let Some(e) = self.g.players.get(&self.pid)
+            && let Ok(p) = packet(id::UPDATE_PLAYER_INVENTORY, &e.inv.packet())
+        {
+            self.out.to.push((self.pid, p));
         }
     }
 

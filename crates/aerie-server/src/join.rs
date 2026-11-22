@@ -1054,6 +1054,7 @@ async fn in_world(
         sent[0], sent[1], sent[2]
     );
     hub.send_inventory(client_id)?;
+    hub.send_active_slots(client_id)?;
     hub.enter_world(
         client_id,
         seen_by_others(client_id, &settings.player, &player.username, start)?,

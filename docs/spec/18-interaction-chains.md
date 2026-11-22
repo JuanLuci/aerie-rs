@@ -171,6 +171,29 @@ while it has forks.
 Cancelling a chain sets both states to failed, sends a cancel packet for
 it and does the same for its forks.
 
+## Chains the server starts
+
+The server can start a chain itself. It is queued and starts at the
+entity's next interaction tick: dropped when its root is on cooldown
+(here click bypass does not apply), else given the next negative id and
+ticked at once. Such a chain needs the client only when its root does: a
+root needs it when one of its own interactions does — always for the
+types that wait for the client or fork (block types, place, drag place,
+place mode select, pick, use entity, chaining, charging, first click,
+movement condition, apply force, select, damage, projectile, parallel,
+repeat, replace, change active slot, camera, builder tool), never for
+serial (whatever it contains) and a few spawn types, and otherwise when
+its next or failed interaction does. A chain that does not need the
+client sends no state packets, does not wait for client states, and its
+steps are shown to its owner like to everybody else.
+
+Moving an item onto or off the active hotbar slot, when both slots hold
+items of different kinds, is not done at once: the server starts a "swap
+from" chain for the held item, with the slot as target slot (and −slot−1
+as the chain data's target slot); when its change-active-slot step runs,
+the move is made, the whole inventory is sent, and the "swap to" fork it
+makes is not predicted.
+
 ## Rules between chains
 
 A new root is compared with every running chain (and their forks when
@@ -332,10 +355,8 @@ placement or a hit applied when the client's packet arrives.
 
 ## Not done yet
 
-- Chains the server starts on its own (held and equipped item
-  interactions, the swap when the held item changes by itself, stat
-  effects, deaths, collisions, projectiles) and so chains that do not
-  need the client.
+- The other chains the server starts on its own: held and equipped item
+  interactions, stat effects, deaths, collisions, projectiles.
 - Selector shapes on the server (blocks swept by a swing) and the forks
   for hit entities; damage (combat).
 - Proxy entities; the world's allowed-roots list; start and use events.
@@ -364,7 +385,12 @@ on both servers, same answers:
 - a use chain that never sends its client data: the same first answer and
   the same cancel after the timeout;
 - hotbar swaps: two accepted, one naming the wrong active slot: the same
-  cancel and slot correction.
+  cancel and slot correction;
+- another kind of item moved onto the active slot: the same server chain
+  (id −1), the inventory sent whole before it and the hotbar after.
+
+At join the three active slots (hotbar, utility, tools) are sent after
+the inventory, as the official server does.
 
 The probe now tells the server it is ready for gameplay 1.5 s after
 joining; sent at once, the official server missed it and took the probe

@@ -246,6 +246,9 @@ pub struct Inter {
     pub next: i32,
     pub failed: i32,
     pub use_latest: bool,
+    /// Whether a chain with this interaction needs the client: always,
+    /// never, or when the next or failed interaction does.
+    remote: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -261,6 +264,9 @@ pub struct Root {
     pub settings: Vec<(p::GameMode, p::RootInteractionSettings)>,
     pub rules: Rules,
     pub tags: Vec<i32>,
+    /// A chain of this root needs the client even when the server starts
+    /// it.
+    pub needs_remote: bool,
 }
 
 /// An item's roots per interaction type and its interaction variables.
@@ -372,7 +378,13 @@ impl Book {
                     None => Op::Jump(b.labels[*to]),
                 })
                 .collect();
+            let mut memo = HashMap::new();
+            let needs_remote = r
+                .interactions
+                .iter()
+                .any(|&x| book.needs_remote(x, &mut memo, 0));
             let root = Root {
+                needs_remote,
                 id: r.id.clone().unwrap_or_default(),
                 ops,
                 cooldown: r.cooldown.clone(),
@@ -645,6 +657,47 @@ impl Book {
                 block: false,
             },
         };
+        let remote = match x {
+            I::ApplyForceInteraction(_)
+            | I::BuilderToolInteraction(_)
+            | I::CameraInteraction(_)
+            | I::PlaceBlockInteraction(_)
+            | I::ChainingInteraction(_)
+            | I::ChangeActiveSlotInteraction(_)
+            | I::ChargingInteraction(_)
+            | I::WieldingInteraction(_)
+            | I::DamageEntityInteraction(_)
+            | I::DragPlaceBlockInteraction(_)
+            | I::ExtrudePlaceBlockInteraction(_)
+            | I::SurfaceDrawPlaceBlockInteraction(_)
+            | I::DragEraseBlockInteraction(_)
+            | I::FirstClickInteraction(_)
+            | I::MovementConditionInteraction(_)
+            | I::ParallelInteraction(_)
+            | I::PickBlockInteraction(_)
+            | I::PlaceModeSelectInteraction(_)
+            | I::ProjectileInteraction(_)
+            | I::RepeatInteraction(_)
+            | I::ReplaceInteraction(_)
+            | I::SelectInteraction(_)
+            | I::SimpleBlockInteraction(_)
+            | I::BreakBlockInteraction(_)
+            | I::UseBlockInteraction(_)
+            | I::ChangeBlockInteraction(_)
+            | I::ChangeStateInteraction(_)
+            | I::BlockConditionInteraction(_)
+            | I::SpawnDeployableFromRaycastInteraction(_)
+            | I::UseEntityInteraction(_) => Some(true),
+            I::SerialInteraction(_) | I::MemoriesConditionInteraction(_) => Some(false),
+            _ => match ty.as_str() {
+                "RunOnBlockTypes" => Some(true),
+                "SignalNearbyVolumes"
+                | "SpawnDeployableAtHitLocation"
+                | "SpawnDeployableAtLocation"
+                | "SpawnTriggerVolume" => Some(false),
+                _ => None,
+            },
+        };
         Inter {
             ty,
             kind,
@@ -666,6 +719,7 @@ impl Book {
             next,
             failed,
             use_latest,
+            remote,
         }
     }
 
@@ -673,6 +727,23 @@ impl Book {
         let mut v = next.clone().unwrap_or_default();
         v.sort_by(|a, b| a.0.total_cmp(&b.0));
         Branches::Charged(v.into_iter().map(|e| e.1).collect(), failed)
+    }
+
+    fn needs_remote(&self, i: i32, memo: &mut HashMap<i32, bool>, depth: u32) -> bool {
+        let Some(x) = self.inter_at(i) else {
+            return false;
+        };
+        if let Some(r) = x.remote {
+            return r;
+        }
+        if let Some(&r) = memo.get(&i) {
+            return r;
+        }
+        let r = depth < 512
+            && (self.needs_remote(x.next, memo, depth + 1)
+                || self.needs_remote(x.failed, memo, depth + 1));
+        memo.insert(i, r);
+        r
     }
 
     pub fn inter_at(&self, i: i32) -> Option<&Inter> {
@@ -842,6 +913,17 @@ pub struct Ctx {
     pub target_slot: Option<i32>,
     pub hit_location: Option<[f32; 3]>,
     pub hit_detail: Option<String>,
+    /// An inventory move that waits for the chain's slot change.
+    pub moved: Option<Move>,
+}
+
+/// An item move between two slots: (section, slot), a quantity, (section,
+/// slot).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Move {
+    pub from: (i32, i32),
+    pub quantity: i32,
+    pub to: (i32, i32),
 }
 
 /// A placement the client reports for a place operation. The face, the
@@ -907,6 +989,9 @@ pub trait Host {
     fn set_active_slot(&mut self, section: i32, slot: i32);
     /// The entity's active hotbar slot changes.
     fn change_hotbar_slot(&mut self, slot: i32);
+    /// The inventory move a slot change was waiting for is made now, and
+    /// the whole inventory sent.
+    fn move_item(&mut self, m: &Move);
     /// Tells the players around about a step.
     fn play(&mut self, packet: p::PlayInteractionFor, view_distance: f64, owner_too: bool);
     fn network_id(&self) -> i32;
@@ -1039,6 +1124,8 @@ pub struct Chain {
     skip_on_click: bool,
     predicted: bool,
     completed: bool,
+    /// The client runs this chain too.
+    requires_client: bool,
 }
 
 /// One chain's states of a tick, as they go to the client.
@@ -1121,6 +1208,7 @@ impl Chain {
             skip_on_click: false,
             predicted: false,
             completed: false,
+            requires_client: true,
         }
     }
 
@@ -1323,6 +1411,9 @@ pub struct Manager {
     shift_dirty: [bool; TYPES],
     shifts_dirty: bool,
     out: Vec<Sync>,
+    last_server: i32,
+    /// Chains the server starts, run at the next tick.
+    starting: Vec<Chain>,
 }
 
 impl Default for Manager {
@@ -1338,6 +1429,8 @@ impl Default for Manager {
             shift_dirty: [false; TYPES],
             shifts_dirty: false,
             out: Vec::new(),
+            last_server: 0,
+            starting: Vec::new(),
         }
     }
 }
@@ -1355,7 +1448,25 @@ impl Manager {
     }
 
     pub fn is_idle(&self) -> bool {
-        self.chains.is_empty() && self.queue.is_empty() && self.cooldowns.is_empty()
+        self.chains.is_empty()
+            && self.queue.is_empty()
+            && self.cooldowns.is_empty()
+            && self.starting.is_empty()
+    }
+
+    /// The server starts a chain of its own; it runs from the next tick,
+    /// with a negative id.
+    pub fn start_server(
+        &mut self,
+        book: &Book,
+        ty: IT,
+        ctx: Ctx,
+        root: i32,
+        data: p::InteractionChainData,
+    ) {
+        let mut chain = Chain::new(ty, ctx, data, root);
+        chain.requires_client = book.root(root).is_some_and(|r| r.needs_remote);
+        self.starting.push(chain);
     }
 
     /// The states of this tick for the client, if any.
@@ -1387,6 +1498,23 @@ impl Manager {
             }
         }
         self.cooldowns.retain(|_, c| !c.tick(dt));
+        for mut chain in std::mem::take(&mut self.starting) {
+            let Some(root) = book.root(chain.initial_root) else {
+                continue;
+            };
+            if self.on_cooldown(root, chain.ty, host, false) {
+                continue;
+            }
+            self.last_server -= 1;
+            if self.last_server >= 0 {
+                self.last_server = -1;
+            }
+            chain.id = self.last_server;
+            if !self.tick_chain(book, host, &mut chain, None) {
+                chain.pre_ticked = true;
+                self.chains.push(chain);
+            }
+        }
         if self.queue.is_empty() {
             self.tick_chains(book, host);
             return;
@@ -1598,7 +1726,7 @@ impl Manager {
             .as_ref()
             .is_some_and(|c| c.state != St::NOT_FINISHED);
         if state != St::NOT_FINISHED {
-            if client_ended {
+            if !chain.requires_client || client_ended {
                 if e != 0 {
                     chain.flag_desync();
                 } else {
@@ -1626,7 +1754,7 @@ impl Manager {
     }
 
     /// Whether a root is on cooldown for a chain the client starts.
-    fn on_cooldown(&mut self, root: &Root, ty: IT, host: &dyn Host) -> bool {
+    fn on_cooldown(&mut self, root: &Root, ty: IT, host: &dyn Host, remote: bool) -> bool {
         let mut id = root.id.clone();
         let mut time = match ty {
             IT::COLLISION_ENTER
@@ -1666,12 +1794,12 @@ impl Manager {
                 id = i.clone();
             }
             interrupt |= c.interrupt_recharge;
-            if c.click_bypass {
+            if c.click_bypass && remote {
                 bypass = true;
                 break;
             }
         }
-        bypass |= settings.is_some_and(|s| s.allow_skip_chain_on_click);
+        bypass |= remote && settings.is_some_and(|s| s.allow_skip_chain_on_click);
         let force = bypass
             || root
                 .cooldown
@@ -1842,7 +1970,7 @@ impl Manager {
         {
             return cancel(host);
         }
-        if self.on_cooldown(root, ty, host) {
+        if self.on_cooldown(root, ty, host, true) {
             return false;
         }
         let mut ctx = Ctx {
@@ -1928,7 +2056,7 @@ impl Manager {
         forks.append(&mut chain.forks);
         chain.forks = forks;
         if chain.server_state != St::NOT_FINISHED {
-            if chain.client_state == St::NOT_FINISHED {
+            if chain.requires_client && chain.client_state == St::NOT_FINISHED {
                 if !host.waiting_for_client() {
                     if chain.waiting_client == 0 {
                         chain.waiting_client = self.now;
@@ -1949,11 +2077,13 @@ impl Manager {
             chain.server_state = state;
             chain.client_state = state;
             chain.update_server_state(book);
-            self.send_sync(chain, base, states);
-            host.cancel(chain.id, chain.fork_id.clone());
+            if chain.requires_client {
+                self.send_sync(chain, base, states);
+                host.cancel(chain.id, chain.fork_id.clone());
+            }
         }
         if chain.server_state != St::NOT_FINISHED {
-            if chain.client_state != St::NOT_FINISHED {
+            if !chain.requires_client || chain.client_state != St::NOT_FINISHED {
                 self.finish(book, host, chain);
                 return chain.forks.is_empty();
             }
@@ -2020,7 +2150,7 @@ impl Manager {
                     cancel,
                 },
                 x.view_distance,
-                false,
+                !chain.requires_client,
             )
         };
         if state != St::NOT_FINISHED {
@@ -2095,7 +2225,9 @@ impl Manager {
             }
         }
         chain.update_server_state(book);
-        self.send_sync(chain, base, std::mem::take(states));
+        if chain.requires_client {
+            self.send_sync(chain, base, std::mem::take(states));
+        }
         Ok(())
     }
 
@@ -2516,6 +2648,10 @@ impl Manager {
                     *target
                 };
                 host.change_hotbar_slot(slot);
+                let moved = chain.ctx.moved.take();
+                if let Some(m) = &moved {
+                    host.move_item(m);
+                }
                 // The item now held runs its swap-to interactions.
                 let held = host.item_at(-1, slot);
                 if let Some(root) = book.held_root(held.as_deref(), IT::SWAP_TO) {
@@ -2527,7 +2663,7 @@ impl Manager {
                         target_slot: (*target != NONE).then_some(slot),
                         ..Default::default()
                     };
-                    Self::fork(chain, e, IT::SWAP_TO, ctx, root, true, None);
+                    Self::fork(chain, e, IT::SWAP_TO, ctx, root, moved.is_none(), None);
                 }
                 set(chain, St::FINISHED);
             }
@@ -2779,7 +2915,9 @@ impl Manager {
         if first {
             host.other(&x.ty, &chain.ctx);
         }
-        let Some(c) = client else {
+        // Where the client waits for the server there is nothing to
+        // follow.
+        let Some(c) = client.filter(|_| x.wait != W::SERVER) else {
             // The client waits for the server here: the step ends by its
             // run time alone.
             if chain.entries[e].state() == St::FAILED
