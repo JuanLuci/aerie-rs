@@ -87,6 +87,8 @@ pub enum Kind {
     Structural,
     /// A `Processing` bench (furnace, campfire; spec 16).
     Processing,
+    /// A block that holds items (a chest; spec 21).
+    Container,
 }
 
 /// Options a structural window can show.
@@ -119,6 +121,33 @@ pub struct Window {
 }
 
 impl Window {
+    /// The window of a block that holds items (spec 21).
+    pub fn container(
+        id: i32,
+        block: &str,
+        at: (i32, i32, i32),
+        item: &str,
+        slots: Vec<crate::inventory::Slot>,
+    ) -> Self {
+        let mut data = Data::default();
+        data.set("blockItemId", json(item));
+        Window {
+            id,
+            kind: Kind::Container,
+            bench: Bench::default(),
+            block: Some((block.to_owned(), at)),
+            data,
+            dirty: false,
+            extra_dirty: false,
+            input: None,
+            options: Vec::new(),
+            selected: 0,
+            slots,
+            last_progress: 0.0,
+            last_progress_at: None,
+        }
+    }
+
     pub fn fieldcraft(book: &Book) -> Self {
         let mut data = Data::default();
         data.set("type", proto::BenchType::CRAFTING.0.to_string());
@@ -169,7 +198,7 @@ impl Window {
     /// The window's own slots as `InventorySection` (structural: the input
     /// then the options).
     pub fn section(&self) -> Option<proto::InventorySection> {
-        if self.kind == Kind::Processing {
+        if self.kind == Kind::Processing || self.kind == Kind::Container {
             return Some(proto::InventorySection {
                 items: Some(crate::inventory::section_items(&self.slots)),
                 capacity: self.slots.len() as i16,
@@ -647,7 +676,7 @@ impl Book {
                 d.set("allowBlockGroupCycling", bench.cycling.to_string());
                 d.set("alwaysShowInventoryHints", bench.always_hints.to_string());
             }
-            Kind::Pocket | Kind::Processing => {}
+            Kind::Pocket | Kind::Processing | Kind::Container => {}
         }
         d.set("worldMemoriesLevel", MEMORIES_LEVEL.to_string());
         d.set("nearbyChestCount", "0".into());

@@ -162,6 +162,8 @@ struct ItemsView<'a> {
         &'a crate::processing::Config,
         &'a [crate::processing::Recipe],
     )>,
+    /// An open container: every slot takes and gives anything.
+    container: bool,
 }
 
 /// The item facts processing needs (spec 16).
@@ -223,6 +225,9 @@ impl inventory::Items for ItemsView<'_> {
         }
     }
     fn window_add(&self, slot: i32, item: &str) -> bool {
+        if self.container {
+            return true;
+        }
         if let Some((cfg, recipes)) = self.processing {
             let pi = ProcItems {
                 book: self.book,
@@ -251,7 +256,7 @@ impl inventory::Items for ItemsView<'_> {
                 .is_some_and(|b| !self.book.structural_options(b, item).0.is_empty())
     }
     fn window_remove(&self, slot: i32) -> bool {
-        self.processing.is_some() || slot == 0
+        self.container || self.processing.is_some() || slot == 0
     }
 }
 
@@ -346,6 +351,8 @@ struct Inner {
     stat_updates: Vec<(i32, Audience, proto::ComponentUpdate)>,
     /// Processing bench blocks (spec 16), by main cell.
     processing: BTreeMap<Pos, crate::processing::State>,
+    /// What blocks that hold items hold (spec 21).
+    containers: BTreeMap<Pos, Vec<inventory::Slot>>,
     /// Block state read from the world save, until its block is first
     /// ticked (spec 20).
     saved_states: BTreeMap<Pos, String>,
@@ -1645,12 +1652,19 @@ impl Hub {
         let Inner {
             players,
             processing,
+            containers,
             ..
         } = &mut *g;
         let Some(e) = players.get_mut(&id) else {
             return;
         };
         let before = e.inv.clone();
+        // An open container's slots.
+        let cont_at = e
+            .window
+            .as_ref()
+            .filter(|w| w.kind == crate::crafting::Kind::Container)
+            .and_then(|w| Some((w.id, w.block.as_ref()?.1)));
         let window = e
             .window
             .as_ref()
@@ -1682,8 +1696,15 @@ impl Hub {
             processing: proc_bench
                 .as_ref()
                 .and_then(|b| Some((b.processing.as_ref()?, recipes.as_slice()))),
+            container: cont_at.is_some(),
         };
         let mut wid = window.as_ref().map(|(i, _, _)| *i);
+        if let Some((cid, at)) = &cont_at
+            && let Some(slots) = containers.get(at)
+        {
+            e.inv.attach(*cid, slots.clone());
+            wid = Some(*cid);
+        }
         if let Some((wid, slots, _)) = window {
             e.inv.attach(wid, slots);
         }
@@ -1697,7 +1718,15 @@ impl Hub {
         e.inv.record();
         f(&mut e.inv, &items, &prefs, wid);
         let touched = e.inv.recorded();
-        if let Some((pid, at, b)) = &proc_at
+        let mut container_changed = None;
+        if let Some((cid, at)) = &cont_at
+            && let Some(slots) = e.inv.detach(*cid)
+        {
+            if containers.get(at) != Some(&slots) {
+                containers.insert(*at, slots.clone());
+                container_changed = Some((*at, slots));
+            }
+        } else if let Some((pid, at, b)) = &proc_at
             && let Some(slots) = e.inv.detach(*pid)
             && let Some(st) = processing.get_mut(at)
             && let Some(cfg) = b.processing.as_ref()
@@ -1736,6 +1765,18 @@ impl Hub {
         e.inv_dirty.extend(touched.into_iter().filter(|s| *s < 0));
         if window_touched && let Some(w) = e.window.as_mut() {
             w.dirty = true;
+        }
+        // Everyone with the container open sees the change.
+        if let Some((at, slots)) = container_changed {
+            for e in players.values_mut() {
+                if let Some(w) = e.window.as_mut().filter(|w| {
+                    w.kind == crate::crafting::Kind::Container
+                        && w.block.as_ref().is_some_and(|b| b.1 == at)
+                }) {
+                    w.slots = slots.clone();
+                    w.dirty = true;
+                }
+            }
         }
     }
 
@@ -1895,6 +1936,10 @@ impl Hub {
                 .unwrap_or(0),
         );
         let (x, y, z) = (x - f[0], y - f[1], z - f[2]);
+        if self.rules.container(self.block_in_world(x, y, z)).is_some() {
+            self.open_container(id, (x, y, z));
+            return Ok(true);
+        }
         let found = {
             let b = self.block_in_world(x, y, z);
             self.keys_by_id
@@ -1953,6 +1998,122 @@ impl Hub {
         self.send(id, packet(self::id::OPEN_WINDOW, &o)?);
         info!("opened {} ({}) for {id}", key, bench.id);
         Ok(true)
+    }
+
+    /// Opens the window of a block that holds items (spec 21): the page,
+    /// the window with the slots, the open sound, and the block shown open
+    /// when this is its first window.
+    fn open_container(&self, id: i32, at: Pos) {
+        self.world_step(|hub, g, ground, out| {
+            use crate::support::World;
+            let (block, rot) = View {
+                g,
+                ground,
+                hub_rules: &hub.rules,
+            }
+            .block(at.0, at.1, at.2);
+            let Some((c, base)) = hub.rules.container(block) else {
+                return;
+            };
+            if g.players.get(&id).is_none_or(|e| e.window.is_some()) {
+                return;
+            }
+            let slots = g.containers.entry(at).or_default();
+            slots.resize(c.capacity, None);
+            let slots = slots.clone();
+            let first = !g.players.values().any(|e| hub.has_container_open(e, at));
+            let Some(e) = g.players.get_mut(&id) else {
+                return;
+            };
+            e.next_window = e.next_window.max(0) + 1;
+            let item = base.item.clone().unwrap_or_else(|| base.key.clone());
+            let w = crate::crafting::Window::container(e.next_window, &base.key, at, &item, slots);
+            let page = proto::SetPage {
+                page: proto::Page::BENCH,
+                can_close_through_interaction: true,
+            };
+            let open = proto::OpenWindow {
+                id: w.id,
+                window_type: proto::WindowType::CONTAINER,
+                window_data: Some(w.data.text()),
+                inventory: w.section(),
+                extra_resources: None,
+            };
+            e.window = Some(w);
+            for p in [
+                packet(self::id::SET_PAGE, &page),
+                packet(self::id::OPEN_WINDOW, &open),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                out.to.push((id, p));
+            }
+            if c.open_sound > 0 {
+                hub.sound_near(g, c.open_sound, hub.block_center(block, rot, at), out);
+            }
+            if first {
+                hub.set_block_state(g, ground, at, "OpenWindow", out);
+            }
+        });
+    }
+
+    fn has_container_open(&self, e: &Entry, at: Pos) -> bool {
+        e.window.as_ref().is_some_and(|w| {
+            w.kind == crate::crafting::Kind::Container
+                && w.block.as_ref().is_some_and(|b| b.1 == at)
+        })
+    }
+
+    /// A container's window closed: with no window left on it the block
+    /// is shown closed (unless it stays open while empty), and the close
+    /// sound plays.
+    fn container_closed(&self, g: &mut Inner, ground: &Ground, at: Pos, out: &mut Outgoing) {
+        use crate::support::World;
+        let (block, rot) = View {
+            g,
+            ground,
+            hub_rules: &self.rules,
+        }
+        .block(at.0, at.1, at.2);
+        let Some((c, _)) = self.rules.container(block) else {
+            return;
+        };
+        let (close_sound, stay) = (c.close_sound, c.stay_open_when_empty);
+        if !g.players.values().any(|e| self.has_container_open(e, at)) {
+            let empty = g
+                .containers
+                .get(&at)
+                .is_none_or(|s| s.iter().all(Option::is_none));
+            if stay && empty {
+                return;
+            }
+            self.set_block_state(g, ground, at, "CloseWindow", out);
+        }
+        if close_sound > 0 {
+            self.sound_near(g, close_sound, self.block_center(block, rot, at), out);
+        }
+    }
+
+    /// A container block is gone: what it held drops, its windows close.
+    fn drop_container(&self, g: &mut Inner, at: Pos, out: &mut Outgoing) {
+        let Some(slots) = g.containers.remove(&at) else {
+            return;
+        };
+        let stacks: Vec<(String, i32)> =
+            slots.into_iter().flatten().map(|s| (s.item, s.n)).collect();
+        if !stacks.is_empty() {
+            out.drops
+                .push((stacks, [at.0 as f64 + 0.5, at.1 as f64, at.2 as f64 + 0.5]));
+        }
+        for (pid, e) in g.players.iter_mut() {
+            if self.has_container_open(e, at)
+                && let Some(w) = e.window.take()
+                && let Ok(p) = packet(self::id::CLOSE_WINDOW, &proto::CloseWindow { id: w.id })
+            {
+                out.to.push((*pid, p));
+            }
+        }
     }
 
     /// Opens a processing bench's window (spec 16): the bench's state is
@@ -2243,6 +2404,12 @@ impl Hub {
             let w = e.window.take().unwrap();
             let refunded = hub.cancel_crafting(e);
             let input = w.input.clone();
+            if w.kind == crate::crafting::Kind::Container {
+                if let Some((_, at)) = &w.block {
+                    hub.container_closed(g, ground, *at, out);
+                }
+                return;
+            }
             if let Some((_, at)) = &w.block {
                 hub.set_block_state(g, ground, *at, "default", out);
             }
@@ -2983,9 +3150,35 @@ impl Hub {
         if let Ok(text) = std::fs::read_to_string(dir.join("block-state.txt")) {
             let mut g = self.inner.lock().unwrap();
             let mut at = None;
+            let mut chest: Option<Pos> = None;
             for l in text.lines() {
                 let w: Vec<&str> = l.split_whitespace().collect();
-                if let ["@", x, y, z, "processing"] = w[..] {
+                if let ["@", x, y, z, "container", n] = w[..] {
+                    at = None;
+                    chest = match (x.parse(), y.parse(), z.parse()) {
+                        (Ok(x), Ok(y), Ok(z)) => Some((x, y, z)),
+                        _ => None,
+                    };
+                    if let Some(c) = chest {
+                        g.containers.insert(c, vec![None; n.parse().unwrap_or(0)]);
+                    }
+                } else if let (Some(c), ["slot", i, item, n, d, m]) = (chest, &w[..]) {
+                    if let (Ok(i), Ok(n), Some(slots)) =
+                        (i.parse::<usize>(), n.parse(), g.containers.get_mut(&c))
+                        && i < slots.len()
+                    {
+                        slots[i] = Some(Stack {
+                            item: (*item).to_owned(),
+                            n,
+                            durability: d.parse().unwrap_or(0.0),
+                            max: m.parse().unwrap_or(0.0),
+                        });
+                    }
+                } else if l.is_empty() {
+                    chest = None;
+                    at = None;
+                } else if let ["@", x, y, z, "processing"] = w[..] {
+                    chest = None;
                     at = match (x.parse(), y.parse(), z.parse()) {
                         (Ok(x), Ok(y), Ok(z)) => Some((x, y, z)),
                         _ => None,
@@ -3091,6 +3284,21 @@ impl Hub {
         }
         for (at, st) in &g.saved_states {
             text += &format!("@ {} {} {} processing\n{}\n", at.0, at.1, at.2, st);
+        }
+        for (at, slots) in &g.containers {
+            if slots.iter().all(Option::is_none) {
+                continue;
+            }
+            text += &format!("@ {} {} {} container {}\n", at.0, at.1, at.2, slots.len());
+            for (i, st) in slots.iter().enumerate() {
+                if let Some(st) = st {
+                    text += &format!(
+                        "slot {i} {} {} {} {}\n",
+                        st.item, st.n, st.durability, st.max
+                    );
+                }
+            }
+            text += "\n";
         }
         if text == g.states_written {
             return;
@@ -3871,6 +4079,7 @@ impl Hub {
                         rules: &self.rules,
                         bench: None,
                         processing: None,
+                        container: false,
                     };
                     let order = e.prefs.order_for(inventory::Items::kind(&items, &key));
                     let before = e.inv.clone();
@@ -5102,6 +5311,14 @@ impl Hub {
                 self.drop_processing(g, (x, y, z), out);
             }
         }
+        // A container replaced by anything but one of its own states
+        // drops what it held (spec 21).
+        if g.containers.contains_key(&(x, y, z)) {
+            let base = |b: i32| self.rules.container(b).map(|(_, base)| base.key.clone());
+            if base(id).is_none() || base(id) != base(old) {
+                self.drop_container(g, (x, y, z), out);
+            }
+        }
         // The old block's other parts go (spec 10, fillers).
         if old != 0 {
             self.remove_parts(g, ground, (x, y, z), old, old_rot, old_filler, how, out);
@@ -5798,6 +6015,7 @@ impl Hub {
                     rules: &self.rules,
                     bench: None,
                     processing: None,
+                    container: false,
                 };
                 let order = e.prefs.order_for(inventory::Items::kind(&items, &it.item));
                 let left = e.inv.add_to(&items, &order, &it.stack());

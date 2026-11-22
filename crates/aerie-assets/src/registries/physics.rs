@@ -28,6 +28,29 @@ pub fn table(ctx: &Ctx) -> Result<String> {
     keys.sort();
     for k in keys {
         let a = blocks.resolved(k, "BlockType");
+        // A block that holds items: `K key capacity stayOpenWhenEmpty
+        // openSound closeSound` (the sounds of its window states).
+        if let Some(c) = a
+            .obj("BlockEntity")
+            .and_then(|e| e.obj("Components"))
+            .and_then(|c| c.obj("ItemContainerBlock"))
+        {
+            let sound = |state: &str| -> Result<i32> {
+                let id = a
+                    .obj("State")
+                    .and_then(|s| s.obj("Definitions"))
+                    .and_then(|d| d.obj(state))
+                    .and_then(|s| s.str_at("InteractionSoundEventId"));
+                super::sound_events::index(ctx, id.as_deref())
+            };
+            out += &format!(
+                "K {k} {} {} {} {}\n",
+                c.get("Capacity").and_then(Value::as_i64).unwrap_or(20),
+                c.bool_or("StayOpenWhenEmpty", false) as u8,
+                sound("OpenWindow")?,
+                sound("CloseWindow")?
+            );
+        }
         let drop = match a.str_at("SupportDropType").as_deref() {
             Some("Destroy") => 1,
             Some("Fall") => 2,

@@ -152,6 +152,15 @@ pub struct Drop {
     pub quantity: i32,
 }
 
+/// A block's item container (spec 21).
+#[derive(Clone, Debug, Default)]
+pub struct Container {
+    pub capacity: usize,
+    pub stay_open_when_empty: bool,
+    pub open_sound: i32,
+    pub close_sound: i32,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Block {
     pub key: String,
@@ -181,6 +190,8 @@ pub struct Block {
     pub place_overrides: Vec<i32>,
     /// Interaction states: name → block id (`default` included).
     pub states: Vec<(String, i32)>,
+    /// A block that holds items (on its default state's block).
+    pub container: Option<Container>,
 }
 
 impl Block {
@@ -434,6 +445,20 @@ impl Rules {
                         });
                     }
                 }
+                "K" => {
+                    let w: Vec<&str> = rest.split_whitespace().collect();
+                    let [key, capacity, stay, open, close] = w[..] else {
+                        continue;
+                    };
+                    if let Some(b) = by_key.get(key).and_then(|&i| r.blocks[i].as_mut()) {
+                        b.container = Some(Container {
+                            capacity: capacity.parse().unwrap_or(20),
+                            stay_open_when_empty: stay == "1",
+                            open_sound: open.parse().unwrap_or(0),
+                            close_sound: close.parse().unwrap_or(0),
+                        });
+                    }
+                }
                 "L" => {
                     if let Some((key, json)) = rest.split_once(' ')
                         && let Ok(v) = serde_json::from_str(json)
@@ -445,6 +470,19 @@ impl Rules {
             }
         }
         r
+    }
+
+    /// What a block holds items with, through any of its interaction
+    /// states.
+    pub fn container(&self, id: i32) -> Option<(&Container, &Block)> {
+        let b = self.block(id)?;
+        let base = b
+            .states
+            .iter()
+            .find(|(n, _)| n == "default")
+            .and_then(|(_, i)| self.block(*i))
+            .unwrap_or(b);
+        base.container.as_ref().map(|c| (c, base))
     }
 
     pub fn len(&self) -> usize {
