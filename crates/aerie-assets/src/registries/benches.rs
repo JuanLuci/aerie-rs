@@ -93,4 +93,5 @@ pub const SOUNDS: &[&str] = &[
     "SFX_Player_Craft_Item_Inventory",
     "SFX_Player_Pickup_Item",
     "SFX_Player_Drop_Item",
+    "SFX_Item_Break",
 ];

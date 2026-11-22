@@ -1,6 +1,8 @@
 //! Dropped items (spec 11): spawn, gravity, sweeping through blocks,
 //! merging, pickup and the short flight to the player.
 
+use crate::inventory::Stack;
+
 /// One world tick, in seconds, as the official server counts it.
 pub const DT: f32 = 1.0 / 30.0;
 pub const LAUNCH_SPEED: f64 = 3.25;
@@ -28,6 +30,9 @@ pub trait Blocks {
 pub struct Item {
     pub item: String,
     pub quantity: i32,
+    /// The stack's durability and max (kept as it was dropped).
+    pub durability: f64,
+    pub max: f64,
     pub pos: [f64; 3],
     pub vel: [f64; 3],
     pub merge_delay: f32,
@@ -44,17 +49,12 @@ pub struct Item {
 }
 
 impl Item {
-    pub fn new(
-        item: &str,
-        quantity: i32,
-        pos: [f64; 3],
-        vel: [f64; 3],
-        life: f32,
-        born: u64,
-    ) -> Self {
+    pub fn new(stack: &Stack, pos: [f64; 3], vel: [f64; 3], life: f32, born: u64) -> Self {
         Self {
-            item: item.to_owned(),
-            quantity,
+            item: stack.item.clone(),
+            quantity: stack.n,
+            durability: stack.durability,
+            max: stack.max,
             pos,
             vel,
             merge_delay: MERGE_DELAY,
@@ -64,6 +64,16 @@ impl Item {
             born,
             announced: false,
             stack_changed: false,
+        }
+    }
+
+    /// What it holds, as an inventory stack.
+    pub fn stack(&self) -> Stack {
+        Stack {
+            item: self.item.clone(),
+            n: self.quantity,
+            durability: self.durability,
+            max: self.max,
         }
     }
 
@@ -344,8 +354,7 @@ pub fn movement(pos: &mut [f64; 3], vel: &mut [f64; 3], dt: f32, w: &impl Blocks
 /// The copy of a picked-up item flying to the player.
 #[derive(Clone, Debug)]
 pub struct Flight {
-    pub item: String,
-    pub quantity: i32,
+    pub stack: Stack,
     pub start: [f64; 3],
     pub pos: [f64; 3],
     pub to_player: i32,
@@ -409,8 +418,7 @@ mod tests {
     #[test]
     fn flight_reaches_the_player() {
         let mut f = Flight {
-            item: "A".into(),
-            quantity: 1,
+            stack: Stack::new("A", 1, 0.0),
             start: [0.0; 3],
             pos: [0.0; 3],
             to_player: 1,

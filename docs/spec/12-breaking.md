@@ -23,8 +23,9 @@ From the block's `Gathering.Breaking` (`GatherType`, `Quality`):
 
 ## One hit
 
-- A spec with power: damage = power (× 0.25 for a broken tool: the
-  gameplay config's tool penalty 0.75); breaking it drops `Breaking`
+- A spec with power: damage = power (for a broken tool, × (1 − the
+  gameplay config's `ItemDurability.BrokenPenalties.Tool`, 0.75)); breaking
+  it drops `Breaking`
   (`ItemId`, `DropList`, `Quantity`).
 - No spec, and the block is not `Soft`: a held item that is no weapon
   shows the unbreakable effect (the gameplay config's
@@ -62,16 +63,37 @@ change per block, in the order of the official server's map). The hit that
 breaks a block sends no damage. A client loading a column gets
 `UpdateBlockDamages` (change 0) for every damaged block in it.
 
+## Tool wear
+
+Every stack carries a durability and a max: a stack made from an item id
+(given, crafted, dropped by a block, a creative pick) starts at the item's
+`MaxDurability` for both; a max of 0 never wears; a stack is broken at
+durability 0. Stacks only stack (inventory, merging on the ground) with
+the same item, durability and max. Dropping a stack keeps its durability.
+
+After a hit that does damage (not the unbreakable or nothing cases), out of
+creative, the held stack wears unless it never does: the loss is 0 on a
+soft block, on a block without gathering, or for an item without `Tool`;
+otherwise the first `DurabilityLossBlockTypes` entry that names the block
+or a block set holding it (sets as sent in `UpdateBlockSets`) gives the
+loss, else the item's `DurabilityLossOnHit`. Durability goes down by the
+loss, kept within 0 and the max, and the slot is replaced, which sends the
+hotbar even when nothing changed. A stack that breaks with this hit sends
+its player the chat line `server.general.repair.itemBroken` (param
+`itemName`: the item's name, colour `#ff5555`) and the 2D UI sound
+`SFX_Item_Break`.
+
 ## Not done yet
 
-Tool wear (`MaxDurability`, `DurabilityLossOnHit`,
-`DurabilityLossBlockTypes`) needs durability in the inventory; tool states
-(`Gathering.Tools`, such as stripping a trunk); break shapes (tools that
-break several blocks).
+Tool states (`Gathering.Tools`, such as stripping a trunk); break shapes
+(tools that break several blocks, with per-block or per-swing wear); wear
+from weapons and armour.
 
 ## Checked against the official server
 
-Not yet: replaying a recorded client's hits makes the official server
+Stacks given and thrown carry the same durability and max on both
+servers (a crude hatchet: 200 of 200, in the inventory and on the ground).
+Hits and wear are not yet: replaying a recorded client's hits makes the official server
 cancel the chains ("client failed to send client data"), because the
 recording kept only some of them. Recordings now keep every chain with its
 time, and the probe replays them at the recorded pace.

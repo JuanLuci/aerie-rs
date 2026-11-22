@@ -61,6 +61,9 @@ pub struct Table {
     unarmed: HashMap<String, Spec>,
     pub unbreakable: Effect,
     pub incorrect: Effect,
+    /// The gameplay config's broken tool penalty (0.75: a quarter of the
+    /// power left).
+    pub broken_tool_penalty: f64,
 }
 
 /// What one hit does (spec 12).
@@ -171,6 +174,7 @@ impl Table {
                         },
                     );
                 }
+                ["X", "tool", v] => t.broken_tool_penalty = v.parse().unwrap_or(0.0),
                 ["E", kind, particle, sound] => {
                     let e = Effect {
                         particle: opt(particle),
@@ -215,13 +219,17 @@ impl Table {
     }
 
     /// What a hit on `key` with `held` does (spec 12); `deco`: the block was
-    /// placed as decoration (its default drop then).
-    pub fn hit(&self, key: &str, held: Option<&str>, deco: bool) -> Hit {
+    /// placed as decoration (its default drop then); `broken`: the held
+    /// stack is worn out (a tool then hits with the penalty).
+    pub fn hit(&self, key: &str, held: Option<&str>, deco: bool, broken: bool) -> Hit {
         let Some(b) = self.blocks.get(key) else {
             return Hit::Nothing;
         };
         let spec = self.spec(b, held);
-        let power = spec.as_ref().map_or(0.0, |s| s.power);
+        let mut power = spec.as_ref().map_or(0.0, |s| s.power);
+        if power != 0.0 && broken && held.and_then(|h| self.items.get(h)).is_some_and(|i| i.tool) {
+            power *= 1.0 - self.broken_tool_penalty as f32;
+        }
         let (damage, mut item, mut list, quantity) = if power != 0.0 {
             (power, b.item.clone(), b.list.clone(), b.quantity)
         } else {
@@ -254,6 +262,31 @@ impl Table {
     }
 }
 
+impl Table {
+    /// Durability a damaging hit on `key` (block id `id`) takes from
+    /// `held` (the official rule): none on soft blocks, blocks without
+    /// gathering or for items that are no tool; else the first
+    /// `DurabilityLossBlockTypes` entry naming the block, or a set it is in
+    /// (`in_set`), else the item's `DurabilityLossOnHit`.
+    pub fn wear(&self, held: &str, key: &str, in_set: impl Fn(&str) -> bool) -> f64 {
+        let Some(b) = self.blocks.get(key) else {
+            return 0.0;
+        };
+        let Some(i) = self.items.get(held).filter(|i| i.tool) else {
+            return 0.0;
+        };
+        if b.soft {
+            return 0.0;
+        }
+        for (loss, sets, types) in &i.loss_for {
+            if types.iter().any(|t| t == key) || sets.iter().any(|s| in_set(s)) {
+                return *loss;
+            }
+        }
+        i.loss_on_hit
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,12 +299,14 @@ mod tests {
                      T Tool_Hatchet_Crude Metals 0.001 0 1 7\n\
                      I Weapon_Sword 1 0 0 0 0 100 0\n\
                      U Woods 0.05 0 3\n\
+                     L Tool_Hatchet_Crude 0.25 Stone,Wood -\n\
+                     X tool 0.75\n\
                      U Rocks 0.02 0 0\n";
 
     #[test]
     fn hands_tools_weapons_soft() {
         let t = Table::parse(T);
-        match t.hit("Wood_Oak_Trunk", None, false) {
+        match t.hit("Wood_Oak_Trunk", None, false, false) {
             Hit::Damage { damage, item, .. } => {
                 assert_eq!(damage, 0.05);
                 assert_eq!(item.as_deref(), Some("Wood_Oak_Trunk"));
@@ -279,25 +314,41 @@ mod tests {
             h => panic!("{h:?}"),
         }
         assert!(
-            matches!(t.hit("Wood_Oak_Trunk", Some("Tool_Hatchet_Crude"), false), Hit::Damage { damage, .. } if damage == 0.15)
+            matches!(t.hit("Wood_Oak_Trunk", Some("Tool_Hatchet_Crude"), false, false), Hit::Damage { damage, .. } if damage == 0.15)
         );
         // A tool without a spec for the block: cannot break it.
         assert_eq!(
-            t.hit("Rock_Stone", Some("Tool_Hatchet_Crude"), false),
+            t.hit("Rock_Stone", Some("Tool_Hatchet_Crude"), false, false),
             Hit::Unbreakable
         );
         // A weapon: no spec; a soft block still breaks.
         assert_eq!(
-            t.hit("Rock_Stone", Some("Weapon_Sword"), false),
+            t.hit("Rock_Stone", Some("Weapon_Sword"), false, false),
             Hit::Nothing
         );
         assert!(
-            matches!(t.hit("Plant_Grass", Some("Weapon_Sword"), false), Hit::Damage { damage, .. } if damage == 1.0)
+            matches!(t.hit("Plant_Grass", Some("Weapon_Sword"), false, false), Hit::Damage { damage, .. } if damage == 1.0)
         );
         // Placed as decoration: the default drop.
         assert!(matches!(
-            t.hit("Wood_Oak_Trunk", None, true),
+            t.hit("Wood_Oak_Trunk", None, true, false),
             Hit::Damage { item: None, .. }
         ));
+    }
+
+    #[test]
+    fn wear_and_broken_tools() {
+        let t = Table::parse(T);
+        let h = "Tool_Hatchet_Crude";
+        // A broken tool keeps a quarter of its power.
+        assert!(
+            matches!(t.hit("Wood_Oak_Trunk", Some(h), false, true), Hit::Damage { damage, .. } if damage == 0.15 * 0.25)
+        );
+        assert_eq!(t.wear(h, "Wood_Oak_Trunk", |s| s == "Wood"), 0.25);
+        // Not in a listed set: the item's own loss (0 here).
+        assert_eq!(t.wear(h, "Wood_Oak_Trunk", |_| false), 0.0);
+        // Soft blocks and items that are no tool wear nothing.
+        assert_eq!(t.wear(h, "Plant_Grass", |_| true), 0.0);
+        assert_eq!(t.wear("Weapon_Sword", "Rock_Stone", |_| true), 0.0);
     }
 }

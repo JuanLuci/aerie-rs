@@ -11,7 +11,7 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::inventory::{self, Inventory};
+use crate::inventory::{self, Inventory, Slot, Stack};
 
 /// Packet ids used here (gen/packets.tsv).
 pub mod id {
@@ -267,10 +267,10 @@ impl Hub {
             e.consuming.remove(&c.chain_id);
         }
         self.with_inventory(player, |inv| {
-            if let Some((held, n)) = inv.get(inventory::HOTBAR, slot)
-                && held == item
+            if let Some(held) = inv.get(inventory::HOTBAR, slot)
+                && held.item == item
             {
-                inv.set(inventory::HOTBAR, slot, Some((held, n + adjust)));
+                inv.set(inventory::HOTBAR, slot, Some(held.with_n(held.n + adjust)));
             }
         })?;
         info!("{player} used {item} ({adjust:+})");
@@ -316,13 +316,19 @@ impl Hub {
     /// One hit on a block (spec 12): creative breaks it at once without
     /// drops; otherwise the spec the held item gives decides the damage,
     /// effects and drops.
-    fn hit(&self, player: i32, x: i32, y: i32, z: i32, held: Option<&str>) {
-        let held = held
-            .filter(|h| !h.is_empty() && *h != "Empty")
-            .map(str::to_owned);
+    fn hit(&self, player: i32, x: i32, y: i32, z: i32, slot: i32) {
         self.world_step(|hub, g, ground, out| {
             use crate::support::World;
             let creative = g.players.get(&player).is_none_or(|e| e.creative);
+            // The server's own idea of the held stack, as the official
+            // server uses (not the id the client names).
+            let stack = g
+                .players
+                .get(&player)
+                .and_then(|e| e.inv.get(inventory::HOTBAR, slot))
+                .filter(|s| !s.item.is_empty() && s.item != "Empty");
+            let held = stack.as_ref().map(|s| s.item.clone());
+            let broken = stack.as_ref().is_some_and(Stack::broken);
             // A part of a multi-block block: the hit goes to its main cell.
             let f = unpack_filler(g.fillers.get(&(x, y, z)).copied().unwrap_or(0));
             let (x, y, z) = (x - f[0], y - f[1], z - f[2]);
@@ -344,7 +350,7 @@ impl Hub {
                 return;
             };
             let deco = g.support.get(&(x, y, z)) == Some(&crate::support::DECO);
-            match hub.gather.hit(&key, held.as_deref(), deco) {
+            match hub.gather.hit(&key, held.as_deref(), deco, broken) {
                 crate::gather::Hit::Nothing => {}
                 crate::gather::Hit::Unbreakable => {
                     hub.effect(g, &hub.gather.unbreakable.clone(), center, out);
@@ -399,9 +405,71 @@ impl Hub {
                     if spec.as_ref().is_some_and(|s| s.incorrect) {
                         hub.effect(g, &hub.gather.incorrect.clone(), center, out);
                     }
+                    if let Some(st) = stack.filter(|s| !s.unbreakable()) {
+                        hub.wear_held(g, player, slot, &st, &key, block, out);
+                    }
                 }
             }
         });
+    }
+
+    /// The held tool's wear after a damaging hit (spec 12): the slot is
+    /// replaced (and sent, even unchanged, as the official replace is), and
+    /// a tool that just broke tells its player.
+    #[allow(clippy::too_many_arguments)]
+    fn wear_held(
+        &self,
+        g: &mut Inner,
+        player: i32,
+        slot: i32,
+        st: &Stack,
+        key: &str,
+        block: i32,
+        out: &mut Outgoing,
+    ) {
+        let loss = self
+            .gather
+            .wear(&st.item, key, |s| self.rules.in_set(s, block));
+        let worn = st.worn(-loss);
+        let Some(e) = g.players.get_mut(&player) else {
+            return;
+        };
+        if !e
+            .inv
+            .get(inventory::HOTBAR, slot)
+            .is_some_and(|s| s.stacks_with(st))
+        {
+            return;
+        }
+        e.inv.set(inventory::HOTBAR, slot, Some(worn.clone()));
+        e.inv_dirty.insert(inventory::HOTBAR);
+        if worn.broken() && !st.broken() {
+            let name = proto::FormattedMessage {
+                message_id: Some(self.book.item_name(&st.item)),
+                ..Default::default()
+            };
+            let msg = proto::FormattedMessage {
+                message_id: Some("server.general.repair.itemBroken".into()),
+                message_params: Some(vec![("itemName".into(), name)]),
+                color: Some("#ff5555".into()),
+                ..Default::default()
+            };
+            if let Ok(p) = packet(
+                id::SERVER_MESSAGE,
+                &proto::ServerMessage {
+                    r#type: proto::ChatType::CHAT,
+                    message: Some(msg),
+                },
+            ) {
+                out.to.push((player, p));
+            }
+            let s = self.book.sound("SFX_Item_Break");
+            if s > 0
+                && let Ok(p) = sound_2d_packet(s)
+            {
+                out.to.push((player, p));
+            }
+        }
     }
 
     /// The centre of a block (its hitbox's centre).
@@ -589,7 +657,7 @@ impl Hub {
 
     /// Stacks dropped together at one place: straight up for one, spread
     /// on a circle for more.
-    pub fn drop_items(&self, stacks: Vec<(String, i32)>, at: [f64; 3]) {
+    pub fn drop_items(&self, stacks: Vec<Stack>, at: [f64; 3]) {
         if stacks.is_empty() {
             return;
         }
@@ -597,15 +665,15 @@ impl Hub {
         let vels = crate::items::launch(stacks.len(), angle);
         let mut g = self.inner.lock().unwrap();
         let born = g.tick + g.in_tick as u64;
-        for ((item, n), vel) in stacks.into_iter().zip(vels) {
-            if n <= 0 {
+        for (st, vel) in stacks.into_iter().zip(vels) {
+            if st.n <= 0 {
                 continue;
             }
             g.next_item = g.next_item.max(FIRST_ITEM_ID) + 1;
             let nid = g.next_item;
-            let life = self.item_life(&item);
+            let life = self.item_life(&st.item);
             g.items
-                .insert(nid, crate::items::Item::new(&item, n, at, vel, life, born));
+                .insert(nid, crate::items::Item::new(&st, at, vel, life, born));
         }
     }
 
@@ -713,11 +781,11 @@ impl Hub {
             let slot = (0..9)
                 .find(|&i| {
                     inv.get(inventory::HOTBAR, i)
-                        .is_some_and(|(x, _)| x == item)
+                        .is_some_and(|x| x.item == item)
                 })
                 .or_else(|| (0..9).find(|&i| inv.get(inventory::HOTBAR, i).is_none()))
                 .unwrap_or(8);
-            inv.set(inventory::HOTBAR, slot, Some((item.to_owned(), qty)));
+            inv.set(inventory::HOTBAR, slot, Some(self.book.stack(item, qty)));
             slot as usize
         })?;
         Ok(slot.unwrap_or(0))
@@ -767,12 +835,12 @@ impl Hub {
             }
             self::id::DROP_ITEM_STACK => {
                 let (m, _) = proto::DropItemStack::decode(payload, 0)?;
-                if let Some(Some((item, n))) = self.with_inventory(id, |inv| {
+                if let Some(Some(st)) = self.with_inventory(id, |inv| {
                     inv.take(m.inventory_section_id, m.slot_id, m.quantity)
                 })? {
                     // Thrown along the look at speed 6, with the drop sound
                     // (spec 11).
-                    self.throw_item(id, &item, n, 6.0);
+                    self.throw_item(id, st, 6.0);
                     self.sound_2d(id, self.book.sound("SFX_Player_Drop_Item"))?;
                 }
             }
@@ -786,7 +854,8 @@ impl Hub {
                     .get(&id)
                     .is_some_and(|e| e.creative);
                 if creative {
-                    self.throw_item(id, &m.item.item_id, m.item.quantity, 1.0);
+                    let st = self.book.stack(&m.item.item_id, m.item.quantity);
+                    self.throw_item(id, st, 1.0);
                 } else {
                     let n = proto::Notification {
                         message: Some(proto::FormattedMessage {
@@ -825,11 +894,7 @@ impl Hub {
                 let w = e.window.as_ref()?;
                 return match slot {
                     0 => Some(w.input.clone()),
-                    s if s >= 1 => Some(
-                        w.options
-                            .get(s as usize - 1)
-                            .map(|(i, n, _)| (i.clone(), *n)),
-                    ),
+                    s if s >= 1 => Some(w.options.get(s as usize - 1).map(|(st, _)| st.clone())),
                     _ => None,
                 };
             }
@@ -852,32 +917,33 @@ impl Hub {
         {
             return;
         }
-        let Some((item, have)) = from.clone() else {
+        let Some(st) = from.clone() else {
             return;
         };
+        let (item, have) = (st.item.clone(), st.n);
         let w = e.window.as_ref().unwrap();
         let valid = |it: &str| self.book.structural_options(&w.bench, it).0.len() > 0;
         let max = self.book.max_stack(&item);
         let n = m.quantity.min(have).max(0);
         let (new_from, new_to) = match to.clone() {
-            None => (Some((item.clone(), have - n)), Some((item.clone(), n))),
-            Some((other, k)) if other == item => {
-                let n = n.min(max - k).max(0);
-                (Some((item.clone(), have - n)), Some((item.clone(), k + n)))
+            None => (Some(st.with_n(have - n)), Some(st.with_n(n))),
+            Some(other) if other.stacks_with(&st) => {
+                let n = n.min(max - other.n).max(0);
+                (Some(st.with_n(have - n)), Some(other.with_n(other.n + n)))
             }
-            Some(other) if n >= have => (Some(other), Some((item.clone(), have))),
+            Some(other) if n >= have => (Some(other), Some(st.clone())),
             Some(_) => return,
         };
-        let into_input = |slot: &Option<(String, i32)>| slot.as_ref().is_none_or(|(i, _)| valid(i));
+        let into_input = |slot: &Slot| slot.as_ref().is_none_or(|s| valid(&s.item));
         if m.to_section_id == wid && !into_input(&new_to) {
             return;
         }
-        if m.from_section_id == wid && !into_input(&new_from.clone().filter(|(_, n)| *n > 0)) {
+        if m.from_section_id == wid && !into_input(&new_from.clone().filter(|s| s.n > 0)) {
             return;
         }
         let before = e.inv.clone();
-        let put = |e: &mut Entry, sec: i32, slot: i32, v: Option<(String, i32)>| {
-            let v = v.filter(|(_, n)| *n > 0);
+        let put = |e: &mut Entry, sec: i32, slot: i32, v: Slot| {
+            let v = v.filter(|s| s.n > 0);
             if sec == wid {
                 if let Some(w) = e.window.as_mut() {
                     w.input = v;
@@ -897,8 +963,8 @@ impl Hub {
 
     /// A stack thrown by a player (spec 11): from the eyes plus one block
     /// along the look, at `speed` along it, picked up again after 1.5 s.
-    pub fn throw_item(&self, id: i32, item: &str, n: i32, speed: f32) {
-        if n <= 0 {
+    pub fn throw_item(&self, id: i32, st: Stack, speed: f32) {
+        if st.n <= 0 {
             return;
         }
         let mut g = self.inner.lock().unwrap();
@@ -915,7 +981,7 @@ impl Hub {
         let born = g.tick + g.in_tick as u64;
         g.next_item = g.next_item.max(FIRST_ITEM_ID) + 1;
         let nid = g.next_item;
-        let mut it = crate::items::Item::new(item, n, at, vel, self.item_life(item), born);
+        let mut it = crate::items::Item::new(&st, at, vel, self.item_life(&st.item), born);
         it.pickup_delay = 1.5;
         g.items.insert(nid, it);
     }
@@ -1052,15 +1118,15 @@ impl Hub {
             {
                 out.to.push((id, p));
             }
-            if let Some((item, n)) = input
+            if let Some(st) = input
                 && let Some(e) = g.players.get_mut(&id)
             {
                 let before = e.inv.clone();
-                let left = e.inv.add(&item, n, hub.book.max_stack(&item));
+                let left = e.inv.add(&st, hub.book.max_stack(&st.item));
                 let changed = e.inv.changed_since(&before);
                 e.inv_dirty.extend(changed);
                 if left > 0 {
-                    out.throws.push((id, item, left));
+                    out.throws.push((id, st.with_n(left)));
                 }
             }
         });
@@ -1079,7 +1145,8 @@ impl Hub {
         {
             let before = e.inv.clone();
             for (item, n) in taken {
-                e.inv.add(item, *n, self.book.max_stack(item));
+                e.inv
+                    .add(&self.book.stack(item, *n), self.book.max_stack(item));
             }
             let changed = e.inv.changed_since(&before);
             e.inv_dirty.extend(changed);
@@ -1148,7 +1215,7 @@ impl Hub {
                     }
                 }
                 (proto::WindowAction::CraftRecipeAction(a), Kind::Structural) => {
-                    let Some((_, _, recipe)) = w.options.get(w.selected as usize).cloned() else {
+                    let Some((_, recipe)) = w.options.get(w.selected as usize).cloned() else {
                         return;
                     };
                     if let Some(p) = hub
@@ -1280,9 +1347,10 @@ impl Hub {
             }
         }
         for (item, n) in self.book.outputs(recipe, quantity) {
-            let left = e.inv.add(&item, n, self.book.max_stack(&item));
+            let st = self.book.stack(&item, n);
+            let left = e.inv.add(&st, self.book.max_stack(&item));
             if left > 0 {
-                out.throws.push((pid, item, left));
+                out.throws.push((pid, st.with_n(left)));
             }
         }
         let changed = e.inv.changed_since(&before);
@@ -1362,9 +1430,10 @@ impl Hub {
     /// A structural input cycled through its block group (spec 09).
     fn cycle_input(&self, pid: i32, e: &mut Entry, down: bool, out: &mut Outgoing) {
         let Some(w) = e.window.as_mut() else { return };
-        let Some((item, n)) = w.input.clone() else {
+        let Some(input) = w.input.clone() else {
             return;
         };
+        let (item, n) = (input.item.clone(), input.n);
         let Some(group) = self.book.group_of(&item) else {
             return;
         };
@@ -1378,7 +1447,7 @@ impl Hub {
             (i + 1) % len
         };
         let next = group[next].clone();
-        w.input = Some((next.clone(), n));
+        w.input = Some(self.book.stack(&next, n));
         let s = self.book.drop_sound(&next);
         self.update_options(w);
         if s > 0
@@ -1392,7 +1461,7 @@ impl Hub {
     fn update_options(&self, w: &mut crate::crafting::Window) {
         w.dirty = true;
         w.options.clear();
-        let Some((item, _)) = w.input.clone() else {
+        let Some(Stack { item, .. }) = w.input.clone() else {
             return;
         };
         let (options, divider) = self.book.structural_options(&w.bench, &item);
@@ -1400,7 +1469,7 @@ impl Hub {
             return;
         }
         w.data.set("dividerIndex", divider.to_string());
-        let ids: Vec<String> = options.iter().map(|(_, _, r)| r.clone()).collect();
+        let ids: Vec<String> = options.iter().map(|(_, r)| r.clone()).collect();
         w.data.set(
             "optionSlotRecipes",
             format!(
@@ -1466,9 +1535,10 @@ impl Hub {
                         job.seconds_done = 0.0;
                         let before = e.inv.clone();
                         for (item, n) in self.book.outputs(&job.recipe, 1) {
-                            let left = e.inv.add(&item, n, self.book.max_stack(&item));
+                            let st = self.book.stack(&item, n);
+                            let left = e.inv.add(&st, self.book.max_stack(&item));
                             if left > 0 {
-                                out.throws.push((pid, item, left));
+                                out.throws.push((pid, st.with_n(left)));
                             }
                         }
                         let changed = e.inv.changed_since(&before);
@@ -1542,11 +1612,12 @@ impl Hub {
         }
         let m = self.book.single_input(&job.recipe)?.clone();
         let w = e.window.as_mut()?;
-        let (item, have) = w.input.clone()?;
+        let input = w.input.clone()?;
+        let (item, have) = (input.item.clone(), input.n);
         if !self.book.is_material(&m, &item) || have < m.quantity {
             return None;
         }
-        w.input = (have > m.quantity).then(|| (item.clone(), have - m.quantity));
+        w.input = (have > m.quantity).then(|| input.with_n(have - m.quantity));
         self.update_options(w);
         Some(vec![(item, m.quantity)])
     }
@@ -1560,7 +1631,7 @@ impl Hub {
                 inv.set(
                     m.inventory_section_id,
                     m.slot_id,
-                    Some((m.item.item_id.clone(), m.item.quantity)),
+                    Some(self.book.stack(&m.item.item_id, m.item.quantity)),
                 )
             })?;
         } else {
@@ -1581,7 +1652,7 @@ impl Hub {
 
     fn saved_inventory(&self, uuid: uuid::Uuid) -> Option<Inventory> {
         let text = std::fs::read_to_string(self.inventory_file(uuid)?).ok()?;
-        Some(Inventory::from_text(&text))
+        Some(Inventory::from_text(&text, |i| self.book.max_durability(i)))
     }
 
     fn save_inventory(&self, uuid: uuid::Uuid, inv: &Inventory) {
@@ -1908,7 +1979,7 @@ impl Hub {
             g.items
                 .iter()
                 .filter(|(_, d)| d.announced)
-                .map(|(n, d)| item_entity(*n, &d.item, d.quantity, d.pos)),
+                .map(|(n, d)| item_entity(*n, &d.stack(), d.pos)),
         );
         if !theirs.is_empty() {
             let p = packet(
@@ -1973,17 +2044,7 @@ impl Hub {
             self.open_bench(_player, x, y, z)?;
         }
         for ((x, y, z), slot) in hits {
-            // The server's own idea of the held item, as the official
-            // server uses (not the id the client names).
-            let held = self
-                .inner
-                .lock()
-                .unwrap()
-                .players
-                .get(&_player)
-                .and_then(|e| e.inv.get(inventory::HOTBAR, slot))
-                .map(|(item, _)| item);
-            self.hit(_player, x, y, z, held.as_deref());
+            self.hit(_player, x, y, z, slot);
         }
         changes.dedup();
         for &((x, y, z), b, rot) in &changes {
@@ -2332,35 +2393,23 @@ pub fn server_message(text: &str) -> Result<Packet> {
 /// A dropped item's entity: where it lies and what it is.
 /// How clients first see an item entity: its stack (entity scale 0),
 /// intangible, its position.
-fn item_entity(nid: i32, item: &str, quantity: i32, pos: [f64; 3]) -> proto::EntityUpdate {
+fn item_entity(nid: i32, st: &Stack, pos: [f64; 3]) -> proto::EntityUpdate {
     proto::EntityUpdate {
         network_id: nid,
         removed: None,
         updates: Some(vec![
-            item_update(item, quantity),
+            item_update(st),
             proto::ComponentUpdate::IntangibleUpdate(Box::default()),
             transform_update(pos),
         ]),
     }
 }
 
-fn item_update(item: &str, quantity: i32) -> proto::ComponentUpdate {
+fn item_update(st: &Stack) -> proto::ComponentUpdate {
     proto::ComponentUpdate::ItemUpdate(Box::new(proto::ItemUpdate {
-        item: item_packet(item, quantity),
+        item: st.packet(),
         entity_scale: 0.0,
     }))
-}
-
-fn item_packet(item: &str, quantity: i32) -> proto::ItemWithAllMetadata {
-    proto::ItemWithAllMetadata {
-        item_id: item.to_owned(),
-        quantity,
-        durability: 0.0,
-        max_durability: 0.0,
-        quality: -1,
-        override_dropped_item_animation: false,
-        metadata: None,
-    }
 }
 
 fn transform_update(pos: [f64; 3]) -> proto::ComponentUpdate {
@@ -2782,7 +2831,7 @@ struct Outgoing {
     to: Vec<(i32, Packet)>,
     drops: Vec<(Vec<(String, i32)>, [f64; 3])>,
     /// Stacks a player drops (speed 1, spec 11).
-    throws: Vec<(i32, String, i32)>,
+    throws: Vec<(i32, Stack)>,
 }
 
 /// A part's offset packed as the official server does (5 bits each:
@@ -3118,10 +3167,14 @@ impl Hub {
             self.send(to, p);
         }
         for (stacks, at) in out.drops {
+            let stacks = stacks
+                .into_iter()
+                .map(|(item, n)| self.book.stack(&item, n))
+                .collect();
             self.drop_items(stacks, at);
         }
-        for (pid, item, n) in out.throws {
-            self.throw_item(pid, &item, n, 1.0);
+        for (pid, st) in out.throws {
+            self.throw_item(pid, st, 1.0);
         }
         r
     }
@@ -3479,7 +3532,7 @@ impl Hub {
             let mut near: Vec<(f64, i32)> = g
                 .items
                 .iter()
-                .filter(|(o, d)| *o != nid && d.born <= tick && d.item == it.item)
+                .filter(|(o, d)| *o != nid && d.born <= tick && d.stack().stacks_with(&it.stack()))
                 .map(|(o, d)| (dist2(d.pos, it.pos), *o))
                 .filter(|(d2, _)| *d2 <= items::MERGE_RADIUS * items::MERGE_RADIUS)
                 .collect();
@@ -3542,14 +3595,14 @@ impl Hub {
                     continue;
                 };
                 let before = e.inv.clone();
-                let left = e.inv.add(&it.item, it.quantity, max);
+                let left = e.inv.add(&it.stack(), max);
                 if left == it.quantity {
                     continue;
                 }
                 let taken = it.quantity - left;
                 let changed = e.inv.changed_since(&before);
                 e.inv_dirty.extend(changed);
-                self.notify_pickup(pid, &it.item, taken, it.pos, out);
+                self.notify_pickup(pid, &it.stack().with_n(taken), it.pos, out);
                 let target = e.position.as_ref().map_or(it.pos, |p| [p.x, p.y, p.z]);
                 g.next_item = g.next_item.max(FIRST_ITEM_ID) + 1;
                 let fid = g.next_item;
@@ -3559,8 +3612,7 @@ impl Hub {
                     g.flights.insert(
                         fid,
                         items::Flight {
-                            item: it.item.clone(),
-                            quantity: it.quantity,
+                            stack: it.stack(),
                             start: it.pos,
                             pos: it.pos,
                             to_player: pid,
@@ -3579,8 +3631,7 @@ impl Hub {
                 g.flights.insert(
                     fid,
                     items::Flight {
-                        item: it.item.clone(),
-                        quantity: left,
+                        stack: it.stack().with_n(left),
                         start: it.pos,
                         pos: it.pos,
                         to_player: pid,
@@ -3634,7 +3685,7 @@ impl Hub {
                     network_id: fid,
                     removed: None,
                     updates: Some(vec![
-                        item_update(&f.item, f.quantity),
+                        item_update(&f.stack),
                         proto::ComponentUpdate::IntangibleUpdate(Box::default()),
                         transform_update(f.pos),
                     ]),
@@ -3650,13 +3701,13 @@ impl Hub {
             if !it.announced {
                 it.announced = true;
                 it.stack_changed = false;
-                updates.push(item_entity(*nid, &it.item, it.quantity, it.pos));
+                updates.push(item_entity(*nid, &it.stack(), it.pos));
                 continue;
             }
             let mut parts = Vec::new();
             if it.stack_changed {
                 it.stack_changed = false;
-                parts.push(item_update(&it.item, it.quantity));
+                parts.push(item_update(&it.stack()));
             }
             if moved.contains(nid) {
                 parts.push(transform_update(it.pos));
@@ -3693,7 +3744,8 @@ impl Hub {
     }
 
     /// The pickup notification and sound (spec 11).
-    fn notify_pickup(&self, pid: i32, item: &str, n: i32, at: [f64; 3], out: &mut Outgoing) {
+    fn notify_pickup(&self, pid: i32, st: &Stack, at: [f64; 3], out: &mut Outgoing) {
+        let item = st.item.as_str();
         let name = proto::FormattedMessage {
             message_id: Some(self.book.item_name(item)),
             ..Default::default()
@@ -3709,7 +3761,7 @@ impl Hub {
                 message: Some(msg),
                 secondary_message: None,
                 icon: None,
-                item: Some(item_packet(item, n)),
+                item: Some(st.packet()),
                 style: Default::default(),
                 tag: None,
             },

@@ -100,8 +100,8 @@ pub struct Window {
     pub extra_dirty: bool,
     /// Structural windows: the input slot, the options (item, quantity,
     /// recipe) and the selected option.
-    pub input: Option<(String, i32)>,
-    pub options: Vec<(String, i32, String)>,
+    pub input: crate::inventory::Slot,
+    pub options: Vec<(crate::inventory::Stack, String)>,
     pub selected: i32,
     /// Progress last sent and when (updates are rate limited).
     pub last_progress: f32,
@@ -162,11 +162,11 @@ impl Window {
             return None;
         }
         let mut items = Vec::new();
-        if let Some((item, n)) = &self.input {
-            items.push((0, stack(item, *n)));
+        if let Some(s) = &self.input {
+            items.push((0, s.packet()));
         }
-        for (i, (item, n, _)) in self.options.iter().enumerate() {
-            items.push((i as i32 + 1, stack(item, *n)));
+        for (i, (s, _)) in self.options.iter().enumerate() {
+            items.push((i as i32 + 1, s.packet()));
         }
         Some(proto::InventorySection {
             items: Some(items),
@@ -182,18 +182,6 @@ pub fn fmt_f32(v: f32) -> String {
         s
     } else {
         format!("{s}.0")
-    }
-}
-
-pub fn stack(item: &str, quantity: i32) -> proto::ItemWithAllMetadata {
-    proto::ItemWithAllMetadata {
-        item_id: item.to_owned(),
-        quantity,
-        durability: 0.0,
-        max_durability: 0.0,
-        quality: -1,
-        override_dropped_item_animation: false,
-        metadata: None,
     }
 }
 
@@ -230,6 +218,7 @@ struct ItemInfo {
     tags: Vec<i32>,
     name: Option<String>,
     max_stack: i32,
+    max_durability: f64,
     sound_set: i32,
 }
 
@@ -307,6 +296,7 @@ impl Book {
                                     tags: it.tag_indexes.unwrap_or_default(),
                                     name: it.translation_properties.and_then(|t| t.name),
                                     max_stack: it.max_stack,
+                                    max_durability: it.durability,
                                     sound_set: it.item_sound_set_index,
                                 },
                             );
@@ -382,6 +372,17 @@ impl Book {
 
     pub fn counts(&self) -> (usize, usize, usize) {
         (self.recipes.len(), self.items.len(), self.benches.len())
+    }
+
+    /// An item's `MaxDurability` (0: it never wears).
+    pub fn max_durability(&self, item: &str) -> f64 {
+        self.items.get(item).map_or(0.0, |i| i.max_durability)
+    }
+
+    /// A new stack of `item` at full durability, as the official server
+    /// makes one from an item id.
+    pub fn stack(&self, item: &str, n: i32) -> crate::inventory::Stack {
+        crate::inventory::Stack::new(item, n, self.max_durability(item))
     }
 
     /// Most of an item in one slot (the official default 100 for an unknown
@@ -533,7 +534,7 @@ impl Book {
         &self,
         bench: &Bench,
         input: &str,
-    ) -> (Vec<(String, i32, String)>, usize) {
+    ) -> (Vec<(crate::inventory::Stack, String)>, usize) {
         let header = |r: &proto::CraftingRecipe| {
             r.bench_requirement.iter().flatten().any(|b| {
                 b.r#type.0 == bench.kind
@@ -587,7 +588,7 @@ impl Book {
                     if let Some(o) = r.outputs.iter().flatten().next()
                         && let Some(item) = &o.item_id
                     {
-                        options.push((item.clone(), o.quantity, id.clone()));
+                        options.push((self.stack(item, o.quantity), id.clone()));
                     }
                 }
             }
@@ -606,7 +607,7 @@ impl Book {
             (crate::inventory::STORAGE, 36),
         ] {
             for slot in 0..n {
-                if let Some((item, _)) = inv.get(sec, slot)
+                if let Some(crate::inventory::Stack { item, .. }) = inv.get(sec, slot)
                     && recipes.iter().any(|(_, r)| {
                         r.inputs
                             .iter()
@@ -789,18 +790,23 @@ mod tests {
 
     #[test]
     fn units_resources_and_items() {
+        use crate::inventory::Stack;
         let b = book();
         let mut inv = Inventory::default();
-        inv.add("Log", 5, 100);
-        inv.add("Rock", 2, 100);
+        inv.add(&Stack::new("Log", 5, 0.0), 100);
+        inv.add(&Stack::new("Rock", 2, 0.0), 100);
         assert_eq!(b.take_unit(&mut inv, "Bench_Recipe"), None);
-        assert_eq!(inv.get(-1, 0), Some(("Log".into(), 5)), "nothing taken");
-        inv.add("Rock", 1, 100);
+        assert_eq!(
+            inv.get(-1, 0),
+            Some(Stack::new("Log", 5, 0.0)),
+            "nothing taken"
+        );
+        inv.add(&Stack::new("Rock", 1, 0.0), 100);
         assert_eq!(
             b.take_unit(&mut inv, "Bench_Recipe"),
             Some(vec![("Log".into(), 4), ("Rock".into(), 3)])
         );
-        assert_eq!(inv.get(-1, 0), Some(("Log".into(), 1)));
+        assert_eq!(inv.get(-1, 0), Some(Stack::new("Log", 1, 0.0)));
         assert_eq!(
             b.allowed("Bench_Recipe", 0, "Workbench"),
             Err(Refused::WrongBench)

@@ -260,6 +260,11 @@ fn dash(s: &str) -> Option<String> {
 }
 
 impl Rules {
+    /// Whether block `id` is in the named block set.
+    pub fn in_set(&self, set: &str, id: i32) -> bool {
+        self.sets.get(set).is_some_and(|s| s.contains(&id))
+    }
+
     pub fn new(registries: &[(u32, Vec<u8>)], table: &str) -> Self {
         let mut r = Rules {
             connecting: connecting(),

@@ -10,7 +10,8 @@
 //!   a weapon or a builder tool; `MaxDurability`, `DurabilityLossOnHit`;
 //! - bare hands: `Item/Unarmed/Gathering/<GatherType>`;
 //! - the gameplay config's `Gathering.UnbreakableBlock` and
-//!   `Gathering.IncorrectTool` effects (particle system, sound).
+//!   `Gathering.IncorrectTool` effects (particle system, sound) and
+//!   `ItemDurability.BrokenPenalties.Tool`.
 //!
 //! Text lines for the start-up cache (`-` for none, sounds as event
 //! indexes):
@@ -19,7 +20,8 @@
 //! `T item gather power quality incorrect hitSound` (every spec, in order),
 //! `I item weapon builder tool hitSound incorrectSound maxDurability
 //! lossOnHit`, `L item loss sets types` (comma lists),
-//! `U gather power quality hitSound`, `E kind particle sound`.
+//! `U gather power quality hitSound`, `E kind particle sound`,
+//! `X tool penalty`.
 
 use serde_json::Value;
 
@@ -159,6 +161,12 @@ pub fn table(ctx: &Ctx) -> Result<String> {
     }
     if let Ok(gameplay) = ctx.store(GAMEPLAY) {
         let d = gameplay.resolved("Default", "GameplayConfig");
+        if let Some(p) = d
+            .obj("ItemDurability")
+            .and_then(|x| x.obj("BrokenPenalties"))
+        {
+            out += &format!("X tool {}\n", p.f64_or("Tool", 0.0));
+        }
         if let Some(g) = d.obj("Gathering") {
             for (name, key) in [
                 ("unbreakable", "UnbreakableBlock"),

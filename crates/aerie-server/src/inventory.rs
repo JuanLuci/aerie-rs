@@ -19,10 +19,70 @@ const SECTIONS: [(i32, usize); 8] = [
     (-12, 50),
 ];
 
-/// Most of one item in a slot.
+/// Most of one item in a slot when moving between slots.
 const STACK: i32 = 999;
 
-pub type Slot = Option<(String, i32)>;
+/// One slot's content: an item, how many, and its durability (the
+/// official `ItemStack`: a new stack starts at the item's
+/// `MaxDurability`; a max of 0 never wears).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Stack {
+    pub item: String,
+    pub n: i32,
+    pub durability: f64,
+    pub max: f64,
+}
+
+impl Stack {
+    /// A new stack at full durability.
+    pub fn new(item: &str, n: i32, max: f64) -> Self {
+        Self {
+            item: item.to_owned(),
+            n,
+            durability: max,
+            max,
+        }
+    }
+
+    pub fn with_n(&self, n: i32) -> Self {
+        Self { n, ..self.clone() }
+    }
+
+    pub fn unbreakable(&self) -> bool {
+        self.max <= 0.0
+    }
+
+    pub fn broken(&self) -> bool {
+        !self.unbreakable() && self.durability == 0.0
+    }
+
+    /// Durability changed by `by`, kept within 0 and the max.
+    pub fn worn(&self, by: f64) -> Self {
+        Self {
+            durability: (self.durability + by).clamp(0.0, self.max.max(0.0)),
+            ..self.clone()
+        }
+    }
+
+    /// The official stacking rule: same item, durability and max.
+    pub fn stacks_with(&self, o: &Stack) -> bool {
+        self.item == o.item && self.durability == o.durability && self.max == o.max
+    }
+
+    pub fn packet(&self) -> proto::ItemWithAllMetadata {
+        proto::ItemWithAllMetadata {
+            item_id: self.item.clone(),
+            quantity: self.n,
+            durability: self.durability,
+            max_durability: self.max,
+            quality: -1,
+            override_dropped_item_animation: false,
+            metadata: None,
+        }
+    }
+}
+
+pub type Slot = Option<Stack>;
 
 #[derive(Clone, Debug)]
 pub struct Inventory {
@@ -59,24 +119,25 @@ impl Inventory {
         };
         match usize::try_from(slot).ok().and_then(|i| s.get_mut(i)) {
             Some(x) => {
-                *x = v.filter(|(_, n)| *n > 0);
+                *x = v.filter(|s| s.n > 0);
                 true
             }
             None => false,
         }
     }
 
-    /// Adds as the official pickup does (default preferences): existing
-    /// stacks of the item over hotbar, storage, backpack in slot order, then
-    /// empty slots in that order, each up to `max`. Returns what did not fit.
-    pub fn add(&mut self, item: &str, mut n: i32, max: i32) -> i32 {
+    /// Adds as the official pickup does (default preferences): stacks it
+    /// stacks with over hotbar, storage, backpack in slot order, then empty
+    /// slots in that order, each up to `max`. Returns what did not fit.
+    pub fn add(&mut self, stack: &Stack, max: i32) -> i32 {
         let max = max.max(1);
+        let mut n = stack.n;
         for sec in [HOTBAR, STORAGE, -9] {
             let Some(s) = self.section(sec) else { continue };
             for x in s.iter_mut().flatten() {
-                if x.0 == item && x.1 < max && n > 0 {
-                    let k = n.min(max - x.1);
-                    x.1 += k;
+                if x.stacks_with(stack) && x.n < max && n > 0 {
+                    let k = n.min(max - x.n);
+                    x.n += k;
                     n -= k;
                 }
             }
@@ -86,7 +147,7 @@ impl Inventory {
             for x in s.iter_mut() {
                 if x.is_none() && n > 0 {
                     let k = n.min(max);
-                    *x = Some((item.to_owned(), k));
+                    *x = Some(stack.with_n(k));
                     n -= k;
                 }
             }
@@ -105,15 +166,15 @@ impl Inventory {
                 if units <= 0 {
                     return 0;
                 }
-                let Some((item, have)) = x else { continue };
-                let Some(p) = per(item).filter(|&p| p > 0) else {
+                let Some(st) = x else { continue };
+                let Some(p) = per(&st.item).filter(|&p| p > 0) else {
                     continue;
                 };
                 let need = (units + p - 1) / p;
-                let k = need.min(*have);
-                *have -= k;
+                let k = need.min(st.n);
+                st.n -= k;
                 units -= k * p;
-                if *have == 0 {
+                if st.n == 0 {
                     *x = None;
                 }
             }
@@ -123,31 +184,31 @@ impl Inventory {
 
     /// Takes up to `n` from a slot.
     pub fn take(&mut self, section: i32, slot: i32, n: i32) -> Slot {
-        let (item, have) = self.get(section, slot)?;
-        let k = n.min(have).max(0);
-        self.set(section, slot, Some((item.clone(), have - k)));
-        (k > 0).then_some((item, k))
+        let st = self.get(section, slot)?;
+        let k = n.min(st.n).max(0);
+        self.set(section, slot, Some(st.with_n(st.n - k)));
+        (k > 0).then(|| st.with_n(k))
     }
 
-    /// `MoveItemStack`: onto an empty slot or the same item, else a swap
-    /// (when the whole stack moves).
+    /// `MoveItemStack`: onto an empty slot or a stack it stacks with, else
+    /// a swap (when the whole stack moves).
     pub fn move_stack(&mut self, from: (i32, i32), n: i32, to: (i32, i32)) {
-        let Some((item, have)) = self.get(from.0, from.1) else {
+        let Some(st) = self.get(from.0, from.1) else {
             return;
         };
         match self.get(to.0, to.1) {
             None => {
-                let k = n.min(have);
-                self.set(from.0, from.1, Some((item.clone(), have - k)));
-                self.set(to.0, to.1, Some((item, k)));
+                let k = n.min(st.n);
+                self.set(from.0, from.1, Some(st.with_n(st.n - k)));
+                self.set(to.0, to.1, Some(st.with_n(k)));
             }
-            Some((other, m)) if other == item => {
-                let k = n.min(have).min(STACK - m);
-                self.set(from.0, from.1, Some((item.clone(), have - k)));
-                self.set(to.0, to.1, Some((item, m + k)));
+            Some(other) if other.stacks_with(&st) => {
+                let k = n.min(st.n).min(STACK - other.n);
+                self.set(from.0, from.1, Some(st.with_n(st.n - k)));
+                self.set(to.0, to.1, Some(other.with_n(other.n + k)));
             }
-            Some(other) if n >= have => {
-                self.set(to.0, to.1, Some((item, have)));
+            Some(other) if n >= st.n => {
+                self.set(to.0, to.1, Some(st));
                 self.set(from.0, from.1, Some(other));
             }
             Some(_) => {}
@@ -157,37 +218,30 @@ impl Inventory {
     /// `SmartMoveItemStack`: hotbar ↔ storage, into the first room.
     pub fn smart_move(&mut self, from: (i32, i32), n: i32) {
         let to = if from.0 == HOTBAR { STORAGE } else { HOTBAR };
-        let Some((item, _)) = self.take(from.0, from.1, n) else {
+        let Some(st) = self.take(from.0, from.1, n) else {
             return;
         };
-        let k = {
-            let total = self.get(from.0, from.1).map_or(0, |s| s.1);
-            let _ = total;
-            let mut left = 0;
-            if let Some(s) = self.section(to) {
-                let mut m = n;
-                for x in s.iter_mut() {
-                    match x {
-                        Some((i, c)) if *i == item && *c < STACK && m > 0 => {
-                            let k = m.min(STACK - *c);
-                            *c += k;
-                            m -= k;
-                        }
-                        None if m > 0 => {
-                            *x = Some((item.clone(), m));
-                            m = 0;
-                        }
-                        _ => {}
+        let mut m = st.n;
+        if let Some(s) = self.section(to) {
+            for x in s.iter_mut() {
+                match x {
+                    Some(o) if o.stacks_with(&st) && o.n < STACK && m > 0 => {
+                        let k = m.min(STACK - o.n);
+                        o.n += k;
+                        m -= k;
                     }
+                    None if m > 0 => {
+                        *x = Some(st.with_n(m));
+                        m = 0;
+                    }
+                    _ => {}
                 }
-                left = m;
             }
-            left
-        };
-        if k > 0 {
+        }
+        if m > 0 {
             // No room: back where it was.
-            let back = self.get(from.0, from.1).map_or(0, |s| s.1) + k;
-            self.set(from.0, from.1, Some((item, back)));
+            let back = self.get(from.0, from.1).map_or(0, |s| s.n) + m;
+            self.set(from.0, from.1, Some(st.with_n(back)));
         }
     }
 
@@ -195,7 +249,7 @@ impl Inventory {
     pub fn all(&self) -> Vec<(String, i32)> {
         self.sections
             .iter()
-            .flat_map(|(_, v)| v.iter().flatten().cloned())
+            .flat_map(|(_, v)| v.iter().flatten().map(|s| (s.item.clone(), s.n)))
             .collect()
     }
 
@@ -227,22 +281,7 @@ impl Inventory {
                 items: Some(
                     v.iter()
                         .enumerate()
-                        .filter_map(|(i, s)| {
-                            s.as_ref().map(|(item, n)| {
-                                (
-                                    i as i32,
-                                    proto::ItemWithAllMetadata {
-                                        item_id: item.clone(),
-                                        quantity: *n,
-                                        durability: 0.0,
-                                        max_durability: 0.0,
-                                        quality: -1,
-                                        override_dropped_item_animation: false,
-                                        metadata: None,
-                                    },
-                                )
-                            })
-                        })
+                        .filter_map(|(i, s)| s.as_ref().map(|s| (i as i32, s.packet())))
                         .collect(),
                 ),
                 capacity: v.len() as i16,
@@ -260,28 +299,46 @@ impl Inventory {
         }
     }
 
-    /// Text form for saving: `section slot item quantity` per line.
+    /// Text form for saving: `section slot item quantity durability max`
+    /// per line.
     pub fn to_text(&self) -> String {
         let mut s = String::new();
         for (id, v) in &self.sections {
             for (i, x) in v.iter().enumerate() {
-                if let Some((item, n)) = x {
-                    s += &format!("{id} {i} {item} {n}\n");
+                if let Some(st) = x {
+                    s += &format!(
+                        "{id} {i} {} {} {} {}\n",
+                        st.item, st.n, st.durability, st.max
+                    );
                 }
             }
         }
         s
     }
 
-    pub fn from_text(text: &str) -> Self {
+    /// Reads [`Self::to_text`]; lines saved before durability was kept get
+    /// the item's full durability from `max_of`.
+    pub fn from_text(text: &str, max_of: impl Fn(&str) -> f64) -> Self {
         let mut inv = Self::default();
         for l in text.lines() {
             let w: Vec<&str> = l.split_whitespace().collect();
-            if let [sec, slot, item, n] = w[..]
-                && let (Ok(sec), Ok(slot), Ok(n)) = (sec.parse(), slot.parse(), n.parse())
-            {
-                inv.set(sec, slot, Some((item.to_owned(), n)));
-            }
+            let (sec, slot, item, n) = match w[..] {
+                [sec, slot, item, n, ..] => (sec, slot, item, n),
+                _ => continue,
+            };
+            let (Ok(sec), Ok(slot), Ok(n)) = (sec.parse(), slot.parse(), n.parse()) else {
+                continue;
+            };
+            let st = match w[..] {
+                [_, _, _, _, d, m] => Stack {
+                    item: item.to_owned(),
+                    n,
+                    durability: d.parse().unwrap_or(0.0),
+                    max: m.parse().unwrap_or(0.0),
+                },
+                _ => Stack::new(item, n, max_of(item)),
+            };
+            inv.set(sec, slot, Some(st));
         }
         inv
     }
@@ -291,25 +348,44 @@ impl Inventory {
 mod tests {
     use super::*;
 
+    fn s(item: &str, n: i32) -> Slot {
+        Some(Stack::new(item, n, 0.0))
+    }
+
     #[test]
     fn add_move_swap_save() {
         let mut inv = Inventory::default();
-        assert_eq!(inv.add("Wood", 5, 100), 0);
-        assert_eq!(inv.get(HOTBAR, 0), Some(("Wood".into(), 5)));
-        inv.add("Stone", 3, 100);
+        assert_eq!(inv.add(&Stack::new("Wood", 5, 0.0), 100), 0);
+        assert_eq!(inv.get(HOTBAR, 0), s("Wood", 5));
+        inv.add(&Stack::new("Stone", 3, 0.0), 100);
         inv.move_stack((HOTBAR, 0), 2, (STORAGE, 4));
-        assert_eq!(inv.get(HOTBAR, 0), Some(("Wood".into(), 3)));
-        assert_eq!(inv.get(STORAGE, 4), Some(("Wood".into(), 2)));
+        assert_eq!(inv.get(HOTBAR, 0), s("Wood", 3));
+        assert_eq!(inv.get(STORAGE, 4), s("Wood", 2));
         // Whole stack onto another item: swap.
         inv.move_stack((HOTBAR, 1), 3, (HOTBAR, 0));
-        assert_eq!(inv.get(HOTBAR, 0), Some(("Stone".into(), 3)));
-        assert_eq!(inv.get(HOTBAR, 1), Some(("Wood".into(), 3)));
+        assert_eq!(inv.get(HOTBAR, 0), s("Stone", 3));
+        assert_eq!(inv.get(HOTBAR, 1), s("Wood", 3));
         inv.smart_move((HOTBAR, 0), 3);
         assert_eq!(inv.get(HOTBAR, 0), None);
-        assert!(inv.to_text().contains("-2 0 Stone 3"));
-        let back = Inventory::from_text(&inv.to_text());
-        assert_eq!(back.get(STORAGE, 0), Some(("Stone".into(), 3)));
-        assert_eq!(inv.take(HOTBAR, 1, 10), Some(("Wood".into(), 3)));
+        assert!(inv.to_text().contains("-2 0 Stone 3 0 0"));
+        let back = Inventory::from_text(&inv.to_text(), |_| 9.0);
+        assert_eq!(back.get(STORAGE, 0), s("Stone", 3));
+        let old = Inventory::from_text("-1 0 Axe 1\n", |_| 9.0);
+        assert_eq!(old.get(HOTBAR, 0), Some(Stack::new("Axe", 1, 9.0)));
+        assert_eq!(inv.take(HOTBAR, 1, 10), s("Wood", 3));
         assert_eq!(inv.get(HOTBAR, 1), None);
+    }
+
+    #[test]
+    fn worn_stacks_apart() {
+        let mut inv = Inventory::default();
+        let axe = Stack::new("Axe", 1, 200.0);
+        inv.add(&axe, 1);
+        let worn = axe.worn(-0.5);
+        assert_eq!(worn.durability, 199.5);
+        assert!(!worn.stacks_with(&axe));
+        assert!(axe.worn(-500.0).broken());
+        inv.add(&worn, 1);
+        assert_eq!(inv.get(HOTBAR, 1), Some(worn));
     }
 }
