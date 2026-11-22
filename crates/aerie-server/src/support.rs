@@ -570,6 +570,16 @@ impl Rules {
 
     /// The centre of a block's hitbox (block-local) for a rotation; `None`
     /// for a plain block.
+    /// A block's front direction (x, z) for its rotation's yaw, and its
+    /// unrotated hitbox's depth (processing benches throw items out of
+    /// their front).
+    pub fn front(&self, id: i32, rot: i32) -> ([f64; 2], Option<f64>) {
+        let (yaw, _, _) = rotation(rot);
+        let d = rotate_f([0.0, 0.0, 1.0], yaw, 0, 0);
+        let depth = self.bounds(id, 0).map(|b| (b[5] - b[2]) as f64);
+        ([d[0] as f64, d[2] as f64], depth)
+    }
+
     pub fn center(&self, id: i32, rot: i32) -> Option<[f64; 3]> {
         let b = self.bounds(id, rot)?;
         Some([

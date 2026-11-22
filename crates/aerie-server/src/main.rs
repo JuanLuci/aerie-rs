@@ -78,6 +78,7 @@ async fn main() -> Result<()> {
             after: arg(&args, "--after"),
             interactions: arg(&args, "--interactions").map(PathBuf::from),
             root_map: arg(&args, "--root-map").map(PathBuf::from),
+            listen: arg(&args, "--listen").and_then(|s| s.parse().ok()),
         };
         return probe::run(upstream, capture, opts).await;
     }
@@ -296,7 +297,7 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             let mut every =
                 tokio::time::interval(std::time::Duration::from_nanos(1_000_000_000 / 30));
-            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // How long each tick takes (spec 13): the panel each second, a
             // `perf:` line every 10 s.
             let mut perf = perf::Perf::default();

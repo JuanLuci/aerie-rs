@@ -73,6 +73,11 @@ slot already active (Aerie ignores the request instead).
 
 ## What clients receive
 
+A section's stacks are listed in the order of the official server's map
+(the open addressing table of spec 10's sets, made for 16 entries and
+filled in ascending slot order: slots 0–5 come as 0, 2, 4, 1, 3, 5).
+Inventory packets from client moves go out before the window's update.
+
 Every section a successful move set is sent at the end of the tick, even
 when its content did not change (a slot moved onto itself, a stack that
 went back where it was).

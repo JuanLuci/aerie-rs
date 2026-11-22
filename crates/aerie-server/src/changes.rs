@@ -9,6 +9,17 @@
 //! slot down with key 0 first. Each section has two such sets that swap
 //! every tick and are cleared but never shrunk.
 
+/// The order the official server's integer-keyed maps list their entries
+/// in a packet (inventory sections: the same open addressing table as the
+/// sets below, made for 16 entries, filled in ascending slot order).
+pub fn map_order(keys: impl IntoIterator<Item = i32>) -> Vec<i32> {
+    let mut s = IntSet::with_capacity(32);
+    for k in keys {
+        s.insert(k);
+    }
+    s.iter()
+}
+
 /// An integer set iterated in the official server's order.
 #[derive(Clone, Debug)]
 pub struct IntSet {
@@ -202,6 +213,16 @@ impl Deltas {
         self.keys.clear();
         self.values.clear();
         out
+    }
+}
+
+#[cfg(test)]
+mod map_tests {
+    #[test]
+    fn inventory_sections_as_captured() {
+        // Orders seen from the official server.
+        assert_eq!(super::map_order(0..6), [0, 2, 4, 1, 3, 5]);
+        assert_eq!(super::map_order([0, 1, 3, 4]), [0, 4, 1, 3]);
     }
 }
 

@@ -124,6 +124,10 @@ pub struct State {
     pub processing_fuel_slots: BTreeSet<i32>,
     /// Progress to show in the window, when the official bench sends it.
     pub progress_sent: Option<f32>,
+    /// The bench's `FuelDropItemId` (set each tick).
+    pub fuel_drop: Option<String>,
+    /// Filled by [`State::all`]'s caller: the fuel left, as drop items.
+    pub dropped_fuel: Vec<(String, i32)>,
 }
 
 /// What a tick asks the world to do.
@@ -174,8 +178,17 @@ impl State {
         self.output = it.collect();
     }
 
-    /// Everything inside, for when the bench is broken.
-    pub fn all(&self) -> Vec<Stack> {
+    /// Everything inside, for when the bench is broken; the whole seconds
+    /// of fuel left become that many of the bench's fuel drop item (in
+    /// `dropped_fuel`, split at 100 a stack by the caller's item rules).
+    pub fn all(&mut self) -> Vec<Stack> {
+        if let Some(item) = self.fuel_drop.clone() {
+            let n = self.fuel_time as i32;
+            if n > 0 {
+                self.dropped_fuel.push((item, n));
+            }
+        }
+        self.fuel_time = 0.0;
         self.slots().into_iter().flatten().collect()
     }
 

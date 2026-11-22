@@ -171,28 +171,17 @@ impl Window {
     pub fn section(&self) -> Option<proto::InventorySection> {
         if self.kind == Kind::Processing {
             return Some(proto::InventorySection {
-                items: Some(
-                    self.slots
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, s)| s.as_ref().map(|s| (i as i32, s.packet())))
-                        .collect(),
-                ),
+                items: Some(crate::inventory::section_items(&self.slots)),
                 capacity: self.slots.len() as i16,
             });
         }
         if self.kind != Kind::Structural {
             return None;
         }
-        let mut items = Vec::new();
-        if let Some(s) = &self.input {
-            items.push((0, s.packet()));
-        }
-        for (i, (s, _)) in self.options.iter().enumerate() {
-            items.push((i as i32 + 1, s.packet()));
-        }
+        let mut slots = vec![self.input.clone()];
+        slots.extend((0..OPTION_SLOTS).map(|i| self.options.get(i).map(|(s, _)| s.clone())));
         Some(proto::InventorySection {
-            items: Some(items),
+            items: Some(crate::inventory::section_items(&slots)),
             capacity: (1 + OPTION_SLOTS) as i16,
         })
     }

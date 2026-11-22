@@ -1436,8 +1436,11 @@ impl Hub {
         let window_type = match proto::BenchType(bench.kind) {
             proto::BenchType::STRUCTURAL_CRAFTING => proto::WindowType::STRUCTURAL_CRAFTING,
             proto::BenchType::CRAFTING => proto::WindowType::BASIC_CRAFTING,
+            proto::BenchType::PROCESSING if bench.processing.is_some() => {
+                return self.open_processing(id, &key, bench, at);
+            }
             _ => {
-                // Processing and diagram benches: not done yet (PARITY).
+                // Diagram benches: not done yet (PARITY).
                 info!("{key} ({}) cannot be opened yet", bench.id);
                 return Ok(true);
             }
@@ -1479,6 +1482,249 @@ impl Hub {
         self.send(id, packet(self::id::OPEN_WINDOW, &o)?);
         info!("opened {} ({}) for {id}", key, bench.id);
         Ok(true)
+    }
+
+    /// Opens a processing bench's window (spec 16): the bench's state is
+    /// made on first use; the window starts with the fuel shown.
+    fn open_processing(
+        &self,
+        id: i32,
+        key: &str,
+        bench: crate::crafting::Bench,
+        at: Pos,
+    ) -> Result<bool> {
+        let Some(cfg) = bench.processing.clone() else {
+            return Ok(true);
+        };
+        let w = {
+            let mut g = self.inner.lock().unwrap();
+            let Inner {
+                players,
+                processing,
+                ..
+            } = &mut *g;
+            let Some(e) = players.get_mut(&id) else {
+                return Ok(true);
+            };
+            if e.window.is_some() {
+                return Ok(true);
+            }
+            let st = processing
+                .entry(at)
+                .or_insert_with(|| crate::processing::State::new(&cfg, 1));
+            let recipes = self.book.processing_recipes(&bench, 1);
+            let pi = ProcItems {
+                book: &self.book,
+                keys: &self.keys_by_id,
+            };
+            let progress = crate::processing::Bench {
+                cfg: &cfg,
+                recipes: &recipes,
+                tier: 1,
+                items: &pi,
+            }
+            .progress(st);
+            e.next_window = e.next_window.max(0) + 1;
+            let Some(mut w) =
+                self.book
+                    .processing_window(e.next_window, key, at, &bench, st, progress)
+            else {
+                return Ok(true);
+            };
+            let (fuel, max) = st.fuel_shown();
+            w.data.set("fuelTime", crate::crafting::fmt_f32(fuel));
+            w.data.set("maxFuel", max.to_string());
+            w.data.set(
+                "processingFuelSlots",
+                crate::processing::mask(&st.processing_fuel_slots).to_string(),
+            );
+            e.window = Some(w.clone());
+            w
+        };
+        let page = proto::SetPage {
+            page: proto::Page::BENCH,
+            can_close_through_interaction: true,
+        };
+        self.send(id, packet(self::id::SET_PAGE, &page)?);
+        let o = proto::OpenWindow {
+            id: w.id,
+            window_type: proto::WindowType::PROCESSING,
+            window_data: Some(w.data.text()),
+            inventory: w.section(),
+            extra_resources: Some(proto::ExtraResources {
+                resources: Some(Vec::new()),
+            }),
+        };
+        self.send(id, packet(self::id::OPEN_WINDOW, &o)?);
+        self.sound_2d(id, bench.open_sound)?;
+        info!("opened {} ({}) for {id}", key, bench.id);
+        Ok(true)
+    }
+
+    /// A processing bench is gone: everything inside falls out at the
+    /// block's bottom centre, with the whole seconds of fuel left as the
+    /// bench's fuel drop item.
+    fn drop_processing(&self, g: &mut Inner, at: Pos, out: &mut Outgoing) {
+        let Some(mut st) = g.processing.remove(&at) else {
+            return;
+        };
+        let mut stacks: Vec<(String, i32)> = st.all().into_iter().map(|s| (s.item, s.n)).collect();
+        for (item, mut n) in std::mem::take(&mut st.dropped_fuel) {
+            let max = self.book.max_stack(&item).max(1);
+            while n > 0 {
+                let k = n.min(max);
+                stacks.push((item.clone(), k));
+                n -= k;
+            }
+        }
+        if !stacks.is_empty() {
+            out.drops
+                .push((stacks, [at.0 as f64 + 0.5, at.1 as f64, at.2 as f64 + 0.5]));
+        }
+        // Windows open on it close.
+        for (pid, e) in g.players.iter_mut() {
+            if e.window.as_ref().is_some_and(|w| {
+                w.kind == crate::crafting::Kind::Processing
+                    && w.block.as_ref().is_some_and(|(_, p)| *p == at)
+            }) && let Some(w) = e.window.take()
+                && let Ok(p) = packet(self::id::CLOSE_WINDOW, &proto::CloseWindow { id: w.id })
+            {
+                out.to.push((*pid, p));
+            }
+        }
+    }
+
+    /// The processing benches for one tick (spec 16): each burns fuel and
+    /// crafts as the official bench block, switches its block's state,
+    /// plays its sounds, throws out what does not fit and updates the
+    /// windows open on it. A bench whose block is gone drops what it held.
+    fn processing_step(&self, g: &mut Inner, ground: &Ground, dt: f32, out: &mut Outgoing) {
+        use crate::support::World;
+        let places: Vec<Pos> = g.processing.keys().copied().collect();
+        for at in places {
+            let (block, rot) = View {
+                g,
+                ground,
+                hub_rules: &self.rules,
+            }
+            .block(at.0, at.1, at.2);
+            let bench = self
+                .keys_by_id
+                .get(&block)
+                .and_then(|k| self.book.bench(k))
+                .filter(|b| b.processing.is_some())
+                .cloned();
+            let Some(bench) = bench else {
+                self.drop_processing(g, at, out);
+                continue;
+            };
+            let cfg = bench.processing.as_ref().unwrap();
+            let current = self
+                .rules
+                .block(block)
+                .and_then(|b| b.states.iter().find(|(_, i)| *i == block))
+                .map_or("default".to_owned(), |(n, _)| n.clone());
+            let recipes = self.book.processing_recipes(&bench, 1);
+            let pi = ProcItems {
+                book: &self.book,
+                keys: &self.keys_by_id,
+            };
+            let pb = crate::processing::Bench {
+                cfg,
+                recipes: &recipes,
+                tier: 1,
+                items: &pi,
+            };
+            let sounds = crate::processing::Sounds {
+                failed: bench.failed_sound,
+                end: cfg.end_sound,
+                completed: bench.completed_sound,
+            };
+            let Some(st) = g.processing.get_mut(&at) else {
+                continue;
+            };
+            st.fuel_drop = cfg.fuel_drop.clone();
+            let ev = pb.tick(st, &current, dt, sounds);
+            let st = st.clone();
+            if let Some(state) = ev.state {
+                self.set_block_state(g, ground, at, state, out);
+            }
+            let center = self.block_center(block, rot, at);
+            for s in ev.sounds {
+                if s > 0 {
+                    self.sound_near(g, s, center, out);
+                }
+            }
+            if !ev.eject.is_empty() {
+                let (dir, depth) = self.rules.front(block, rot);
+                let pos = match depth {
+                    Some(d) => {
+                        let off = d / 2.0 + 0.1f32 as f64;
+                        [
+                            center[0] + dir[0] * off,
+                            center[1],
+                            center[2] + dir[1] * off,
+                        ]
+                    }
+                    None => [at.0 as f64 + 0.5, at.1 as f64, at.2 as f64 + 0.5],
+                };
+                let born = g.tick + g.in_tick as u64;
+                for stack in ev.eject {
+                    let vx = (dir[0] * 2.0 + 2.0 * (rand::random::<f64>() - 0.5)) as f32;
+                    let vz = (dir[1] * 2.0 + 2.0 * (rand::random::<f64>() - 0.5)) as f32;
+                    g.next_item = g.next_item.max(FIRST_ITEM_ID) + 1;
+                    let nid = g.next_item;
+                    let life = self.item_life(&stack.item);
+                    g.items.insert(
+                        nid,
+                        crate::items::Item::new(
+                            &stack,
+                            pos,
+                            [vx as f64, 3.25, vz as f64],
+                            life,
+                            born,
+                        ),
+                    );
+                }
+            }
+            // The windows open on this bench.
+            let progress = st.progress_sent;
+            for e in g.players.values_mut() {
+                let Some(w) = e.window.as_mut().filter(|w| {
+                    w.kind == crate::crafting::Kind::Processing
+                        && w.block.as_ref().is_some_and(|(_, p)| *p == at)
+                }) else {
+                    continue;
+                };
+                let before = w.data.text();
+                w.data.set("active", st.active.to_string());
+                if let Some(p) = progress {
+                    w.data.set("progress", crate::crafting::fmt_f32(p));
+                }
+                if let Some((f, max)) = ev.fuel {
+                    w.data.set("fuelTime", crate::crafting::fmt_f32(f));
+                    w.data.set("maxFuel", max.to_string());
+                }
+                w.data.set(
+                    "processingSlots",
+                    crate::processing::mask(&st.processing_slots).to_string(),
+                );
+                if ev.fuel.is_some() || !st.active {
+                    w.data.set(
+                        "processingFuelSlots",
+                        crate::processing::mask(&st.processing_fuel_slots).to_string(),
+                    );
+                }
+                let slots = st.slots();
+                if w.data.text() != before || w.slots != slots {
+                    w.slots = slots;
+                    w.dirty = true;
+                }
+            }
+            if let Some(s) = g.processing.get_mut(&at) {
+                s.progress_sent = None;
+            }
+        }
     }
 
     /// A UI sound for one player (none for index 0).
@@ -1701,6 +1947,53 @@ impl Hub {
                             ) {
                                 out.all.push(p);
                             }
+                        }
+                    }
+                }
+                (proto::WindowAction::SetActiveAction(a), Kind::Processing) => {
+                    // On needs fuel; a refusal resends the window.
+                    let Some((_, at)) = w.block.clone() else {
+                        return;
+                    };
+                    let Some(cfg) = w.bench.processing.as_ref() else {
+                        return;
+                    };
+                    let changed = g.processing.get_mut(&at).map(|st| {
+                        let c = st.set_active(a.state, cfg);
+                        if c {
+                            let recipes = hub.book.processing_recipes(&w.bench, 1);
+                            let pi = ProcItems {
+                                book: &hub.book,
+                                keys: &hub.keys_by_id,
+                            };
+                            crate::processing::Bench {
+                                cfg,
+                                recipes: &recipes,
+                                tier: 1,
+                                items: &pi,
+                            }
+                            .update_recipe(st);
+                        }
+                        (c, st.active)
+                    });
+                    if let Some((c, active)) = changed {
+                        for e in g.players.values_mut() {
+                            if let Some(w) = e.window.as_mut().filter(|x| {
+                                x.kind == Kind::Processing
+                                    && x.block.as_ref().is_some_and(|(_, p)| *p == at)
+                            }) {
+                                w.data.set("active", active.to_string());
+                                if !active {
+                                    w.data.set("processingSlots", "0".into());
+                                    w.data.set("processingFuelSlots", "0".into());
+                                }
+                                w.dirty = true;
+                            }
+                        }
+                        if !c
+                            && let Some(w) = g.players.get_mut(&id).and_then(|e| e.window.as_mut())
+                        {
+                            w.dirty = true;
                         }
                     }
                 }
@@ -1965,10 +2258,21 @@ impl Hub {
             if let Some((_, at)) = emptied {
                 self.set_block_state(g, ground, at, "default", out);
             }
+        }
+    }
+
+    /// What players are sent about their own inventory and window (spec 09,
+    /// 14, 16): the changed inventory sections, then the changed window.
+    /// Runs at the start of a tick for what client packets changed since
+    /// the last one (the official server handles packets after its systems
+    /// and sends at the end of that tick), and at its end for the tick's
+    /// own changes.
+    fn send_player_updates(&self, g: &mut Inner, out: &mut Outgoing) {
+        for (pid, e) in g.players.iter_mut() {
+            let pid = *pid;
             // A structural window follows the player's hotbar and storage.
-            if let Some(e) = g.players.get_mut(&pid)
-                && (e.inv_dirty.contains(&inventory::HOTBAR)
-                    || e.inv_dirty.contains(&inventory::STORAGE))
+            if (e.inv_dirty.contains(&inventory::HOTBAR)
+                || e.inv_dirty.contains(&inventory::STORAGE))
                 && let Some(w) = e.window.as_mut()
                 && w.kind == crate::crafting::Kind::Structural
             {
@@ -1976,9 +2280,13 @@ impl Hub {
                 w.data.set("inventoryHints", json_ints(&hints));
                 w.dirty = true;
             }
-            // Windows that changed this tick.
-            if let Some(e) = g.players.get_mut(&pid)
-                && let Some(w) = e.window.as_mut()
+            if !e.inv_dirty.is_empty() {
+                let which: Vec<i32> = std::mem::take(&mut e.inv_dirty).into_iter().collect();
+                if let Ok(p) = packet(id::UPDATE_PLAYER_INVENTORY, &e.inv.packet_of(&which)) {
+                    out.to.push((pid, p));
+                }
+            }
+            if let Some(w) = e.window.as_mut()
                 && w.dirty
                 && w.id != 0
             {
@@ -3619,6 +3927,20 @@ impl Hub {
     ) -> Option<(i32, i32)> {
         let old_filler = g.fillers.get(&(x, y, z)).copied().unwrap_or(0);
         let (old, old_rot) = self.set_cell(g, ground, (x, y, z), id, rot, 0, how, out)?;
+        // A processing bench replaced by anything but one of its own
+        // states drops what it held (spec 16).
+        if g.processing.contains_key(&(x, y, z)) {
+            let bench_of = |b: i32| {
+                self.keys_by_id
+                    .get(&b)
+                    .and_then(|k| self.book.bench(k))
+                    .filter(|b| b.processing.is_some())
+                    .map(|b| b.id.clone())
+            };
+            if bench_of(id).is_none() || bench_of(id) != bench_of(old) {
+                self.drop_processing(g, (x, y, z), out);
+            }
+        }
         // The old block's other parts go (spec 10, fillers).
         if old != 0 {
             self.remove_parts(g, ground, (x, y, z), old, old_rot, old_filler, how, out);
@@ -3828,25 +4150,20 @@ impl Hub {
             None => crate::items::DT,
         };
         self.world_step(|hub, g, ground, out| {
+            hub.send_player_updates(g, out);
             g.in_tick = true;
             let todo = std::mem::take(&mut g.ticking);
             for (sec, index) in todo {
                 hub.check_support(g, ground, block_of(sec, index), out);
             }
+            // Before the flush: a bench's new block state goes out with
+            // this tick's block changes, ahead of its window.
+            hub.processing_step(g, ground, dt, out);
             hub.flush(g, ground, out);
             hub.health_step(g, dt, out);
             hub.items_step(g, ground, dt, out);
             hub.crafting_step(g, ground, dt, out);
-            // Inventories that changed, only their changed sections.
-            for (pid, e) in g.players.iter_mut() {
-                if e.inv_dirty.is_empty() {
-                    continue;
-                }
-                let which: Vec<i32> = std::mem::take(&mut e.inv_dirty).into_iter().collect();
-                if let Ok(p) = packet(id::UPDATE_PLAYER_INVENTORY, &e.inv.packet_of(&which)) {
-                    out.to.push((*pid, p));
-                }
-            }
+            hub.send_player_updates(g, out);
             g.in_tick = false;
             g.tick += 1;
         });

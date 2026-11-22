@@ -217,6 +217,15 @@ impl Stack {
 
 pub type Slot = Option<Stack>;
 
+/// A section's stacks for a packet, in the official server's map order.
+pub fn section_items(slots: &[Slot]) -> Vec<(i32, proto::ItemWithAllMetadata)> {
+    let filled = (0..slots.len() as i32).filter(|&i| slots[i as usize].is_some());
+    crate::changes::map_order(filled)
+        .into_iter()
+        .filter_map(|i| Some((i, slots[i as usize].as_ref()?.packet())))
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub struct Inventory {
     sections: Vec<(i32, Vec<Slot>)>,
@@ -690,12 +699,7 @@ impl Inventory {
             }
             let (_, v) = self.sections.iter().find(|(i, _)| *i == id).unwrap();
             Some(proto::InventorySection {
-                items: Some(
-                    v.iter()
-                        .enumerate()
-                        .filter_map(|(i, s)| s.as_ref().map(|s| (i as i32, s.packet())))
-                        .collect(),
-                ),
+                items: Some(section_items(v)),
                 capacity: v.len() as i16,
             })
         };

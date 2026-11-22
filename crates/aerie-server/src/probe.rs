@@ -78,6 +78,8 @@ pub struct Options {
     /// Root interaction ids to translate in replayed chains (`from to` per
     /// line): two servers can number root interactions differently.
     pub root_map: Option<PathBuf>,
+    /// Seconds to keep listening once in the world (20 by default).
+    pub listen: Option<u64>,
 }
 
 /// Translates a chain's root interaction ids (and its forks').
@@ -281,7 +283,10 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
                 // Finish setup the way the client does: view radius, then SetupFinalize.
                 frame::encode(32, &224i32.to_le_bytes(), &mut wire)?;
                 frame::encode(33, &[], &mut wire)?;
-                join_deadline = Some(tokio::time::Instant::now() + JOIN_LISTEN);
+                join_deadline = Some(
+                    tokio::time::Instant::now()
+                        + opts.listen.map_or(JOIN_LISTEN, Duration::from_secs),
+                );
             }
             3 if f.payload.len() >= 16 => {
                 // Answer pings: same id and time, type Raw, empty queue.
