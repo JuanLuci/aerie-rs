@@ -177,6 +177,7 @@ pub struct Block {
     pub item: Option<String>,
     pub break_sound: i32,
     pub hit_sound: i32,
+    pub harvest_sound: i32,
     /// 0 break, 1 destroy, 2 fall.
     pub drop_type: u8,
     /// `Gathering.Physics`, `Breaking`, `Soft`, `Harvest` in that order of use.
@@ -291,6 +292,7 @@ impl Rules {
         };
         let mut sound_sets: HashMap<i32, i32> = HashMap::new();
         let mut hit_sets: HashMap<i32, i32> = HashMap::new();
+        let mut harvest_sets: HashMap<i32, i32> = HashMap::new();
         for (id, payload) in registries {
             match *id {
                 UPDATE_BLOCK_SETS => {
@@ -322,6 +324,9 @@ impl Rules {
                                 }
                                 if *k == proto::BlockSoundEvent::HIT {
                                     hit_sets.insert(i, *e);
+                                }
+                                if *k == proto::BlockSoundEvent::HARVEST {
+                                    harvest_sets.insert(i, *e);
                                 }
                             }
                         }
@@ -390,6 +395,10 @@ impl Rules {
                         .copied()
                         .unwrap_or(0),
                     hit_sound: hit_sets.get(&b.block_sound_set_index).copied().unwrap_or(0),
+                    harvest_sound: harvest_sets
+                        .get(&b.block_sound_set_index)
+                        .copied()
+                        .unwrap_or(0),
                     place_overrides: b
                         .placement_settings
                         .as_ref()

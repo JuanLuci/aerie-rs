@@ -334,6 +334,7 @@ failed) and, after its own logic, jumps to label 0 when it failed.
   also passes on a positive value of a stat that can go negative.
   Percent costs compare the stat's fill.
 - **Apply effect**, **effect condition**, **clear effect**: spec 19.
+- **Door**: spec 22.
 - **Use entity** (instant, waits for the client): the root the target
   entity gives the chain's type is entered; no entity, out of reach or no
   such root: failed.
@@ -392,7 +393,7 @@ placement or a hit applied when the client's packet arrives.
 - Tags are the ones the registry packets carry (roots: with their
   inherited tags).
 - Chaining's "unexpected index" check (the official server only logs it).
-- Picking a block up by using it (harvest), "soft only" breaking.
+- "Soft only" breaking.
 - Each type listed under "Types the server does not run yet".
 
 ## Checked against the official server

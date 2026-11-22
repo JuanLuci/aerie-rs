@@ -2000,6 +2000,93 @@ impl Hub {
         Ok(true)
     }
 
+    /// A player picks a block up by using it (spec 12): a harvestable
+    /// block goes, its harvest drops go straight to the player (what does
+    /// not fit is thrown), and its harvest sound plays. False when the
+    /// block is not harvestable.
+    fn harvest(
+        &self,
+        g: &mut Inner,
+        ground: &Ground,
+        out: &mut Outgoing,
+        pid: i32,
+        at: Pos,
+    ) -> bool {
+        use crate::support::World;
+        let (block, rot) = View {
+            g,
+            ground,
+            hub_rules: &self.rules,
+        }
+        .block(at.0, at.1, at.2);
+        let Some(b) = self.rules.block(block) else {
+            return false;
+        };
+        let Some(drop) = b.harvest_drop.clone() else {
+            return false;
+        };
+        let (own_item, sound) = (b.item.clone(), b.harvest_sound);
+        let center = self.block_center(block, rot, at);
+        let how = How {
+            physics: true,
+            ..Default::default()
+        };
+        if self.change(g, ground, at, 0, 0, how, out).is_some() {
+            self.mark_area(g, at.0, at.1, at.2, block, rot);
+        }
+        let stacks = if drop.item.is_none() && drop.list.is_none() {
+            own_item.map(|i| vec![(i, 1)]).unwrap_or_default()
+        } else {
+            self.rules.roll(&crate::support::Drop {
+                quantity: 1,
+                ..drop
+            })
+        };
+        for (item, n) in stacks {
+            let st = self.book.stack(&item, n);
+            let Some(e) = g.players.get_mut(&pid) else {
+                continue;
+            };
+            let before = e.inv.clone();
+            let view = ItemsView {
+                book: &self.book,
+                rules: &self.rules,
+                bench: None,
+                processing: None,
+                container: false,
+            };
+            let order = e.prefs.order_for(inventory::Items::kind(&view, &item));
+            let left = e.inv.add_to(&view, &order, &st);
+            let changed = e.inv.changed_since(&before);
+            e.inv_dirty.extend(changed);
+            let taken = n - left;
+            if taken > 0 {
+                let got = st.with_n(taken);
+                self.notify_pickup(pid, &got, [f64::NAN; 3], out);
+                g.next_item = g.next_item.max(FIRST_ITEM_ID) + 1;
+                g.flights.insert(
+                    g.next_item,
+                    crate::items::Flight {
+                        stack: got,
+                        start: center,
+                        pos: center,
+                        to_player: pid,
+                        life: crate::items::FLIGHT_TIME,
+                        announced: false,
+                        finished: false,
+                    },
+                );
+            }
+            if left > 0 {
+                out.throws.push((pid, st.with_n(left)));
+            }
+        }
+        if sound > 0 {
+            self.sound_near(g, sound, center, out);
+        }
+        true
+    }
+
     /// Whether a door at `at` could stand as its interaction state
     /// `state`: every cell of that state's shape is free, soft, or the
     /// door's own.
@@ -5137,8 +5224,9 @@ impl crate::chains::Host for ChainHost<'_> {
         match_tool: bool,
     ) -> bool {
         if harvest {
-            // Picking a block up by using it is not done yet.
-            return false;
+            return self
+                .hub
+                .harvest(self.g, self.ground, self.out, self.pid, pos);
         }
         self.hub.hit_in(
             self.g,
@@ -6497,6 +6585,16 @@ impl Hub {
             out.to.push((pid, p));
         }
         let sound = self.book.sound("SFX_Player_Pickup_Item");
+        // Without a place (an item given straight to the player) the
+        // sound is not positioned.
+        if at[0].is_nan() {
+            if sound > 0
+                && let Ok(p) = sound_2d_packet(sound)
+            {
+                out.to.push((pid, p));
+            }
+            return;
+        }
         if sound > 0
             && let Ok(p) = packet(
                 id::PLAY_SOUND_3D,

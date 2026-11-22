@@ -120,3 +120,25 @@ the same damage per hit, health, hit sounds, wear (0.25 a hit, stone being
 in the hatchet's sets), healing after 5 s and damage packets, but for the
 one late chain above. (The official server had cancelled earlier replays
 because the two servers number root interactions differently.)
+
+## Picking a block up by using it
+
+A block whose gathering has a harvest entry is picked up by the harvest
+form of the break interaction (the empty hand's use, when the block has
+no use of its own and no entity is targeted), when gathering is allowed:
+
+1. The block goes (its area is checked for support).
+2. Its harvest drops — the entry's item or drop list, else the block's own
+   item, once — go straight into the player's inventory by the pickup
+   preferences (spec 14); what does not fit is thrown as the player
+   throws an item (spec 11).
+3. For what was taken the player gets the pickup notification, the
+   pickup sound (not positioned) and the item flying to them from the
+   block's centre.
+4. The block's harvest sound plays at the block's centre.
+
+A block without a harvest entry fails the step.
+
+Checked against the official server (a rubble block used with an empty
+hand, a made-up client chain): the same chain states, block change,
+inventory, notification and both sounds.
