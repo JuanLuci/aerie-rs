@@ -220,6 +220,12 @@ struct ItemInfo {
     max_stack: i32,
     max_durability: f64,
     sound_set: i32,
+    /// What the inventory moves look at (spec 14).
+    armor_slot: Option<i32>,
+    usable: bool,
+    weapon_or_tool: bool,
+    block_id: i32,
+    ability: Option<crate::inventory::Ability>,
 }
 
 #[derive(Default)]
@@ -297,6 +303,28 @@ impl Book {
                                     name: it.translation_properties.and_then(|t| t.name),
                                     max_stack: it.max_stack,
                                     max_durability: it.durability,
+                                    armor_slot: it.armor.as_ref().map(|a| a.armor_slot.0),
+                                    usable: it.utility.as_ref().is_some_and(|u| u.usable),
+                                    weapon_or_tool: it.weapon.is_some() || it.tool.is_some(),
+                                    block_id: it.block_id,
+                                    ability: it.ability.as_ref().map(|a| {
+                                        crate::inventory::Ability {
+                                            core: a.slot == proto::AbilitySlot::CORE,
+                                            keywords: a
+                                                .ability_keyword_indexes
+                                                .clone()
+                                                .unwrap_or_default(),
+                                            requires_any: a
+                                                .requires_any_ability_keyword_indexes
+                                                .clone(),
+                                            requires_all: a
+                                                .requires_all_ability_keyword_indexes
+                                                .clone(),
+                                            excludes_any: a
+                                                .excludes_any_ability_keyword_indexes
+                                                .clone(),
+                                        }
+                                    }),
                                     sound_set: it.item_sound_set_index,
                                 },
                             );
@@ -372,6 +400,27 @@ impl Book {
 
     pub fn counts(&self) -> (usize, usize, usize) {
         (self.recipes.len(), self.items.len(), self.benches.len())
+    }
+
+    pub fn armor_slot(&self, item: &str) -> Option<i32> {
+        self.items.get(item)?.armor_slot
+    }
+
+    pub fn usable(&self, item: &str) -> bool {
+        self.items.get(item).is_some_and(|i| i.usable)
+    }
+
+    pub fn weapon_or_tool(&self, item: &str) -> bool {
+        self.items.get(item).is_some_and(|i| i.weapon_or_tool)
+    }
+
+    /// The block an item places (0 or less: none).
+    pub fn block_of(&self, item: &str) -> i32 {
+        self.items.get(item).map_or(0, |i| i.block_id)
+    }
+
+    pub fn ability(&self, item: &str) -> Option<crate::inventory::Ability> {
+        self.items.get(item)?.ability.clone()
     }
 
     /// An item's `MaxDurability` (0: it never wears).

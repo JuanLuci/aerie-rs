@@ -11,7 +11,7 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::inventory::{self, Inventory, Slot, Stack};
+use crate::inventory::{self, Inventory, Stack};
 
 /// Packet ids used here (gen/packets.tsv).
 pub mod id {
@@ -31,6 +31,8 @@ pub mod id {
     pub const SMART_MOVE_ITEM_STACK: u32 = 176;
     pub const SET_CREATIVE_ITEM: u32 = 171;
     pub const SMART_GIVE_CREATIVE_ITEM: u32 = 173;
+    pub const SET_ACTIVE_SLOT: u32 = 177;
+    pub const SYNC_PLAYER_PREFERENCES: u32 = 116;
     pub const UPDATE_PLAYER_INVENTORY: u32 = 170;
     pub const SERVER_SET_BLOCKS: u32 = 141;
     pub const SET_CHUNK: u32 = 131;
@@ -102,6 +104,56 @@ struct Entry {
     perf_shown: bool,
     /// Columns this player's client has.
     columns: std::collections::HashSet<(i32, i32)>,
+    /// Where picked-up items go first (`SyncPlayerPreferences`).
+    prefs: inventory::Preferences,
+    /// Active utility and tools slots (-1: none).
+    utility_slot: i32,
+    tools_slot: i32,
+}
+
+/// The item facts inventory moves need (spec 14), from the item registry,
+/// the block rules and the open window.
+struct ItemsView<'a> {
+    book: &'a crate::crafting::Book,
+    rules: &'a crate::support::Rules,
+    bench: Option<&'a crate::crafting::Bench>,
+}
+
+impl inventory::Items for ItemsView<'_> {
+    fn max_stack(&self, item: &str) -> i32 {
+        self.book.max_stack(item)
+    }
+    fn armor_slot(&self, item: &str) -> Option<i32> {
+        self.book.armor_slot(item)
+    }
+    fn usable(&self, item: &str) -> bool {
+        self.book.usable(item)
+    }
+    fn ability(&self, item: &str) -> Option<inventory::Ability> {
+        self.book.ability(item)
+    }
+    fn kind(&self, item: &str) -> inventory::Kind {
+        use inventory::Kind;
+        if self.book.armor_slot(item).is_some() {
+            Kind::Armor
+        } else if self.book.weapon_or_tool(item) {
+            Kind::WeaponOrTool
+        } else if self.book.usable(item) {
+            Kind::Usable
+        } else if self
+            .rules
+            .block(self.book.block_of(item))
+            .is_some_and(|b| b.solid)
+        {
+            Kind::SolidBlock
+        } else {
+            Kind::Misc
+        }
+    }
+    fn window_input(&self, item: &str) -> bool {
+        self.bench
+            .is_some_and(|b| !self.book.structural_options(b, item).0.is_empty())
+    }
 }
 
 #[derive(Default)]
@@ -801,6 +853,9 @@ impl Hub {
                     perf_hud: self.perf_hud,
                     perf_shown: false,
                     columns: Default::default(),
+                    prefs: Default::default(),
+                    utility_slot: -1,
+                    tools_slot: -1,
                     inv_dirty: Default::default(),
                 },
             );
@@ -888,27 +943,62 @@ impl Hub {
         match packet_id {
             self::id::MOVE_ITEM_STACK => {
                 let (m, _) = proto::MoveItemStack::decode(payload, 0)?;
-                if m.from_section_id >= 0 || m.to_section_id >= 0 {
-                    self.move_with_window(id, &m);
-                    return Ok(());
-                }
-                self.with_inventory(id, |inv| {
-                    inv.move_stack(
+                self.inventory_move(id, |inv, items, _, _| {
+                    inv.move_to_slot(
+                        items,
                         (m.from_section_id, m.from_slot_id),
                         m.quantity,
                         (m.to_section_id, m.to_slot_id),
-                    )
-                })?;
+                    );
+                });
+                // Moved into the utility section: that slot becomes the
+                // active one, and the client is told.
+                if m.to_section_id != m.from_section_id && m.to_section_id == inventory::UTILITY {
+                    let changed = {
+                        let mut g = self.inner.lock().unwrap();
+                        g.players.get_mut(&id).is_some_and(|e| {
+                            let c = e.utility_slot != m.to_slot_id;
+                            e.utility_slot = m.to_slot_id;
+                            c
+                        })
+                    };
+                    if changed {
+                        self.send(
+                            id,
+                            packet(
+                                self::id::SET_ACTIVE_SLOT,
+                                &proto::SetActiveSlot {
+                                    inventory_section_id: inventory::UTILITY,
+                                    active_slot: m.to_slot_id,
+                                },
+                            )?,
+                        );
+                    }
+                }
             }
             self::id::SMART_MOVE_ITEM_STACK => {
                 let (m, _) = proto::SmartMoveItemStack::decode(payload, 0)?;
-                self.with_inventory(id, |inv| {
-                    inv.smart_move((m.from_section_id, m.from_slot_id), m.quantity)
-                })?;
+                self.inventory_move(id, |inv, items, prefs, window| {
+                    inv.smart_move(
+                        items,
+                        prefs,
+                        window,
+                        (m.from_section_id, m.from_slot_id),
+                        m.quantity,
+                        m.move_type.0,
+                    );
+                });
             }
             self::id::DROP_ITEM_STACK => {
                 let (m, _) = proto::DropItemStack::decode(payload, 0)?;
+                // All of the quantity or nothing, as the official remove.
                 if let Some(Some(st)) = self.with_inventory(id, |inv| {
+                    let have = inv
+                        .get(m.inventory_section_id, m.slot_id)
+                        .map_or(0, |s| s.n);
+                    if m.quantity > have {
+                        return None;
+                    }
                     inv.take(m.inventory_section_id, m.slot_id, m.quantity)
                 })? {
                     // Thrown along the look at speed 6, with the drop sound
@@ -947,91 +1037,99 @@ impl Hub {
         Ok(())
     }
 
-    /// A move between the player's inventory and a structural window's
-    /// slots (slot 0 the input, 1–64 the options, which take nothing).
-    fn move_with_window(&self, id: i32, m: &proto::MoveItemStack) {
+    /// Runs an inventory move with the open structural window's slots
+    /// joined as a section (spec 14), then puts them back: a new input
+    /// remakes the options.
+    fn inventory_move(
+        &self,
+        id: i32,
+        f: impl FnOnce(&mut Inventory, &ItemsView, &inventory::Preferences, Option<i32>),
+    ) {
         let mut g = self.inner.lock().unwrap();
         let Some(e) = g.players.get_mut(&id) else {
             return;
         };
-        let Some(wid) = e
+        let before = e.inv.clone();
+        let window = e
             .window
             .as_ref()
             .filter(|w| w.kind == crate::crafting::Kind::Structural)
-            .map(|w| w.id)
-        else {
-            return;
+            .map(|w| {
+                let mut slots = vec![w.input.clone()];
+                slots.extend(
+                    (0..crate::crafting::OPTION_SLOTS)
+                        .map(|i| w.options.get(i).map(|(s, _)| s.clone())),
+                );
+                (w.id, slots, w.bench.clone())
+            });
+        let bench = window.as_ref().map(|(_, _, b)| b.clone());
+        let items = ItemsView {
+            book: &self.book,
+            rules: &self.rules,
+            bench: bench.as_ref(),
         };
-        let get = |e: &Entry, sec: i32, slot: i32| -> Option<crate::inventory::Slot> {
-            if sec == wid {
-                let w = e.window.as_ref()?;
-                return match slot {
-                    0 => Some(w.input.clone()),
-                    s if s >= 1 => Some(w.options.get(s as usize - 1).map(|(st, _)| st.clone())),
-                    _ => None,
-                };
-            }
-            if sec < 0 {
-                Some(e.inv.get(sec, slot))
-            } else {
-                None
-            }
-        };
-        let (Some(from), Some(to)) = (
-            get(e, m.from_section_id, m.from_slot_id),
-            get(e, m.to_section_id, m.to_slot_id),
-        ) else {
-            return;
-        };
-        // The options never take or give items; the input takes only what
-        // some option can be made from.
-        if (m.from_section_id == wid && m.from_slot_id != 0)
-            || (m.to_section_id == wid && m.to_slot_id != 0)
-        {
-            return;
+        let wid = window.as_ref().map(|(i, _, _)| *i);
+        if let Some((wid, slots, _)) = window {
+            e.inv.attach(wid, slots);
         }
-        let Some(st) = from.clone() else {
-            return;
-        };
-        let (item, have) = (st.item.clone(), st.n);
-        let w = e.window.as_ref().unwrap();
-        let valid = |it: &str| self.book.structural_options(&w.bench, it).0.len() > 0;
-        let max = self.book.max_stack(&item);
-        let n = m.quantity.min(have).max(0);
-        let (new_from, new_to) = match to.clone() {
-            None => (Some(st.with_n(have - n)), Some(st.with_n(n))),
-            Some(other) if other.stacks_with(&st) => {
-                let n = n.min(max - other.n).max(0);
-                (Some(st.with_n(have - n)), Some(other.with_n(other.n + n)))
+        let prefs = e.prefs;
+        e.inv.record();
+        f(&mut e.inv, &items, &prefs, wid);
+        let touched = e.inv.recorded();
+        if let Some(wid) = wid {
+            let slots = e.inv.detach(wid).unwrap_or_default();
+            let input = slots.into_iter().next().flatten();
+            if let Some(w) = e.window.as_mut()
+                && w.input != input
+            {
+                w.input = input;
+                self.update_options(w);
             }
-            Some(other) if n >= have => (Some(other), Some(st.clone())),
-            Some(_) => return,
-        };
-        let into_input = |slot: &Slot| slot.as_ref().is_none_or(|s| valid(&s.item));
-        if m.to_section_id == wid && !into_input(&new_to) {
-            return;
         }
-        if m.from_section_id == wid && !into_input(&new_from.clone().filter(|s| s.n > 0)) {
-            return;
-        }
-        let before = e.inv.clone();
-        let put = |e: &mut Entry, sec: i32, slot: i32, v: Slot| {
-            let v = v.filter(|s| s.n > 0);
-            if sec == wid {
-                if let Some(w) = e.window.as_mut() {
-                    w.input = v;
-                }
-            } else {
-                e.inv.set(sec, slot, v);
-            }
-        };
-        put(e, m.from_section_id, m.from_slot_id, new_from);
-        put(e, m.to_section_id, m.to_slot_id, new_to);
         let changed = e.inv.changed_since(&before);
         e.inv_dirty.extend(changed);
-        if let Some(w) = e.window.as_mut() {
-            self.update_options(w);
+        let window_touched = wid.is_some_and(|w| touched.contains(&w));
+        e.inv_dirty.extend(touched.into_iter().filter(|s| *s < 0));
+        if window_touched && let Some(w) = e.window.as_mut() {
+            w.dirty = true;
         }
+    }
+
+    /// `SetActiveSlot` (spec 14): the utility or tools slot in use. The
+    /// hotbar only changes through interactions, so asking for it ends the
+    /// connection, as does a slot out of range or the one already active.
+    pub fn set_active_slot(&self, id: i32, payload: &[u8]) -> Result<bool> {
+        let (m, _) = proto::SetActiveSlot::decode(payload, 0)?;
+        let mut g = self.inner.lock().unwrap();
+        let Some(e) = g.players.get_mut(&id) else {
+            return Ok(true);
+        };
+        let (slot, cap) = match m.inventory_section_id {
+            inventory::UTILITY => (&mut e.utility_slot, 4),
+            -8 => (&mut e.tools_slot, 23),
+            _ => return Ok(false),
+        };
+        if m.active_slot < -1 || m.active_slot >= cap || m.active_slot == *slot {
+            return Ok(false);
+        }
+        *slot = m.active_slot;
+        Ok(true)
+    }
+
+    /// `SyncPlayerPreferences`: where picked-up items go first.
+    pub fn player_preferences(&self, id: i32, payload: &[u8]) -> Result<()> {
+        let (m, _) = proto::SyncPlayerPreferences::decode(payload, 0)?;
+        use inventory::Location as L;
+        if let Some(e) = self.inner.lock().unwrap().players.get_mut(&id) {
+            e.prefs = inventory::Preferences {
+                armor: L::from_wire(m.armor_items_preferred_pickup_location.0),
+                weapon_and_tool: L::from_wire(m.weapon_and_tool_items_preferred_pickup_location.0),
+                usable: L::from_wire(m.usable_items_items_preferred_pickup_location.0),
+                solid_block: L::from_wire(m.solid_block_items_preferred_pickup_location.0),
+                misc: L::from_wire(m.misc_items_preferred_pickup_location.0),
+            };
+        }
+        Ok(())
     }
 
     /// A stack thrown by a player (spec 11): from the eyes plus one block
@@ -3674,12 +3772,18 @@ impl Hub {
                 .collect();
             players.sort_by(|a, b| a.0.total_cmp(&b.0));
             for (_, pid) in players {
-                let max = self.book.max_stack(&it.item);
                 let Some(e) = g.players.get_mut(&pid) else {
                     continue;
                 };
                 let before = e.inv.clone();
-                let left = e.inv.add(&it.stack(), max);
+                // Into the container the player's preferences pick (spec 14).
+                let items = ItemsView {
+                    book: &self.book,
+                    rules: &self.rules,
+                    bench: None,
+                };
+                let order = e.prefs.order_for(inventory::Items::kind(&items, &it.item));
+                let left = e.inv.add_to(&items, &order, &it.stack());
                 if left == it.quantity {
                     continue;
                 }

@@ -1139,6 +1139,14 @@ fn client_packet(f: &Frame, hub: &Hub, client_id: i32, ready: &mut Ready, seen: 
             Some(hub.creative_item(client_id, f.id, &f.payload))
         }
         world::id::SYNC_INTERACTION_CHAINS => Some(hub.interactions(client_id, &f.payload)),
+        world::id::SYNC_PLAYER_PREFERENCES => Some(hub.player_preferences(client_id, &f.payload)),
+        world::id::SET_ACTIVE_SLOT => Some(hub.set_active_slot(client_id, &f.payload).map(|ok| {
+            if !ok {
+                // The official server disconnects here; Aerie keeps the
+                // client and ignores the request.
+                warn!("refused SetActiveSlot from {client_id}");
+            }
+        })),
         _ => None,
     };
     if let Some(r) = handled {
