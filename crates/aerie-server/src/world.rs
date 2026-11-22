@@ -109,6 +109,22 @@ struct Entry {
     /// Active utility and tools slots (-1: none).
     utility_slot: i32,
     tools_slot: i32,
+    /// Creative settings from `SyncPlayerPreferences`: reach and no
+    /// physics.
+    creative_distance: i32,
+    no_physics: bool,
+    /// Placements already done: (chain, fork path, operation).
+    placed_ops: std::collections::HashSet<(i32, String, i32)>,
+}
+
+/// A block placement a client reports in an interaction chain (spec 15).
+#[derive(Clone, Debug)]
+struct Placement {
+    pos: Pos,
+    rot: i32,
+    /// The block the client put there (-1: none named).
+    client_block: i32,
+    slot: i32,
 }
 
 /// The item facts inventory moves need (spec 14), from the item registry,
@@ -207,6 +223,9 @@ pub struct How {
 
 #[derive(Default)]
 struct Inner {
+    /// Particles of placements, sent after the tick's block changes and
+    /// before its heights (as the official server's command buffer does).
+    deferred_particles: Vec<Packet>,
     next_id: i32,
     players: BTreeMap<i32, Entry>,
     /// Blocks changed since the server started, sent to whoever joins.
@@ -550,8 +569,24 @@ impl Hub {
         &self,
         g: &mut Inner,
         ground: &Ground,
+        pos: Pos,
+        drops: Option<(Option<String>, Option<String>, i32)>,
+        out: &mut Outgoing,
+    ) {
+        self.break_with(g, ground, pos, drops, false, true, out);
+    }
+
+    /// Breaking with the official settings: `by_physics` (its particle is
+    /// `Physics`), `area` (support checks around it).
+    #[allow(clippy::too_many_arguments)]
+    fn break_with(
+        &self,
+        g: &mut Inner,
+        ground: &Ground,
         (x, y, z): Pos,
         drops: Option<(Option<String>, Option<String>, i32)>,
+        by_physics: bool,
+        area: bool,
         out: &mut Outgoing,
     ) {
         use crate::support::World;
@@ -568,10 +603,11 @@ impl Hub {
             self.sound_near(g, b.break_sound, center, out);
         }
         let how = How {
-            physics: true,
+            physics: area,
+            by_physics,
             ..Default::default()
         };
-        if self.change(g, ground, (x, y, z), 0, 0, how, out).is_some() {
+        if self.change(g, ground, (x, y, z), 0, 0, how, out).is_some() && area {
             self.mark_area(g, x, y, z, block, rot);
         }
         let Some((item, list, quantity)) = drops else {
@@ -868,6 +904,9 @@ impl Hub {
                     prefs: Default::default(),
                     utility_slot: -1,
                     tools_slot: -1,
+                    creative_distance: 10,
+                    no_physics: false,
+                    placed_ops: Default::default(),
                     inv_dirty: Default::default(),
                 },
             );
@@ -1140,6 +1179,8 @@ impl Hub {
                 solid_block: L::from_wire(m.solid_block_items_preferred_pickup_location.0),
                 misc: L::from_wire(m.misc_items_preferred_pickup_location.0),
             };
+            e.creative_distance = m.creative_interaction_distance as i32;
+            e.no_physics = m.no_physics;
         }
         Ok(())
     }
@@ -2186,9 +2227,18 @@ impl Hub {
     /// which Aerie does not do yet.
     pub fn interactions(&self, _player: i32, payload: &[u8]) -> Result<()> {
         let (m, _) = proto::SyncInteractionChains::decode(payload, 0)?;
-        let mut changes = Vec::new();
+        let mut placements = Vec::new();
         let mut hits = Vec::new();
         let mut uses = Vec::new();
+        fn fork_path(f: Option<&proto::ForkedChainId>) -> String {
+            let mut s = String::new();
+            let mut f = f;
+            while let Some(x) = f {
+                s += &format!("{}.{}/", x.entry_index, x.sub_index);
+                f = x.forked_id.as_deref();
+            }
+            s
+        }
         let mut walk = |c: &proto::SyncInteractionChain| -> Result<()> {
             if c.initial
                 && c.forked_id.is_none()
@@ -2206,12 +2256,30 @@ impl Hub {
                     uses.push((t.x, t.y, t.z));
                 }
             }
-            for d in c.interaction_data.iter().flatten().flatten() {
-                if let (Some(p), true) = (&d.block_position, d.placed_block_id != i32::MIN) {
-                    let rot = d.block_rotation.as_ref().map_or(0, |r| {
-                        r.rotation_roll.0 * 16 + r.rotation_pitch.0 * 4 + r.rotation_yaw.0
-                    });
-                    changes.push(((p.x, p.y, p.z), d.placed_block_id, rot));
+            // A placement operation: a block, its rotation and the block
+            // the client put (spec 15).
+            for (i, d) in c.interaction_data.iter().flatten().enumerate() {
+                let Some(d) = d else { continue };
+                if let (Some(p), Some(r), true) = (
+                    &d.block_position,
+                    &d.block_rotation,
+                    d.placed_block_id != i32::MIN,
+                ) {
+                    let rot = r.rotation_roll.0 * 16 + r.rotation_pitch.0 * 4 + r.rotation_yaw.0;
+                    let op = (
+                        c.chain_id,
+                        fork_path(c.forked_id.as_ref()),
+                        c.operation_base_index + i as i32,
+                    );
+                    placements.push((
+                        op,
+                        Placement {
+                            pos: (p.x, p.y, p.z),
+                            rot,
+                            client_block: d.placed_block_id,
+                            slot: c.active_hotbar_slot,
+                        },
+                    ));
                 }
             }
             Ok(())
@@ -2229,11 +2297,216 @@ impl Hub {
         for ((x, y, z), slot) in hits {
             self.hit(_player, x, y, z, slot);
         }
-        changes.dedup();
-        for &((x, y, z), b, rot) in &changes {
-            self.player_change(x, y, z, b, rot);
+        for (op, p) in placements {
+            let first = {
+                let mut g = self.inner.lock().unwrap();
+                g.players.get_mut(&_player).is_some_and(|e| {
+                    if e.placed_ops.len() > 4096 {
+                        e.placed_ops.clear();
+                    }
+                    e.placed_ops.insert(op)
+                })
+            };
+            if first {
+                self.place(_player, p);
+            }
         }
         Ok(())
+    }
+
+    /// A chat line from a translation key (`server.modules.interaction.*`).
+    fn tell_key(&self, pid: i32, key: &str, out: &mut Outgoing) {
+        if let Ok(p) = packet(
+            id::SERVER_MESSAGE,
+            &proto::ServerMessage {
+                r#type: proto::ChatType::CHAT,
+                message: Some(proto::FormattedMessage {
+                    message_id: Some(key.to_owned()),
+                    ..Default::default()
+                }),
+            },
+        ) {
+            out.to.push((pid, p));
+        }
+    }
+
+    /// The client is sent the block a position really holds (the official
+    /// `invalidateBlock`): it goes out with the tick's changes.
+    fn resend_block(g: &mut Inner, (x, y, z): Pos) {
+        let (sec, index) = section_of(x, y, z);
+        let tick = g.tick;
+        g.sections.entry(sec).or_default().add(tick, index);
+        g.touched.insert(sec);
+    }
+
+    /// A player places a block (spec 15), as the official place
+    /// interaction: the held stack, reach, the block it may become, the
+    /// item used up in adventure, free cells (soft blocks there break with
+    /// their drops), decoration marking; a failed placement gives the item
+    /// back and resends the block.
+    fn place(&self, pid: i32, p: Placement) {
+        self.world_step(|hub, g, ground, out| {
+            use crate::support::World;
+            let Some(e) = g.players.get(&pid) else { return };
+            let creative = e.creative;
+            let no_physics = creative && e.no_physics;
+            let Some(held) = e.inv.get(inventory::HOTBAR, p.slot) else {
+                return;
+            };
+            let Some(at) = e.position.clone() else { return };
+            let mut reach = hub.book.use_distance(Some(&held.item), creative);
+            if creative {
+                reach = reach.max(e.creative_distance.clamp(0, 128) as f32);
+            }
+            reach += 2.0;
+            let (x, y, z) = p.pos;
+            let d = [
+                x as f64 + 0.5 - at.x,
+                y as f64 + 0.5 - (at.y + hub.eye_height),
+                z as f64 + 0.5 - at.z,
+            ];
+            if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > (reach * reach) as f64 {
+                return;
+            }
+            let item_block = hub.book.block_of(&held.item);
+            if item_block <= 0 {
+                return;
+            }
+            let mut client = (p.client_block != -1).then_some(p.client_block);
+            if let Some(c) = client {
+                if hub.rules.block(c).is_none() {
+                    return;
+                }
+                if !no_physics
+                    && c != item_block
+                    && !hub
+                        .rules
+                        .block(item_block)
+                        .is_some_and(|b| b.place_overrides.contains(&c))
+                {
+                    client = None;
+                }
+            }
+            let block = client.unwrap_or(item_block);
+            // Used up in adventure.
+            let mut taken = false;
+            if !creative {
+                let e = g.players.get_mut(&pid).unwrap();
+                match e.inv.get(inventory::HOTBAR, p.slot) {
+                    Some(s) if s.stacks_with(&held) && s.n >= 1 => {
+                        e.inv
+                            .set(inventory::HOTBAR, p.slot, Some(s.with_n(s.n - 1)));
+                        e.inv_dirty.insert(inventory::HOTBAR);
+                        taken = true;
+                    }
+                    _ => {
+                        hub.tell_key(pid, "server.modules.interaction.failedCheck", out);
+                        return;
+                    }
+                }
+            }
+            let fail = |g: &mut Inner, out: &mut Outgoing| {
+                if taken && let Some(e) = g.players.get_mut(&pid) {
+                    let one = held.with_n(1);
+                    let back = match e.inv.get(inventory::HOTBAR, p.slot) {
+                        None => {
+                            e.inv.set(inventory::HOTBAR, p.slot, Some(one.clone()));
+                            0
+                        }
+                        Some(s) if s.stacks_with(&one) && s.n < hub.book.max_stack(&one.item) => {
+                            e.inv
+                                .set(inventory::HOTBAR, p.slot, Some(s.with_n(s.n + 1)));
+                            0
+                        }
+                        _ => e.inv.add(&one, hub.book.max_stack(&one.item)),
+                    };
+                    e.inv_dirty.insert(inventory::HOTBAR);
+                    if back > 0 {
+                        hub.tell_key(
+                            pid,
+                            "server.modules.interaction.failedAddBackAfterFailedPlace",
+                            out,
+                        );
+                        return;
+                    }
+                }
+                Self::resend_block(g, p.pos);
+            };
+            let Some(b) = hub.rules.block(block) else {
+                hub.tell_key(pid, "server.modules.interaction.failedCheckBlock", out);
+                return;
+            };
+            if block == 0 {
+                hub.tell_key(pid, "server.modules.interaction.failedCheckEmpty", out);
+                return;
+            }
+            if b.unknown {
+                hub.tell_key(pid, "server.modules.interaction.failedCheckUnknown", out);
+                return;
+            }
+            let cells = hub.rules.cells(block, p.rot);
+            // Every cell free: air, a soft (non-solid) block, or an unknown
+            // filler.
+            let view = |g: &Inner, c: Pos| {
+                View {
+                    g,
+                    ground,
+                    hub_rules: &hub.rules,
+                }
+                .block(c.0, c.1, c.2)
+            };
+            if !no_physics {
+                let free = cells.iter().all(|c| {
+                    let at = (x + c[0], y + c[1], z + c[2]);
+                    if !(0..crate::support::WORLD_HEIGHT).contains(&at.1) {
+                        return false;
+                    }
+                    let (other, _) = view(g, at);
+                    let filler = g.fillers.get(&at).copied().unwrap_or(0);
+                    match hub.rules.block(other) {
+                        None => false,
+                        Some(_) if other == 0 => true,
+                        Some(o) if !o.solid => true,
+                        Some(o) => filler != 0 && o.unknown,
+                    }
+                });
+                if !free {
+                    fail(g, out);
+                    return;
+                }
+            }
+            // Soft blocks in the way break with their drops.
+            for c in &cells {
+                let at = (x + c[0], y + c[1], z + c[2]);
+                let (other, _) = view(g, at);
+                if other == 0 || hub.rules.block(other).is_none_or(|o| o.solid) {
+                    continue;
+                }
+                let drop = hub.rules.block(other).and_then(|o| o.soft_drop.clone());
+                let drops = drop.map_or((None, None, 1), |d| (d.item, d.list, 1));
+                hub.break_with(g, ground, at, Some(drops), true, !no_physics, out);
+            }
+            let how = How {
+                physics: !no_physics,
+                ..Default::default()
+            };
+            let mark = out.all.len();
+            let changed = hub.change(g, ground, p.pos, block, p.rot, how, out);
+            let (later, now): (Vec<Packet>, Vec<Packet>) = out
+                .all
+                .drain(mark..)
+                .partition(|(i, _)| *i == id::SPAWN_BLOCK_PARTICLE_SYSTEM);
+            out.all.extend(now);
+            g.deferred_particles.extend(later);
+            if changed.is_none() {
+                fail(g, out);
+                return;
+            }
+            if no_physics || b.deco_when_placed {
+                g.support.insert(p.pos, crate::support::DECO);
+                hub.save_support(x, y, z, crate::support::DECO);
+            }
+        });
     }
 
     /// Damaged blocks of a column, per section, as the official server
@@ -2838,19 +3111,8 @@ mod interaction_tests {
             .unwrap();
         hub.tick();
         assert!(set_blocks(&mut ra).is_empty());
-        // The client reports where it placed a block.
-        hub.interactions(
-            a,
-            &sync(
-                proto::InteractionType::SECONDARY,
-                false,
-                Some((17, 64, 14, 1530)),
-            ),
-        )
-        .unwrap();
-        hub.tick();
-        assert_eq!(set_blocks(&mut ra), [(17, 64, 14, 1530)]);
-        // Reported again: already there, not sent again.
+        // The client reports a placement, but holds nothing that places
+        // that block: the official server places nothing (spec 15).
         hub.interactions(
             a,
             &sync(
@@ -3374,26 +3636,6 @@ impl Hub {
         r
     }
 
-    /// A block a player broke or placed (spec 10): its area is marked for
-    /// support checks; a placed block that the assets make decoration
-    /// (trunks, for instance) is never checked.
-    pub fn player_change(&self, x: i32, y: i32, z: i32, block: i32, rot: i32) {
-        self.world_step(|hub, g, ground, out| {
-            let how = How {
-                physics: true,
-                ..Default::default()
-            };
-            if let Some((old, old_rot)) = hub.change(g, ground, (x, y, z), block, rot, how, out) {
-                if block == 0 {
-                    hub.mark_area(g, x, y, z, old, old_rot);
-                } else if hub.rules.block(block).is_some_and(|b| b.deco_when_placed) {
-                    g.support.insert((x, y, z), crate::support::DECO);
-                    hub.save_support(x, y, z, crate::support::DECO);
-                }
-            }
-        });
-    }
-
     /// The official `/block setticking`: one block checked next tick.
     pub fn set_ticking(&self, x: i32, y: i32, z: i32) {
         Self::mark(&mut self.inner.lock().unwrap(), x, y, z);
@@ -3618,6 +3860,7 @@ impl Hub {
                 Err(e) => warn!("block changes not sent: {e:#}"),
             }
         }
+        out.all.append(&mut g.deferred_particles);
         let heights = std::mem::take(&mut g.heights);
         for ((cx, cz), idx) in heights {
             let p = if idx.len() == 1 {

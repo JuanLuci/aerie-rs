@@ -352,20 +352,24 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
                         later.push(w);
                     }
                 }
+                // `;` between steps (a pause each), `,` inside a step: sent
+                // together, as a client sends the packets of one chain.
                 for p in opts.after.iter().flat_map(|c| c.split(';')) {
                     if p.trim() == "wait" {
                         // Nothing sent: one more pause.
                         later.push(Vec::new());
                         continue;
                     }
-                    let Some((id, hex)) = p.trim().split_once(':') else {
-                        continue;
-                    };
-                    let bytes: Vec<u8> = (0..hex.len() / 2)
-                        .filter_map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok())
-                        .collect();
                     let mut w = Vec::new();
-                    frame::encode(id.parse()?, &bytes, &mut w)?;
+                    for q in p.split(',') {
+                        let Some((id, hex)) = q.trim().split_once(':') else {
+                            continue;
+                        };
+                        let bytes: Vec<u8> = (0..hex.len() / 2)
+                            .filter_map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok())
+                            .collect();
+                        frame::encode(id.parse()?, &bytes, &mut w)?;
+                    }
                     later.push(w);
                 }
                 if !later.is_empty() {

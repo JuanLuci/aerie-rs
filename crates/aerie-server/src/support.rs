@@ -176,6 +176,9 @@ pub struct Block {
     pub soft_drop: Option<Drop>,
     pub harvest_drop: Option<Drop>,
     pub deco_when_placed: bool,
+    /// Blocks a client may place instead of this one (the placement
+    /// settings' wall, floor and ceiling overrides).
+    pub place_overrides: Vec<i32>,
     /// Interaction states: name → block id (`default` included).
     pub states: Vec<(String, i32)>,
 }
@@ -371,6 +374,20 @@ impl Rules {
                         .copied()
                         .unwrap_or(0),
                     hit_sound: hit_sets.get(&b.block_sound_set_index).copied().unwrap_or(0),
+                    place_overrides: b
+                        .placement_settings
+                        .as_ref()
+                        .map(|p| {
+                            [
+                                p.wall_placement_override_block_id,
+                                p.floor_placement_override_block_id,
+                                p.ceiling_placement_override_block_id,
+                            ]
+                            .into_iter()
+                            .filter(|&i| i >= 0)
+                            .collect()
+                        })
+                        .unwrap_or_default(),
                     breaking_drop: gathering.and_then(|g| g.breaking.as_ref()).map(|d| Drop {
                         item: d.item_id.clone(),
                         list: d.drop_list_id.clone(),

@@ -226,6 +226,8 @@ struct ItemInfo {
     weapon_or_tool: bool,
     block_id: i32,
     ability: Option<crate::inventory::Ability>,
+    /// `InteractionConfig.UseDistance` (adventure, creative).
+    use_distance: (Option<f32>, Option<f32>),
 }
 
 #[derive(Default)]
@@ -307,6 +309,19 @@ impl Book {
                                     usable: it.utility.as_ref().is_some_and(|u| u.usable),
                                     weapon_or_tool: it.weapon.is_some() || it.tool.is_some(),
                                     block_id: it.block_id,
+                                    use_distance: it
+                                        .interaction_config
+                                        .as_ref()
+                                        .and_then(|c| c.use_distance.as_ref())
+                                        .map_or((None, None), |m| {
+                                            let get = |g: proto::GameMode| {
+                                                m.iter().find(|(k, _)| *k == g).map(|(_, v)| *v)
+                                            };
+                                            (
+                                                get(proto::GameMode::ADVENTURE).or(Some(1.0)),
+                                                get(proto::GameMode::CREATIVE).or(Some(1.0)),
+                                            )
+                                        }),
                                     ability: it.ability.as_ref().map(|a| {
                                         crate::inventory::Ability {
                                             core: a.slot == proto::AbilitySlot::CORE,
@@ -400,6 +415,20 @@ impl Book {
 
     pub fn counts(&self) -> (usize, usize, usize) {
         (self.recipes.len(), self.items.len(), self.benches.len())
+    }
+
+    /// How far a player holding `item` may use blocks (the official
+    /// defaults 5 in adventure, 6 in creative; an item's own map without
+    /// the mode gives 1).
+    pub fn use_distance(&self, item: Option<&str>, creative: bool) -> f32 {
+        let d = item
+            .and_then(|i| self.items.get(i))
+            .map_or((None, None), |i| i.use_distance);
+        if creative {
+            d.1.unwrap_or(6.0)
+        } else {
+            d.0.unwrap_or(5.0)
+        }
     }
 
     pub fn armor_slot(&self, item: &str) -> Option<i32> {
