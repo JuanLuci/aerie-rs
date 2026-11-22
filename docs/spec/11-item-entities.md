@@ -20,6 +20,18 @@ bottom at it; and a velocity:
 
 Block drops spawn at the block's bottom centre (x + 0.5, y, z + 0.5).
 
+A player throwing a stack (`DropItemStack`, the slot's stack taken): the
+item starts at the player's position raised by the eye height plus the
+look direction (pitch, yaw: x = −sin(yaw)·cos(pitch), y = sin(pitch),
+z = −cos(yaw)·cos(pitch), with the official 4096-entry sine table), with
+that direction × 6 as velocity, a pickup delay of 1.5 s, and the player
+hears `SFX_Player_Drop_Item` (UI). Creative drops (`DropCreativeItem`) and
+stacks that do not fit after crafting are thrown the same way at speed 1,
+without the sound; out of creative a creative drop only gets the
+`server.general.setCreativeItem.notInCreativeMode` notification. Checked
+with a throw on both servers: same start (eyes 1.6 above the feet), speed
+and fall.
+
 ## Every tick
 
 The world ticks 30 times a second, but `dt` is the measured length of the

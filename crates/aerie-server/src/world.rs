@@ -587,12 +587,6 @@ impl Hub {
         }
     }
 
-    /// An item on the ground (spec 11).
-    pub fn drop_item(&self, item: &str, quantity: i32, x: f64, y: f64, z: f64) -> Result<()> {
-        self.drop_items(vec![(item.to_owned(), quantity)], [x, y, z]);
-        Ok(())
-    }
-
     /// Stacks dropped together at one place: straight up for one, spread
     /// on a circle for more.
     pub fn drop_items(&self, stacks: Vec<(String, i32)>, at: [f64; 3]) {
@@ -776,12 +770,35 @@ impl Hub {
                 if let Some(Some((item, n))) = self.with_inventory(id, |inv| {
                     inv.take(m.inventory_section_id, m.slot_id, m.quantity)
                 })? {
-                    self.drop_in_front(id, &item, n)?;
+                    // Thrown along the look at speed 6, with the drop sound
+                    // (spec 11).
+                    self.throw_item(id, &item, n, 6.0);
+                    self.sound_2d(id, self.book.sound("SFX_Player_Drop_Item"))?;
                 }
             }
             self::id::DROP_CREATIVE_ITEM => {
                 let (m, _) = proto::DropCreativeItem::decode(payload, 0)?;
-                self.drop_in_front(id, &m.item.item_id, m.item.quantity)?;
+                let creative = self
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .players
+                    .get(&id)
+                    .is_some_and(|e| e.creative);
+                if creative {
+                    self.throw_item(id, &m.item.item_id, m.item.quantity, 1.0);
+                } else {
+                    let n = proto::Notification {
+                        message: Some(proto::FormattedMessage {
+                            message_id: Some(
+                                "server.general.setCreativeItem.notInCreativeMode".into(),
+                            ),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    };
+                    self.send(id, packet(self::id::NOTIFICATION, &n)?);
+                }
             }
             _ => {}
         }
@@ -878,18 +895,29 @@ impl Hub {
         }
     }
 
-    /// Drops an item a block and a half in front of a player.
-    fn drop_in_front(&self, id: i32, item: &str, n: i32) -> Result<()> {
-        let (p, yaw) = {
-            let g = self.inner.lock().unwrap();
-            let Some(e) = g.players.get(&id) else {
-                return Ok(());
-            };
-            (e.position.clone(), e.look.as_ref().map_or(0.0, |d| d.yaw))
-        };
-        let Some(p) = p else { return Ok(()) };
-        let (dx, dz) = (-(yaw as f64).sin() * 1.5, -(yaw as f64).cos() * 1.5);
-        self.drop_item(item, n, p.x + dx, p.y + 1.0, p.z + dz)
+    /// A stack thrown by a player (spec 11): from the eyes plus one block
+    /// along the look, at `speed` along it, picked up again after 1.5 s.
+    pub fn throw_item(&self, id: i32, item: &str, n: i32, speed: f32) {
+        if n <= 0 {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        let Some(e) = g.players.get(&id) else { return };
+        let Some(p) = e.position.clone() else { return };
+        let (pitch, yaw) = e.look.as_ref().map_or((0.0, 0.0), |d| (d.pitch, d.yaw));
+        let dir = crate::trig::direction(pitch, yaw);
+        let at = [p.x + dir[0], p.y + self.eye_height + dir[1], p.z + dir[2]];
+        let vel = [
+            ((dir[0] as f32) * speed) as f64,
+            ((dir[1] as f32) * speed) as f64,
+            ((dir[2] as f32) * speed) as f64,
+        ];
+        let born = g.tick + g.in_tick as u64;
+        g.next_item = g.next_item.max(FIRST_ITEM_ID) + 1;
+        let nid = g.next_item;
+        let mut it = crate::items::Item::new(item, n, at, vel, self.item_life(item), born);
+        it.pickup_delay = 1.5;
+        g.items.insert(nid, it);
     }
 
     /// `ClientOpenWindow`: the pocket crafting window (Tab), answered with
@@ -1031,10 +1059,8 @@ impl Hub {
                 let left = e.inv.add(&item, n, hub.book.max_stack(&item));
                 let changed = e.inv.changed_since(&before);
                 e.inv_dirty.extend(changed);
-                if left > 0
-                    && let Some(p) = e.position.clone()
-                {
-                    out.drops.push((vec![(item, left)], [p.x, p.y + 1.0, p.z]));
+                if left > 0 {
+                    out.throws.push((id, item, left));
                 }
             }
         });
@@ -1255,10 +1281,8 @@ impl Hub {
         }
         for (item, n) in self.book.outputs(recipe, quantity) {
             let left = e.inv.add(&item, n, self.book.max_stack(&item));
-            if left > 0
-                && let Some(p) = e.position.clone()
-            {
-                out.drops.push((vec![(item, left)], [p.x, p.y + 1.0, p.z]));
+            if left > 0 {
+                out.throws.push((pid, item, left));
             }
         }
         let changed = e.inv.changed_since(&before);
@@ -1443,10 +1467,8 @@ impl Hub {
                         let before = e.inv.clone();
                         for (item, n) in self.book.outputs(&job.recipe, 1) {
                             let left = e.inv.add(&item, n, self.book.max_stack(&item));
-                            if left > 0
-                                && let Some(p) = e.position.clone()
-                            {
-                                out.drops.push((vec![(item, left)], [p.x, p.y + 1.0, p.z]));
+                            if left > 0 {
+                                out.throws.push((pid, item, left));
                             }
                         }
                         let changed = e.inv.changed_since(&before);
@@ -2759,6 +2781,8 @@ struct Outgoing {
     all: Vec<Packet>,
     to: Vec<(i32, Packet)>,
     drops: Vec<(Vec<(String, i32)>, [f64; 3])>,
+    /// Stacks a player drops (speed 1, spec 11).
+    throws: Vec<(i32, String, i32)>,
 }
 
 /// A part's offset packed as the official server does (5 bits each:
@@ -3095,6 +3119,9 @@ impl Hub {
         }
         for (stacks, at) in out.drops {
             self.drop_items(stacks, at);
+        }
+        for (pid, item, n) in out.throws {
+            self.throw_item(pid, &item, n, 1.0);
         }
         r
     }

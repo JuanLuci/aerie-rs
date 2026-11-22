@@ -25,6 +25,7 @@ mod proxy;
 mod support;
 mod terrain;
 mod tls;
+mod trig;
 mod world;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
