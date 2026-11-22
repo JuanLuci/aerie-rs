@@ -784,6 +784,9 @@ impl Hub {
         if self.change(g, ground, (x, y, z), 0, 0, how, out).is_some() && area {
             self.mark_area(g, x, y, z, block, rot);
         }
+        if !by_physics {
+            self.connect(g, ground, (x, y, z), false, out);
+        }
         let Some((item, list, quantity)) = drops else {
             return;
         };
@@ -2000,6 +2003,78 @@ impl Hub {
         Ok(true)
     }
 
+    /// Connected blocks after a block was placed or removed at `at`
+    /// (spec 23): a placed block takes the shape its rule set gives it,
+    /// then the neighbours take theirs, three steps deep.
+    fn connect(&self, g: &mut Inner, ground: &Ground, at: Pos, placed: bool, out: &mut Outgoing) {
+        use crate::support::World;
+        struct W<'a> {
+            g: &'a Inner,
+            ground: &'a Ground,
+            rules: &'a crate::support::Rules,
+        }
+        impl crate::connected::Cells for W<'_> {
+            fn at(&self, p: Pos) -> Option<(i32, i32, i32)> {
+                if !(0..crate::support::WORLD_HEIGHT).contains(&p.1) {
+                    return None;
+                }
+                let (id, rot) = View {
+                    g: self.g,
+                    ground: self.ground,
+                    hub_rules: self.rules,
+                }
+                .block(p.0, p.1, p.2);
+                Some((id, rot, self.g.fillers.get(&p).copied().unwrap_or(0)))
+            }
+            fn rules(&self, block: i32) -> Option<&proto::ConnectedBlockRuleSet> {
+                self.rules.block(block)?.connected.as_ref()
+            }
+        }
+        let how = How {
+            quiet: true,
+            ..Default::default()
+        };
+        if placed {
+            let want = {
+                let w = W {
+                    g,
+                    ground,
+                    rules: &self.rules,
+                };
+                use crate::connected::Cells;
+                w.at(at).filter(|c| c.2 == 0).and_then(|(block, rot, _)| {
+                    Some((crate::connected::desired(&w, at, block, rot)?, (block, rot)))
+                })
+            };
+            if let Some((want, have)) = want
+                && want != have
+            {
+                self.change(g, ground, at, want.0, want.1, how, out);
+            }
+        }
+        let mut queue = std::collections::VecDeque::from([(at, 0)]);
+        let mut seen = std::collections::HashSet::new();
+        while let Some((here, depth)) = queue.pop_front() {
+            let changes = crate::connected::neighbours(
+                &W {
+                    g,
+                    ground,
+                    rules: &self.rules,
+                },
+                here,
+            );
+            for (p, (block, rot)) in changes {
+                if !seen.insert(p) || p == here {
+                    continue;
+                }
+                self.change(g, ground, p, block, rot, how, out);
+                if depth + 1 < 3 {
+                    queue.push_back((p, depth + 1));
+                }
+            }
+        }
+    }
+
     /// A player picks a block up by using it (spec 12): a harvestable
     /// block goes, its harvest drops go straight to the player (what does
     /// not fit is thrown), and its harvest sound plays. False when the
@@ -2034,6 +2109,7 @@ impl Hub {
         if self.change(g, ground, at, 0, 0, how, out).is_some() {
             self.mark_area(g, at.0, at.1, at.2, block, rot);
         }
+        self.connect(g, ground, at, false, out);
         let stacks = if drop.item.is_none() && drop.list.is_none() {
             own_item.map(|i| vec![(i, 1)]).unwrap_or_default()
         } else {
@@ -4227,6 +4303,7 @@ impl Hub {
                 fail(g, out);
                 return;
             }
+            hub.connect(g, ground, p.pos, true, out);
             if no_physics || b.deco_when_placed {
                 g.support.insert(p.pos, crate::support::DECO);
                 hub.save_support(x, y, z, crate::support::DECO);

@@ -15,6 +15,7 @@ mod chains;
 mod changes;
 mod chunk;
 mod common;
+mod connected;
 mod crafting;
 mod effects;
 mod gather;

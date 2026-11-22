@@ -194,6 +194,8 @@ pub struct Block {
     /// The sound of switching to an interaction state (on the default
     /// state's block): state name → sound.
     pub state_sounds: Vec<(String, i32)>,
+    /// The rule set that fits this block to its neighbours (spec 23).
+    pub connected: Option<proto::ConnectedBlockRuleSet>,
     /// A door (on its default state's block): whether it is horizontal.
     pub door: Option<bool>,
     /// A block that holds items (on its default state's block).
@@ -380,6 +382,7 @@ impl Rules {
                     transparent: b.opacity == proto::Opacity::TRANSPARENT,
                     solid: b.material == proto::BlockMaterial::SOLID,
                     states: b.states.clone().unwrap_or_default(),
+                    connected: b.connected_block_rule_set.clone(),
                     unknown: b.unknown,
                     hitbox: b.hitbox,
                     support,
