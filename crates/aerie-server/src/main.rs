@@ -22,6 +22,7 @@ mod join;
 mod login;
 mod perf;
 mod probe;
+mod processing;
 mod proxy;
 mod support;
 mod terrain;

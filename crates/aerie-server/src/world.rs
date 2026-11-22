@@ -133,6 +133,38 @@ struct ItemsView<'a> {
     book: &'a crate::crafting::Book,
     rules: &'a crate::support::Rules,
     bench: Option<&'a crate::crafting::Bench>,
+    /// An open processing bench: its asset and recipes (spec 16).
+    processing: Option<(
+        &'a crate::processing::Config,
+        &'a [crate::processing::Recipe],
+    )>,
+}
+
+/// The item facts processing needs (spec 16).
+struct ProcItems<'a> {
+    book: &'a crate::crafting::Book,
+    keys: &'a HashMap<i32, String>,
+}
+
+impl crate::processing::Items for ProcItems<'_> {
+    fn max_stack(&self, item: &str) -> i32 {
+        self.book.max_stack(item)
+    }
+    fn units(&self, m: &crate::processing::Material, item: &str) -> Option<i32> {
+        self.book.processing_units(m, item)
+    }
+    fn resource(&self, item: &str, resource: &str) -> Option<i32> {
+        self.book.resource_units(item, resource)
+    }
+    fn fuel_quality(&self, item: &str) -> f64 {
+        self.book.fuel_quality(item)
+    }
+    fn block_key(&self, item: &str) -> Option<String> {
+        self.keys.get(&self.book.block_of(item)).cloned()
+    }
+    fn stack(&self, item: &str, n: i32) -> Stack {
+        self.book.stack(item, n)
+    }
 }
 
 impl inventory::Items for ItemsView<'_> {
@@ -166,9 +198,36 @@ impl inventory::Items for ItemsView<'_> {
             Kind::Misc
         }
     }
-    fn window_input(&self, item: &str) -> bool {
-        self.bench
-            .is_some_and(|b| !self.book.structural_options(b, item).0.is_empty())
+    fn window_add(&self, slot: i32, item: &str) -> bool {
+        if let Some((cfg, recipes)) = self.processing {
+            let pi = ProcItems {
+                book: self.book,
+                keys: &HashMap::new(),
+            };
+            let b = crate::processing::Bench {
+                cfg,
+                recipes,
+                tier: 1,
+                items: &pi,
+            };
+            let fuel = cfg.fuel.as_ref().map_or(0, Vec::len) as i32;
+            let input = cfg.inputs(1).len() as i32;
+            return if slot < fuel {
+                b.fuel_takes(slot as usize, item)
+            } else if slot < fuel + input {
+                b.input_takes((slot - fuel) as usize, item)
+            } else {
+                // Output slots: only taken from.
+                false
+            };
+        }
+        slot == 0
+            && self
+                .bench
+                .is_some_and(|b| !self.book.structural_options(b, item).0.is_empty())
+    }
+    fn window_remove(&self, slot: i32) -> bool {
+        self.processing.is_some() || slot == 0
     }
 }
 
@@ -226,6 +285,8 @@ struct Inner {
     /// Particles of placements, sent after the tick's block changes and
     /// before its heights (as the official server's command buffer does).
     deferred_particles: Vec<Packet>,
+    /// Processing bench blocks (spec 16), by main cell.
+    processing: BTreeMap<Pos, crate::processing::State>,
     next_id: i32,
     players: BTreeMap<i32, Entry>,
     /// Blocks changed since the server started, sent to whoever joins.
@@ -1166,7 +1227,12 @@ impl Hub {
         f: impl FnOnce(&mut Inventory, &ItemsView, &inventory::Preferences, Option<i32>),
     ) {
         let mut g = self.inner.lock().unwrap();
-        let Some(e) = g.players.get_mut(&id) else {
+        let Inner {
+            players,
+            processing,
+            ..
+        } = &mut *g;
+        let Some(e) = players.get_mut(&id) else {
             return;
         };
         let before = e.inv.clone();
@@ -1182,21 +1248,64 @@ impl Hub {
                 );
                 (w.id, slots, w.bench.clone())
             });
+        // A processing bench's window: its fuel, input and output slots.
+        let proc_at = e
+            .window
+            .as_ref()
+            .filter(|w| w.kind == crate::crafting::Kind::Processing)
+            .and_then(|w| Some((w.id, w.block.as_ref()?.1, w.bench.clone())));
+        let recipes = proc_at
+            .as_ref()
+            .map(|(_, _, b)| self.book.processing_recipes(b, 1))
+            .unwrap_or_default();
         let bench = window.as_ref().map(|(_, _, b)| b.clone());
+        let proc_bench = proc_at.as_ref().map(|(_, _, b)| b.clone());
         let items = ItemsView {
             book: &self.book,
             rules: &self.rules,
             bench: bench.as_ref(),
+            processing: proc_bench
+                .as_ref()
+                .and_then(|b| Some((b.processing.as_ref()?, recipes.as_slice()))),
         };
-        let wid = window.as_ref().map(|(i, _, _)| *i);
+        let mut wid = window.as_ref().map(|(i, _, _)| *i);
         if let Some((wid, slots, _)) = window {
             e.inv.attach(wid, slots);
+        }
+        if let Some((pid, at, _)) = &proc_at
+            && let Some(st) = processing.get(at)
+        {
+            e.inv.attach(*pid, st.slots());
+            wid = Some(*pid);
         }
         let prefs = e.prefs;
         e.inv.record();
         f(&mut e.inv, &items, &prefs, wid);
         let touched = e.inv.recorded();
-        if let Some(wid) = wid {
+        if let Some((pid, at, b)) = &proc_at
+            && let Some(slots) = e.inv.detach(*pid)
+            && let Some(st) = processing.get_mut(at)
+            && let Some(cfg) = b.processing.as_ref()
+        {
+            if st.slots() != slots {
+                st.set_slots(slots);
+                let pi = ProcItems {
+                    book: &self.book,
+                    keys: &self.keys_by_id,
+                };
+                crate::processing::Bench {
+                    cfg,
+                    recipes: &recipes,
+                    tier: 1,
+                    items: &pi,
+                }
+                .update_recipe(st);
+            }
+            if let Some(w) = e.window.as_mut() {
+                w.slots = st.slots();
+                w.dirty = true;
+            }
+        } else if let Some(wid) = wid {
             let slots = e.inv.detach(wid).unwrap_or_default();
             let input = slots.into_iter().next().flatten();
             if let Some(w) = e.window.as_mut()
@@ -4106,6 +4215,7 @@ impl Hub {
                     book: &self.book,
                     rules: &self.rules,
                     bench: None,
+                    processing: None,
                 };
                 let order = e.prefs.order_for(inventory::Items::kind(&items, &it.item));
                 let left = e.inv.add_to(&items, &order, &it.stack());

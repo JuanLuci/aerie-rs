@@ -9,6 +9,13 @@
 //! category` per header category, `F block cycling hints` (structural
 //! benches' `AllowBlockGroupCycling` and `AlwaysShowInventoryHints`), and
 //! `S name index` for the sounds crafting plays outside benches.
+//!
+//! Processing benches (spec 16) add `P block maxFuel fuelDropItem
+//! allowNoInput outputSlots endSound`, per input slot `PI block icon
+//! resource filterValid`, per fuel slot `PF block icon resource`, `PX block
+//! perFuelItems outputs ignored` (comma lists, outputs as `item:qty`) for
+//! `ExtraOutput`, and per tier `PT block extraInput extraOutput reduction`;
+//! items whose `FuelQuality` is not 1 give `Q item quality`.
 
 use aerie_protocol::proto::BenchType;
 use serde_json::Value;
@@ -78,6 +85,91 @@ pub fn table(ctx: &Ctx) -> Result<String> {
             b.bool_or("AllowBlockGroupCycling", false) as u8,
             b.bool_or("AlwaysShowInventoryHints", false) as u8
         );
+        if ty == BenchType::PROCESSING {
+            out += &format!(
+                "P {k} {} {} {} {} {}\n",
+                b.i32_or("MaxFuel", 0),
+                or_dash(b.str_at("FuelDropItemId")),
+                b.bool_or("AllowNoInputProcessing", false) as u8,
+                b.i32_or("OutputSlotsCount", 1),
+                sound("EndSoundEventId")?,
+            );
+            for s in b
+                .get("Input")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                out += &format!(
+                    "PI {k} {} {} {}\n",
+                    or_dash(s.str_at("Icon")),
+                    or_dash(s.str_at("ResourceTypeId")),
+                    s.bool_or("FilterValidIngredients", false) as u8,
+                );
+            }
+            for s in b
+                .get("Fuel")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                out += &format!(
+                    "PF {k} {} {}\n",
+                    or_dash(s.str_at("Icon")),
+                    or_dash(s.str_at("ResourceTypeId")),
+                );
+            }
+            if let Some(x) = b.obj("ExtraOutput") {
+                let list = |key: &str, q: bool| -> String {
+                    let v: Vec<String> = x
+                        .get(key)
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|m| {
+                            let id = m.str_at("ItemId")?;
+                            Some(if q {
+                                format!("{id}:{}", m.i32_or("Quantity", 1))
+                            } else {
+                                id
+                            })
+                        })
+                        .collect();
+                    if v.is_empty() {
+                        "-".into()
+                    } else {
+                        v.join(",")
+                    }
+                };
+                out += &format!(
+                    "PX {k} {} {} {}\n",
+                    x.i32_or("PerFuelItemsConsumed", 1),
+                    list("Outputs", true),
+                    list("IgnoredFuelSources", false),
+                );
+            }
+            for t in b
+                .get("TierLevels")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                out += &format!(
+                    "PT {k} {} {} {}\n",
+                    t.i32_or("ExtraInputSlot", 0),
+                    t.i32_or("ExtraOutputSlot", 0),
+                    t.f64_or("CraftingTimeReductionModifier", 0.0),
+                );
+            }
+        }
+    }
+    let items = ctx.store(super::items::PATH)?;
+    for k in items.own.keys() {
+        let a = items.resolved(k, "Item");
+        let q = a.f64_or("FuelQuality", 1.0);
+        if q != 1.0 {
+            out += &format!("Q {k} {q}\n");
+        }
     }
     for name in SOUNDS {
         let i = super::sound_events::index(ctx, Some(name))?;

@@ -48,8 +48,12 @@ pub trait Items {
     fn kind(&self, _item: &str) -> Kind {
         Kind::Misc
     }
-    /// The open window's input slot takes it.
-    fn window_input(&self, _item: &str) -> bool {
+    /// The open window's slot takes it.
+    fn window_add(&self, _slot: i32, _item: &str) -> bool {
+        false
+    }
+    /// The open window's slot gives its items.
+    fn window_remove(&self, _slot: i32) -> bool {
         false
     }
 }
@@ -394,14 +398,15 @@ impl Inventory {
                         && !(core_slot + 1..end).any(|i| i != slot && copy(i))
                 }
             }
-            s if s >= 0 => slot == 0 && items.window_input(&st.item),
+            s if s >= 0 => items.window_add(slot, &st.item),
             _ => true,
         }
     }
 
-    /// A window's option slots give nothing (the official deny-all filter).
-    fn can_remove(&self, sec: i32, slot: i32) -> bool {
-        !(sec >= 0 && slot >= 1)
+    /// A window's slots give what the window allows (structural options
+    /// nothing: the official deny-all filter).
+    fn can_remove(&self, items: &impl Items, sec: i32, slot: i32) -> bool {
+        sec < 0 || items.window_remove(slot)
     }
 
     /// `MoveItemStack` as the official container does it: take `n` off the
@@ -431,7 +436,7 @@ impl Inventory {
         n: i32,
         to: (i32, i32),
     ) -> bool {
-        if n < 0 || !self.can_remove(from.0, from.1) {
+        if n < 0 || !self.can_remove(items, from.0, from.1) {
             return false;
         }
         let Some(before) = self.get(from.0, from.1) else {
@@ -519,7 +524,7 @@ impl Inventory {
         n: i32,
         order: &[i32],
     ) -> Option<i32> {
-        if n < 0 || !self.can_remove(from.0, from.1) {
+        if n < 0 || !self.can_remove(items, from.0, from.1) {
             return None;
         }
         let before = self.get(from.0, from.1)?;
@@ -555,7 +560,7 @@ impl Inventory {
         let mut k = 0;
         for &sec in sources {
             for i in 0..self.capacity(sec) as i32 {
-                if self.can_remove(sec, i)
+                if self.can_remove(items, sec, i)
                     && (sec, i) != target
                     && let Some(s) = self.get(sec, i)
                     && s.stacks_with(&t)

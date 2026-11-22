@@ -46,7 +46,12 @@ pub struct Bench {
     pub header_categories: Vec<String>,
     pub cycling: bool,
     pub always_hints: bool,
+    /// Processing benches: their asset (spec 16).
+    pub processing: Option<crate::processing::Config>,
 }
+
+/// `BenchType` numbers.
+pub const PROCESSING: i32 = 1;
 
 /// A JSON object whose keys keep their first position when set again (as
 /// the official window data does).
@@ -80,6 +85,8 @@ pub enum Kind {
     Simple,
     /// A `StructuralCrafting` bench (builder's bench).
     Structural,
+    /// A `Processing` bench (furnace, campfire; spec 16).
+    Processing,
 }
 
 /// Options a structural window can show.
@@ -103,6 +110,9 @@ pub struct Window {
     pub input: crate::inventory::Slot,
     pub options: Vec<(crate::inventory::Stack, String)>,
     pub selected: i32,
+    /// Processing windows: the bench's fuel, input and output slots as
+    /// last sent.
+    pub slots: Vec<crate::inventory::Slot>,
     /// Progress last sent and when (updates are rate limited).
     pub last_progress: f32,
     pub last_progress_at: Option<std::time::Instant>,
@@ -132,6 +142,7 @@ impl Window {
             input: None,
             options: Vec::new(),
             selected: 0,
+            slots: Vec::new(),
             last_progress: 0.0,
             last_progress_at: None,
         }
@@ -158,6 +169,18 @@ impl Window {
     /// The window's own slots as `InventorySection` (structural: the input
     /// then the options).
     pub fn section(&self) -> Option<proto::InventorySection> {
+        if self.kind == Kind::Processing {
+            return Some(proto::InventorySection {
+                items: Some(
+                    self.slots
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, s)| s.as_ref().map(|s| (i as i32, s.packet())))
+                        .collect(),
+                ),
+                capacity: self.slots.len() as i16,
+            });
+        }
         if self.kind != Kind::Structural {
             return None;
         }
@@ -243,6 +266,8 @@ pub struct Book {
     drop_sounds: HashMap<i32, i32>,
     /// Block groups (block group cycling at structural benches).
     groups: Vec<Vec<String>>,
+    /// Items whose `FuelQuality` is not 1.
+    fuel_quality: HashMap<String, f64>,
 }
 
 /// Why a craft did not happen.
@@ -407,7 +432,16 @@ impl Book {
                         b.always_hints = hints == "1";
                     }
                 }
+                ["Q", item, q] => {
+                    book.fuel_quality
+                        .insert(item.to_owned(), q.parse().unwrap_or(1.0));
+                }
                 _ => {}
+            }
+        }
+        for (block, b) in book.benches.iter_mut() {
+            if b.kind == PROCESSING {
+                b.processing = crate::processing::parse(benches, block);
             }
         }
         book
@@ -556,7 +590,7 @@ impl Book {
                 d.set("allowBlockGroupCycling", bench.cycling.to_string());
                 d.set("alwaysShowInventoryHints", bench.always_hints.to_string());
             }
-            Kind::Pocket => {}
+            Kind::Pocket | Kind::Processing => {}
         }
         d.set("worldMemoriesLevel", MEMORIES_LEVEL.to_string());
         d.set("nearbyChestCount", "0".into());
@@ -580,6 +614,79 @@ impl Book {
             input: None,
             options: Vec::new(),
             selected: 0,
+            slots: Vec::new(),
+            last_progress: 0.0,
+            last_progress_at: None,
+        })
+    }
+
+    /// A processing bench's window (spec 16) for its state, its data keys
+    /// in the official order.
+    pub fn processing_window(
+        &self,
+        id: i32,
+        block: &str,
+        at: (i32, i32, i32),
+        bench: &Bench,
+        state: &crate::processing::State,
+        progress: f32,
+    ) -> Option<Window> {
+        let cfg = bench.processing.as_ref()?;
+        let name = self.item_name(block);
+        let mut d = Data::default();
+        d.set("type", bench.kind.to_string());
+        d.set("id", json(&bench.id));
+        d.set("name", json(&name));
+        d.set("blockItemId", json(block));
+        d.set("tierLevel", "1".into());
+        d.set("grantedAugmentTags", "[]".into());
+        d.set("active", state.active.to_string());
+        d.set("progress", fmt_f32(progress));
+        let opt = |s: &Option<String>| s.as_ref().map_or("null".into(), |v| json(v));
+        if let Some(fuel) = cfg.fuel.as_ref().filter(|f| !f.is_empty()) {
+            let v: Vec<String> = fuel
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{{\"icon\":{},\"resourceTypeId\":{}}}",
+                        opt(&f.icon),
+                        opt(&f.resource)
+                    )
+                })
+                .collect();
+            d.set("fuel", format!("[{}]", v.join(",")));
+        }
+        d.set("maxFuel", cfg.max_fuel.max(0).to_string());
+        d.set("fuelTime", fmt_f32(0.0));
+        d.set("progress", fmt_f32(progress));
+        d.set("processingFuelSlots", "0".into());
+        d.set("processingSlots", "0".into());
+        let inputs = cfg.inputs(1);
+        if !inputs.is_empty() {
+            let v: Vec<String> = inputs
+                .iter()
+                .map(|i| format!("{{\"icon\":{}}}", opt(&i.icon)))
+                .collect();
+            d.set("input", format!("[{}]", v.join(",")));
+        }
+        d.set("outputSlotsCount", cfg.outputs(1).to_string());
+        d.set("worldMemoriesLevel", MEMORIES_LEVEL.to_string());
+        d.set("nearbyChestCount", "0".into());
+        d.set("maxChestCount", MAX_CHEST_COUNT.to_string());
+        d.set("chestHorizontalRadius", CHEST_HORIZONTAL_RADIUS.to_string());
+        d.set("chestVerticalRadius", CHEST_VERTICAL_RADIUS.to_string());
+        Some(Window {
+            id,
+            kind: Kind::Processing,
+            bench: bench.clone(),
+            block: Some((block.to_owned(), at)),
+            data: d,
+            dirty: false,
+            extra_dirty: false,
+            input: None,
+            options: Vec::new(),
+            selected: 0,
+            slots: state.slots(),
             last_progress: 0.0,
             last_progress_at: None,
         })
@@ -788,6 +895,66 @@ impl Book {
     /// The input material of a one-input recipe and its quantity.
     pub fn single_input(&self, id: &str) -> Option<&proto::MaterialQuantity> {
         self.recipes.get(id)?.inputs.as_ref()?.first()
+    }
+
+    /// A processing bench's recipes at a tier, as the processing code
+    /// takes them (spec 16).
+    pub fn processing_recipes(&self, bench: &Bench, tier: i32) -> Vec<crate::processing::Recipe> {
+        self.bench_recipes(bench.kind, &bench.id)
+            .into_iter()
+            .filter(|(_, r)| {
+                !r.bench_requirement
+                    .iter()
+                    .flatten()
+                    .any(|b| b.id == bench.id && b.required_tier_level > tier)
+            })
+            .map(|(id, r)| crate::processing::Recipe {
+                id: id.clone(),
+                inputs: r
+                    .inputs
+                    .iter()
+                    .flatten()
+                    .map(|m| crate::processing::Material {
+                        item: m.item_id.clone(),
+                        resource: m.resource_type_id.clone(),
+                        tag: (m.item_tag != i32::MIN).then_some(m.item_tag),
+                        quantity: m.quantity,
+                    })
+                    .collect(),
+                outputs: r
+                    .outputs
+                    .iter()
+                    .flatten()
+                    .filter_map(|m| Some((m.item_id.clone()?, m.quantity)))
+                    .collect(),
+                seconds: r.time_seconds,
+            })
+            .collect()
+    }
+
+    /// Units of a processing material one item gives.
+    pub fn processing_units(&self, m: &crate::processing::Material, item: &str) -> Option<i32> {
+        let q = proto::MaterialQuantity {
+            item_id: m.item.clone(),
+            item_tag: m.tag.unwrap_or(i32::MIN),
+            resource_type_id: m.resource.clone(),
+            quantity: m.quantity,
+        };
+        self.units(&q, item)
+    }
+
+    /// Units of a resource type one item gives.
+    pub fn resource_units(&self, item: &str, resource: &str) -> Option<i32> {
+        self.items
+            .get(item)?
+            .resources
+            .iter()
+            .find(|(id, _)| id == resource)
+            .map(|(_, q)| *q)
+    }
+
+    pub fn fuel_quality(&self, item: &str) -> f64 {
+        self.fuel_quality.get(item).copied().unwrap_or(1.0)
     }
 
     /// Whether `item` is the material.
