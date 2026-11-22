@@ -346,6 +346,11 @@ struct Inner {
     stat_updates: Vec<(i32, Audience, proto::ComponentUpdate)>,
     /// Processing bench blocks (spec 16), by main cell.
     processing: BTreeMap<Pos, crate::processing::State>,
+    /// Block state read from the world save, until its block is first
+    /// ticked (spec 20).
+    saved_states: BTreeMap<Pos, String>,
+    /// The block state as last written to the save.
+    states_written: String,
     next_id: i32,
     players: BTreeMap<i32, Entry>,
     /// Blocks changed since the server started, sent to whoever joins.
@@ -2066,6 +2071,26 @@ impl Hub {
     /// windows open on it. A bench whose block is gone drops what it held.
     fn processing_step(&self, g: &mut Inner, ground: &Ground, dt: f32, out: &mut Outgoing) {
         use crate::support::World;
+        // Benches from the world save come back with what they held.
+        for (at, text) in std::mem::take(&mut g.saved_states) {
+            let block = View {
+                g,
+                ground,
+                hub_rules: &self.rules,
+            }
+            .block(at.0, at.1, at.2)
+            .0;
+            if let Some(cfg) = self
+                .keys_by_id
+                .get(&block)
+                .and_then(|k| self.book.bench(k))
+                .and_then(|b| b.processing.as_ref())
+            {
+                let mut st = crate::processing::State::new(cfg, 1);
+                st.load(&text);
+                g.processing.insert(at, st);
+            }
+        }
         let places: Vec<Pos> = g.processing.keys().copied().collect();
         for at in places {
             let (block, rot) = View {
@@ -2955,6 +2980,26 @@ impl Hub {
             drop(g);
             info!("loaded {n} block changes from {}", file.display());
         }
+        if let Ok(text) = std::fs::read_to_string(dir.join("block-state.txt")) {
+            let mut g = self.inner.lock().unwrap();
+            let mut at = None;
+            for l in text.lines() {
+                let w: Vec<&str> = l.split_whitespace().collect();
+                if let ["@", x, y, z, "processing"] = w[..] {
+                    at = match (x.parse(), y.parse(), z.parse()) {
+                        (Ok(x), Ok(y), Ok(z)) => Some((x, y, z)),
+                        _ => None,
+                    };
+                } else if l.is_empty() {
+                    at = None;
+                } else if let Some(at) = at {
+                    let e: &mut String = g.saved_states.entry(at).or_default();
+                    e.push_str(l);
+                    e.push('\n');
+                }
+            }
+            g.states_written = text;
+        }
         if let Ok(text) = std::fs::read_to_string(dir.join("support.txt")) {
             let mut g = self.inner.lock().unwrap();
             for line in text.lines() {
@@ -3027,6 +3072,35 @@ impl Hub {
             format!("{x} {y} {z} {key}")
         };
         append_line(file, &line);
+    }
+
+    /// The state blocks carry (spec 20), written whole to `block-state.txt`
+    /// next to `blocks.txt` when it changed: `@ x y z kind`, the state's
+    /// lines, an empty line.
+    fn save_states(&self, g: &mut Inner) {
+        let Some(file) = &self.save else { return };
+        let mut text = String::new();
+        for (at, st) in &g.processing {
+            text += &format!(
+                "@ {} {} {} processing\n{}\n",
+                at.0,
+                at.1,
+                at.2,
+                st.to_text()
+            );
+        }
+        for (at, st) in &g.saved_states {
+            text += &format!("@ {} {} {} processing\n{}\n", at.0, at.1, at.2, st);
+        }
+        if text == g.states_written {
+            return;
+        }
+        let path = file.with_file_name("block-state.txt");
+        let tmp = file.with_file_name("block-state.txt.tmp");
+        match std::fs::write(&tmp, &text).and_then(|_| std::fs::rename(&tmp, &path)) {
+            Ok(()) => g.states_written = text,
+            Err(e) => warn!("saving to {} failed: {e}", path.display()),
+        }
     }
 
     /// Support values that are not 0 (decoration), in `support.txt` next
@@ -5262,6 +5336,9 @@ impl Hub {
             hub.send_player_updates(g, out);
             g.in_tick = false;
             g.tick += 1;
+            if g.tick % 150 == 0 {
+                hub.save_states(g);
+            }
         });
     }
 

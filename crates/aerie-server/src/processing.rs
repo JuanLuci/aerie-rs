@@ -145,6 +145,84 @@ pub struct Events {
 }
 
 impl State {
+    /// The state as text, for the world save: a line of values, then one
+    /// line per filled slot (`input|fuel|output slot item n durability
+    /// max`).
+    pub fn to_text(&self) -> String {
+        let mut s = format!(
+            "values {} {} {} {} {} {} {}\n",
+            self.progress,
+            self.fuel_time,
+            self.last_fuel_total,
+            self.next_extra,
+            self.active as u8,
+            self.ticked as u8,
+            self.recipe.as_deref().unwrap_or("-")
+        );
+        for (name, slots) in [
+            ("input", &self.input),
+            ("fuel", &self.fuel),
+            ("output", &self.output),
+        ] {
+            for (i, st) in slots.iter().enumerate() {
+                if let Some(st) = st {
+                    s += &format!(
+                        "{name} {i} {} {} {} {}\n",
+                        st.item, st.n, st.durability, st.max
+                    );
+                }
+            }
+        }
+        s
+    }
+
+    /// Fills a fresh state from [`Self::to_text`]; slots the bench no
+    /// longer has are dropped.
+    pub fn load(&mut self, text: &str) {
+        for l in text.lines() {
+            let w: Vec<&str> = l.split_whitespace().collect();
+            match w[..] {
+                [
+                    "values",
+                    progress,
+                    fuel_time,
+                    total,
+                    extra,
+                    active,
+                    ticked,
+                    recipe,
+                ] => {
+                    self.progress = progress.parse().unwrap_or(0.0);
+                    self.fuel_time = fuel_time.parse().unwrap_or(0.0);
+                    self.last_fuel_total = total.parse().unwrap_or(0);
+                    self.next_extra = extra.parse().unwrap_or(self.next_extra);
+                    self.active = active == "1";
+                    self.ticked = ticked == "1";
+                    self.recipe = (recipe != "-").then(|| recipe.to_owned());
+                }
+                [name, slot, item, n, durability, max] => {
+                    let slots = match name {
+                        "input" => &mut self.input,
+                        "fuel" => &mut self.fuel,
+                        "output" => &mut self.output,
+                        _ => continue,
+                    };
+                    if let (Ok(i), Ok(n)) = (slot.parse::<usize>(), n.parse()) {
+                        if let Some(s) = slots.get_mut(i) {
+                            *s = Some(Stack {
+                                item: item.to_owned(),
+                                n,
+                                durability: durability.parse().unwrap_or(0.0),
+                                max: max.parse().unwrap_or(0.0),
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub fn new(cfg: &Config, tier: i32) -> Self {
         let mut s = State {
             input: vec![None; cfg.inputs(tier).len()],
