@@ -83,17 +83,40 @@ its player the chat line `server.general.repair.itemBroken` (param
 `itemName`: the item's name, colour `#ff5555`) and the 2D UI sound
 `SFX_Item_Break`.
 
+## Break tools
+
+The `BreakBlock` interaction a hit runs can name a tool type (`Tool`) and
+require it (`MatchTool`). Which one runs comes from the held item's
+interactions for the chain's type, with the item's `InteractionVars` in
+place of the defaults their `Replace` interactions name (in the game:
+pickaxes and drills `Pickaxe`, shears `Shears`, everything else none; the
+bark scraper's `Scraper` attack is not given to any item). A tool that must
+match does nothing on a block whose `Gathering.Tools` has no entry for it.
+
+When the block's health runs out and the block has an entry for the tool:
+if the entry names a state that is another block, the block becomes that
+state (rotation 0, no support area marked), the old block's break sound
+plays and the entry's drops fall (its item and drop list once; neither:
+the block's own item); otherwise the block breaks without its usual drops
+and the entry's drops fall. In the game: a pickaxe on gravel drops its
+`Soil_Gravel_Pickaxe` list, shears give leaves, webs and the like back as
+themselves.
+
 ## Not done yet
 
-Tool states (`Gathering.Tools`, such as stripping a trunk); break shapes
-(tools that break several blocks, with per-block or per-swing wear); wear
-from weapons and armour.
+Break shapes (tools that break several blocks, with per-block or
+per-swing wear); wear from weapons and armour. A hit lands when its chain
+starts; the official server lands it when the chain reaches its break
+operation, so with fast clicking a late chain can land after the next
+one's first hits.
 
 ## Checked against the official server
 
 Stacks given and thrown carry the same durability and max on both
 servers (a crude hatchet: 200 of 200, in the inventory and on the ground).
-Hits and wear are not yet: replaying a recorded client's hits makes the official server
-cancel the chains ("client failed to send client data"), because the
-recording kept only some of them. Recordings now keep every chain with its
-time, and the probe replays them at the recorded pace.
+A recorded client's 27 hatchet hits on stone, replayed on both servers
+(root interaction ids translated by name, the hatchet in the active slot):
+the same damage per hit, health, hit sounds, wear (0.25 a hit, stone being
+in the hatchet's sets), healing after 5 s and damage packets, but for the
+one late chain above. (The official server had cancelled earlier replays
+because the two servers number root interactions differently.)

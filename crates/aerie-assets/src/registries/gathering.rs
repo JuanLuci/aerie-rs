@@ -21,7 +21,13 @@
 //! `I item weapon builder tool hitSound incorrectSound maxDurability
 //! lossOnHit`, `L item loss sets types` (comma lists),
 //! `U gather power quality hitSound`, `E kind particle sound`,
-//! `X tool penalty`.
+//! `X tool penalty`; a block's `Gathering.Tools` as `G block tool state
+//! item list`; and the break tools an item's interactions reach (spec 12:
+//! the `BreakBlock` interactions under each interaction type, with the
+//! item's `InteractionVars` in place of the defaults they replace) as
+//! `K item type tool matchTool`.
+
+use std::collections::{BTreeSet, HashSet};
 
 use serde_json::Value;
 
@@ -52,6 +58,64 @@ fn list(v: Option<Vec<String>>) -> String {
     }
 }
 
+/// Walks interactions for the `BreakBlock`s they can run: (tool, match).
+struct Walk<'a> {
+    interactions: &'a crate::store::Store,
+    roots: &'a crate::store::Store,
+    vars: Option<&'a serde_json::Map<String, Value>>,
+    seen: HashSet<String>,
+    found: BTreeSet<(String, bool)>,
+}
+
+impl Walk<'_> {
+    fn key(&mut self, k: &str) {
+        if !self.seen.insert(k.to_owned()) {
+            return;
+        }
+        if self.interactions.assets.contains_key(k) {
+            let v = self.interactions.resolved(k, "Interaction");
+            self.value(&v);
+        } else if self.roots.assets.contains_key(k) {
+            let v = self.roots.resolved(k, "RootInteraction");
+            self.value(&v);
+        }
+    }
+
+    fn value(&mut self, v: &Value) {
+        match v {
+            Value::String(k) => self.key(k),
+            Value::Array(a) => a.iter().for_each(|x| self.value(x)),
+            Value::Object(o) => {
+                let ty = o.get("Type").and_then(Value::as_str);
+                if ty == Some("BreakBlock") {
+                    let tool = o.get("Tool").and_then(Value::as_str).unwrap_or("-");
+                    let m = o.get("MatchTool").and_then(Value::as_bool).unwrap_or(false);
+                    self.found.insert((tool.to_owned(), m));
+                }
+                if let Some(p) = o.get("Parent").and_then(Value::as_str) {
+                    self.key(p);
+                }
+                for (k, x) in o {
+                    // Names that are not references.
+                    if matches!(k.as_str(), "Parent" | "Type" | "Var" | "$Comment") {
+                        continue;
+                    }
+                    if ty == Some("Replace") && k == "DefaultValue" {
+                        let var = o.get("Var").and_then(Value::as_str);
+                        if let Some(over) = var.and_then(|n| self.vars?.get(n)) {
+                            let over = over.clone();
+                            self.value(&over);
+                            continue;
+                        }
+                    }
+                    self.value(x);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub fn table(ctx: &Ctx) -> Result<String> {
     let mut out = String::new();
     let blocks = ctx.store(super::blocks::PATH)?;
@@ -77,6 +141,25 @@ pub fn table(ctx: &Ctx) -> Result<String> {
         let bb = b.unwrap_or(&nul);
         let ss = soft.unwrap_or(&nul);
         let hh = harvest.unwrap_or(&nul);
+        for t in g
+            .get("Tools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(ty) = t.str_at("Type") {
+                out += &format!(
+                    "G {k} {ty} {} {} {}\n",
+                    or_dash(t.str_at("State")),
+                    or_dash(t.str_at("ItemId")),
+                    or_dash(t.get("DropList").and_then(|d| reference(
+                        d,
+                        &owner,
+                        "Gathering_Tools_DropList"
+                    ))),
+                );
+            }
+        }
         out += &format!(
             "B {k} {} {} {} {} {} {} {} {} {} {} {} {} {}\n",
             or_dash(b.and_then(|b| b.str_at("GatherType"))),
@@ -144,6 +227,28 @@ pub fn table(ctx: &Ctx) -> Result<String> {
                 list(d.strings("BlockSets")),
                 list(d.strings("BlockTypes")),
             );
+        }
+    }
+    let interactions = ctx.store(super::root_interactions::INTERACTIONS)?;
+    let roots = ctx.store(super::root_interactions::PATH)?;
+    for k in items.own.keys() {
+        let a = items.resolved(k, "Item");
+        let Some(types) = a.obj("Interactions").and_then(Value::as_object) else {
+            continue;
+        };
+        let vars = a.obj("InteractionVars").and_then(Value::as_object);
+        for (ty, root) in types {
+            let mut w = Walk {
+                interactions: &interactions,
+                roots: &roots,
+                vars,
+                seen: HashSet::new(),
+                found: BTreeSet::new(),
+            };
+            w.value(root);
+            for (tool, m) in w.found {
+                out += &format!("K {k} {ty} {tool} {}\n", m as u8);
+            }
         }
     }
     let unarmed = ctx.store(UNARMED)?;

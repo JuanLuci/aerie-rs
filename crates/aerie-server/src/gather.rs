@@ -20,6 +20,17 @@ pub struct Block {
     pub soft_weapon: bool,
     pub harvest: bool,
     pub use_default_drop: bool,
+    /// `Gathering.Tools`: what breaking it with a tool type does.
+    pub tools: Vec<ToolData>,
+}
+
+/// One `Gathering.Tools` entry.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ToolData {
+    pub tool: String,
+    pub state: Option<String>,
+    pub item: Option<String>,
+    pub list: Option<String>,
 }
 
 /// A tool spec (or a bare-hand one).
@@ -59,6 +70,9 @@ pub struct Table {
     blocks: HashMap<String, Block>,
     items: HashMap<String, Item>,
     unarmed: HashMap<String, Spec>,
+    /// (item, interaction type) → the break tool its interactions run and
+    /// whether it must match.
+    break_tools: HashMap<(String, String), (Option<String>, bool)>,
     pub unbreakable: Effect,
     pub incorrect: Effect,
     /// The gameplay config's broken tool penalty (0.75: a quarter of the
@@ -81,6 +95,8 @@ pub enum Hit {
         list: Option<String>,
         quantity: i32,
         spec: Option<Spec>,
+        /// The block's entry for the break tool, if it has one.
+        tool: Option<ToolData>,
     },
 }
 
@@ -133,8 +149,23 @@ impl Table {
                             soft_weapon: soft_weapon == "1",
                             harvest: harvest == "1",
                             use_default_drop: use_default == "1",
+                            tools: Vec::new(),
                         },
                     );
+                }
+                ["G", key, tool, state, item, list] => {
+                    if let Some(b) = t.blocks.get_mut(key) {
+                        b.tools.push(ToolData {
+                            tool: tool.to_owned(),
+                            state: opt(state),
+                            item: opt(item),
+                            list: opt(list),
+                        });
+                    }
+                }
+                ["K", item, ty, tool, m] => {
+                    t.break_tools
+                        .insert((item.to_owned(), ty.to_owned()), (opt(tool), m == "1"));
                 }
                 ["I", key, weapon, builder, tool, hit, incorrect, max, loss] => {
                     let it = t.items.entry(key.to_owned()).or_default();
@@ -192,6 +223,14 @@ impl Table {
         t
     }
 
+    /// The break tool a held item's interactions of a type run (none, and
+    /// no match needed, for bare hands and items without one).
+    pub fn break_tool(&self, held: Option<&str>, ty: &str) -> (Option<String>, bool) {
+        held.and_then(|h| self.break_tools.get(&(h.to_owned(), ty.to_owned())))
+            .cloned()
+            .unwrap_or((None, false))
+    }
+
     pub fn item(&self, key: &str) -> Option<&Item> {
         self.items.get(key)
     }
@@ -221,10 +260,31 @@ impl Table {
     /// What a hit on `key` with `held` does (spec 12); `deco`: the block was
     /// placed as decoration (its default drop then); `broken`: the held
     /// stack is worn out (a tool then hits with the penalty).
+    #[cfg(test)]
     pub fn hit(&self, key: &str, held: Option<&str>, deco: bool, broken: bool) -> Hit {
+        self.hit_with(key, held, deco, broken, None, false)
+    }
+
+    /// [`Self::hit`] with the break tool the interaction runs: a tool that
+    /// must match does nothing on a block without an entry for it.
+    pub fn hit_with(
+        &self,
+        key: &str,
+        held: Option<&str>,
+        deco: bool,
+        broken: bool,
+        tool: Option<&str>,
+        match_tool: bool,
+    ) -> Hit {
         let Some(b) = self.blocks.get(key) else {
             return Hit::Nothing;
         };
+        let tool_data = tool
+            .and_then(|t| b.tools.iter().find(|d| d.tool == t))
+            .cloned();
+        if match_tool && tool_data.is_none() {
+            return Hit::Nothing;
+        }
         let spec = self.spec(b, held);
         let mut power = spec.as_ref().map_or(0.0, |s| s.power);
         if power != 0.0 && broken && held.and_then(|h| self.items.get(h)).is_some_and(|i| i.tool) {
@@ -258,6 +318,7 @@ impl Table {
             list,
             quantity,
             spec,
+            tool: tool_data,
         }
     }
 }
@@ -301,6 +362,10 @@ mod tests {
                      U Woods 0.05 0 3\n\
                      L Tool_Hatchet_Crude 0.25 Stone,Wood -\n\
                      X tool 0.75\n\
+                     G Wood_Oak_Trunk Scraper Stripped Bark -\n\
+                     G Plant_Grass Shears - - -\n\
+                     K Tool_Scraper Primary Scraper 1\n\
+                     K Tool_Shears Primary Shears 0\n\
                      U Rocks 0.02 0 0\n";
 
     #[test]
@@ -333,6 +398,32 @@ mod tests {
         assert!(matches!(
             t.hit("Wood_Oak_Trunk", None, true, false),
             Hit::Damage { item: None, .. }
+        ));
+    }
+
+    #[test]
+    fn break_tools() {
+        let t = Table::parse(T);
+        assert_eq!(
+            t.break_tool(Some("Tool_Shears"), "Primary"),
+            (Some("Shears".into()), false)
+        );
+        assert_eq!(t.break_tool(None, "Primary"), (None, false));
+        // A tool that must match does nothing on a block without its entry.
+        assert_eq!(
+            t.hit_with("Rock_Stone", None, false, false, Some("Scraper"), true),
+            Hit::Nothing
+        );
+        match t.hit_with("Wood_Oak_Trunk", None, false, false, Some("Scraper"), true) {
+            Hit::Damage { tool: Some(d), .. } => {
+                assert_eq!(d.state.as_deref(), Some("Stripped"));
+                assert_eq!(d.item.as_deref(), Some("Bark"));
+            }
+            h => panic!("{h:?}"),
+        }
+        assert!(matches!(
+            t.hit_with("Plant_Grass", None, false, false, Some("Shears"), false),
+            Hit::Damage { tool: Some(_), .. }
         ));
     }
 

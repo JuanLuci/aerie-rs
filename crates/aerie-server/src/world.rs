@@ -432,7 +432,16 @@ impl Hub {
                 return;
             };
             let deco = g.support.get(&(x, y, z)) == Some(&crate::support::DECO);
-            match hub.gather.hit(&key, held.as_deref(), deco, broken) {
+            // The break tool the held item's primary interaction runs.
+            let (tool, match_tool) = hub.gather.break_tool(held.as_deref(), "Primary");
+            match hub.gather.hit_with(
+                &key,
+                held.as_deref(),
+                deco,
+                broken,
+                tool.as_deref(),
+                match_tool,
+            ) {
                 crate::gather::Hit::Nothing => {}
                 crate::gather::Hit::Unbreakable => {
                     hub.effect(g, &hub.gather.unbreakable.clone(), center, out);
@@ -449,6 +458,7 @@ impl Hub {
                     list,
                     quantity,
                     spec,
+                    tool,
                 } => {
                     let (sec, index) = section_of(x, y, z);
                     let now = std::time::Instant::now();
@@ -465,8 +475,13 @@ impl Hub {
                         }
                     }
                     if destroyed {
-                        let drops = (item, list, quantity);
-                        hub.break_block(g, ground, (x, y, z), Some(drops), out);
+                        match tool {
+                            None => {
+                                let drops = (item, list, quantity);
+                                hub.break_block(g, ground, (x, y, z), Some(drops), out);
+                            }
+                            Some(t) => hub.tool_break(g, ground, (x, y, z), block, rot, t, out),
+                        }
                     } else if let Some(b) = hub.rules.block(block)
                         && b.hit_sound > 0
                     {
@@ -631,6 +646,60 @@ impl Hub {
         };
         out.drops
             .push((stacks, [x as f64 + 0.5, y as f64, z as f64 + 0.5]));
+    }
+
+    /// A block finished by a tool it has an entry for (spec 12): it turns
+    /// into the entry's state if that is another block (rotation 0, the
+    /// old block's break sound), else breaks without its usual drops; the
+    /// entry's drops (or the block's own item) fall either way.
+    #[allow(clippy::too_many_arguments)]
+    fn tool_break(
+        &self,
+        g: &mut Inner,
+        ground: &Ground,
+        (x, y, z): Pos,
+        block: i32,
+        rot: i32,
+        t: crate::gather::ToolData,
+        out: &mut Outgoing,
+    ) {
+        let state = t.state.as_ref().and_then(|s| {
+            self.rules
+                .block(block)?
+                .states
+                .iter()
+                .find(|(n, _)| n == s)
+                .map(|(_, id)| *id)
+        });
+        match state.filter(|&n| n != block) {
+            Some(n) => {
+                self.change(g, ground, (x, y, z), n, 0, How::default(), out);
+                if let Some(b) = self.rules.block(block)
+                    && b.break_sound > 0
+                {
+                    let center = self.block_center(block, rot, (x, y, z));
+                    self.sound_near(g, b.break_sound, center, out);
+                }
+            }
+            None => self.break_block(g, ground, (x, y, z), None, out),
+        }
+        let stacks = if t.item.is_none() && t.list.is_none() {
+            self.rules
+                .block(block)
+                .and_then(|b| b.item.clone())
+                .map(|i| vec![(i, 1)])
+                .unwrap_or_default()
+        } else {
+            self.rules.roll(&crate::support::Drop {
+                item: t.item,
+                list: t.list,
+                quantity: 1,
+            })
+        };
+        if !stacks.is_empty() {
+            out.drops
+                .push((stacks, [x as f64 + 0.5, y as f64, z as f64 + 0.5]));
+        }
     }
 
     /// A sound at a point for the players within its reach (SFX).

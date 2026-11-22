@@ -76,6 +76,7 @@ async fn main() -> Result<()> {
             use_block: arg(&args, "--use-block"),
             after: arg(&args, "--after"),
             interactions: arg(&args, "--interactions").map(PathBuf::from),
+            root_map: arg(&args, "--root-map").map(PathBuf::from),
         };
         return probe::run(upstream, capture, opts).await;
     }

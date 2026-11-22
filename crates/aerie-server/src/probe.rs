@@ -75,6 +75,26 @@ pub struct Options {
     /// chains are sent again once in the world, moved to the block under the
     /// probe's spawn, to see how a server answers them.
     pub interactions: Option<PathBuf>,
+    /// Root interaction ids to translate in replayed chains (`from to` per
+    /// line): two servers can number root interactions differently.
+    pub root_map: Option<PathBuf>,
+}
+
+/// Translates a chain's root interaction ids (and its forks').
+fn remap_roots(c: &mut proto::SyncInteractionChain, map: &std::collections::HashMap<i32, i32>) {
+    let f = |v: &mut i32| {
+        if let Some(n) = map.get(v) {
+            *v = *n;
+        }
+    };
+    f(&mut c.override_root_interaction);
+    for s in c.interaction_data.iter_mut().flatten().flatten() {
+        f(&mut s.root_interaction);
+        f(&mut s.entered_root_interaction);
+    }
+    for k in c.new_forks.iter_mut().flatten() {
+        remap_roots(k, map);
+    }
 }
 
 /// The interaction chains of a `--record` folder, in order.
@@ -210,6 +230,20 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
         Some(d) => recorded_chains(d)?,
         None => Vec::new(),
     };
+    if let Some(p) = &opts.root_map {
+        let map: std::collections::HashMap<i32, i32> = std::fs::read_to_string(p)?
+            .lines()
+            .filter_map(|l| {
+                let mut w = l.split_whitespace();
+                Some((w.next()?.parse().ok()?, w.next()?.parse().ok()?))
+            })
+            .collect();
+        for (_, m) in &mut chains {
+            for c in &mut m.updates {
+                remap_roots(c, &map);
+            }
+        }
+    }
     loop {
         let f = loop {
             if let Some(f) = dec.next()? {
