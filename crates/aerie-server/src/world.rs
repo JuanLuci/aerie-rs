@@ -23,6 +23,8 @@ pub mod id {
     pub const CHAT_MESSAGE: u32 = 211;
     pub const CUSTOM_HUD: u32 = 217;
     pub const SYNC_INTERACTION_CHAINS: u32 = 290;
+    pub const CANCEL_INTERACTION_CHAIN: u32 = 291;
+    pub const PLAY_INTERACTION_FOR: u32 = 292;
     pub const ENTITY_UPDATES: u32 = 161;
     pub const UPDATE_BLOCK_DAMAGE: u32 = 144;
     pub const DROP_CREATIVE_ITEM: u32 = 172;
@@ -131,6 +133,10 @@ struct Entry {
     no_physics: bool,
     /// Placements already done: (chain, fork path, operation).
     placed_ops: std::collections::HashSet<(i32, String, i32)>,
+    /// The interaction chains it runs (spec 18).
+    chains: crate::chains::Manager,
+    /// The movement states the client last reported.
+    movement: proto::MovementStates,
 }
 
 /// A block placement a client reports in an interaction chain (spec 15).
@@ -280,6 +286,8 @@ pub struct Hub {
     creative: bool,
     /// The stat types (spec 17).
     stat_types: crate::stats::Types,
+    /// Interactions and root interactions as the server runs them.
+    chains: crate::chains::Book,
 }
 
 /// Who gets a player's component update.
@@ -509,6 +517,25 @@ impl Hub {
     /// effects and drops.
     fn hit(&self, player: i32, x: i32, y: i32, z: i32, slot: i32) {
         self.world_step(|hub, g, ground, out| {
+            hub.hit_in(g, ground, out, player, (x, y, z), slot, None)
+        });
+    }
+
+    /// [`Hub::hit`] inside a world step. `tool` is the break tool and
+    /// match rule of the break operation, when a chain names them.
+    #[allow(clippy::too_many_arguments)]
+    fn hit_in(
+        &self,
+        g: &mut Inner,
+        ground: &Ground,
+        out: &mut Outgoing,
+        player: i32,
+        (x, y, z): Pos,
+        slot: i32,
+        tool: Option<(Option<String>, bool)>,
+    ) {
+        let hub = self;
+        {
             use crate::support::World;
             let creative = g.players.get(&player).is_none_or(|e| e.creative);
             // The server's own idea of the held stack, as the official
@@ -542,7 +569,8 @@ impl Hub {
             };
             let deco = g.support.get(&(x, y, z)) == Some(&crate::support::DECO);
             // The break tool the held item's primary interaction runs.
-            let (tool, match_tool) = hub.gather.break_tool(held.as_deref(), "Primary");
+            let (tool, match_tool) =
+                tool.unwrap_or_else(|| hub.gather.break_tool(held.as_deref(), "Primary"));
             match hub.gather.hit_with(
                 &key,
                 held.as_deref(),
@@ -616,7 +644,7 @@ impl Hub {
                     }
                 }
             }
-        });
+        }
     }
 
     /// The held tool's wear after a damaging hit (spec 12): the slot is
@@ -958,6 +986,11 @@ impl Hub {
     /// config's `ItemEntity.Lifetime`).
     fn item_life(&self, _item: &str) -> f32 {
         600.0
+    }
+
+    pub fn with_chains(mut self, b: crate::chains::Book) -> Self {
+        self.chains = b;
+        self
     }
 
     pub fn with_stats(mut self, t: crate::stats::Types) -> Self {
@@ -1382,6 +1415,8 @@ impl Hub {
                     creative_distance: 10,
                     no_physics: false,
                     placed_ops: Default::default(),
+                    chains: Default::default(),
+                    movement: Default::default(),
                     inv_dirty: Default::default(),
                 },
             );
@@ -2962,6 +2997,7 @@ impl Hub {
             }
             e.sprinting = ms.sprinting;
             e.gliding = ms.gliding;
+            e.movement = ms.clone();
         }
         if m.look_orientation.is_some() {
             e.look = m.look_orientation.clone();
@@ -3131,6 +3167,36 @@ impl Hub {
     /// which Aerie does not do yet.
     pub fn interactions(&self, _player: i32, payload: &[u8]) -> Result<()> {
         let (m, _) = proto::SyncInteractionChains::decode(payload, 0)?;
+        if !self.chains.roots.is_empty() {
+            // Chains run on the server (spec 18): queued for the tick.
+            for c in &m.updates {
+                self.consume_step(_player, c)?;
+            }
+            self.world_step(|hub, g, ground, out| {
+                let Some(mut manager) = g
+                    .players
+                    .get_mut(&_player)
+                    .map(|e| std::mem::take(&mut e.chains))
+                else {
+                    return;
+                };
+                manager.receive(
+                    m.updates,
+                    &mut ChainHost {
+                        hub,
+                        g,
+                        ground,
+                        out,
+                        pid: _player,
+                    },
+                );
+                if let Some(e) = g.players.get_mut(&_player) {
+                    e.chains = manager;
+                }
+            });
+            return Ok(());
+        }
+        // Without the interaction registries (tests): the direct path.
         let mut placements = Vec::new();
         let mut hits = Vec::new();
         let mut uses = Vec::new();
@@ -3257,7 +3323,13 @@ impl Hub {
     /// their drops), decoration marking; a failed placement gives the item
     /// back and resends the block.
     fn place(&self, pid: i32, p: Placement) {
-        self.world_step(|hub, g, ground, out| {
+        self.world_step(|hub, g, ground, out| hub.place_in(g, ground, out, pid, p));
+    }
+
+    /// [`Hub::place`] inside a world step.
+    fn place_in(&self, g: &mut Inner, ground: &Ground, out: &mut Outgoing, pid: i32, p: Placement) {
+        let hub = self;
+        {
             use crate::support::World;
             let Some(e) = g.players.get(&pid) else { return };
             let creative = e.creative;
@@ -3418,7 +3490,7 @@ impl Hub {
                 g.support.insert(p.pos, crate::support::DECO);
                 hub.save_support(x, y, z, crate::support::DECO);
             }
-        });
+        }
     }
 
     /// Damaged blocks of a column, per section, as the official server
@@ -4274,6 +4346,224 @@ impl crate::items::Blocks for View<'_> {
     }
 }
 
+/// What a player's interaction chains see of the world (spec 18).
+struct ChainHost<'a> {
+    hub: &'a Hub,
+    g: &'a mut Inner,
+    ground: &'a Ground,
+    out: &'a mut Outgoing,
+    pid: i32,
+}
+
+impl ChainHost<'_> {
+    fn player(&self) -> Option<&Entry> {
+        self.g.players.get(&self.pid)
+    }
+}
+
+impl crate::chains::Host for ChainHost<'_> {
+    fn creative(&self) -> bool {
+        self.player().is_some_and(|e| e.creative)
+    }
+
+    fn active_slot(&self, section: i32) -> i32 {
+        self.player().map_or(-1, |e| match section {
+            inventory::HOTBAR => e.hotbar_slot,
+            inventory::UTILITY => e.utility_slot,
+            -8 => e.tools_slot,
+            _ => -1,
+        })
+    }
+
+    fn item_at(&self, section: i32, slot: i32) -> Option<String> {
+        self.player()?
+            .inv
+            .get(section, slot)
+            .map(|s| s.item)
+            .filter(|i| !i.is_empty() && i != "Empty")
+    }
+
+    fn movement(&self) -> proto::MovementStates {
+        self.player()
+            .map(|e| e.movement.clone())
+            .unwrap_or_default()
+    }
+
+    fn block(&self, (x, y, z): Pos) -> Option<i32> {
+        use crate::support::World;
+        if !(0..crate::support::WORLD_HEIGHT).contains(&y) {
+            return None;
+        }
+        Some(
+            View {
+                g: self.g,
+                ground: self.ground,
+                hub_rules: &self.hub.rules,
+            }
+            .block(x, y, z)
+            .0,
+        )
+    }
+
+    fn cell(&self, (x, y, z): Pos) -> Option<(i32, proto::BlockRotation)> {
+        use crate::support::World;
+        if !(0..crate::support::WORLD_HEIGHT).contains(&y) {
+            return None;
+        }
+        let (id, rot) = View {
+            g: self.g,
+            ground: self.ground,
+            hub_rules: &self.hub.rules,
+        }
+        .block(x, y, z);
+        Some((
+            id,
+            proto::BlockRotation {
+                rotation_yaw: proto::Rotation((rot % 4) as _),
+                rotation_pitch: proto::Rotation((rot / 4 % 4) as _),
+                rotation_roll: proto::Rotation((rot / 16 % 4) as _),
+            },
+        ))
+    }
+
+    fn base_of(&self, (x, y, z): Pos) -> Pos {
+        let f = unpack_filler(self.g.fillers.get(&(x, y, z)).copied().unwrap_or(0));
+        (x - f[0], y - f[1], z - f[2])
+    }
+
+    fn in_reach(&self, held: Option<&str>, (x, y, z): Pos) -> bool {
+        let Some(e) = self.player() else { return false };
+        let Some(at) = &e.position else { return false };
+        let mut reach = self.hub.book.use_distance(held, e.creative);
+        if e.creative {
+            reach = reach.max(e.creative_distance.clamp(0, 128) as f32);
+        }
+        reach += 2.0;
+        let d = [
+            x as f64 + 0.5 - at.x,
+            y as f64 + 0.5 - (at.y + self.hub.eye_height),
+            z as f64 + 0.5 - at.z,
+        ];
+        d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= (reach * reach) as f64
+    }
+
+    fn place(&mut self, r: &crate::chains::PlaceRequest) -> Option<bool> {
+        let e = self.player()?;
+        let held = e.inv.get(inventory::HOTBAR, r.slot)?;
+        if r.client_block != -1 && self.hub.rules.block(r.client_block).is_none() {
+            return None;
+        }
+        let used_up = !e.creative && held.n == 1 && r.remove_item;
+        let rot = r.rotation.rotation_roll.0 as i32 * 16
+            + r.rotation.rotation_pitch.0 as i32 * 4
+            + r.rotation.rotation_yaw.0 as i32;
+        self.hub.place_in(
+            self.g,
+            self.ground,
+            self.out,
+            self.pid,
+            Placement {
+                pos: r.pos,
+                rot,
+                client_block: r.client_block,
+                slot: r.slot,
+            },
+        );
+        Some(used_up)
+    }
+
+    fn break_block(
+        &mut self,
+        pos: Pos,
+        ctx: &crate::chains::Ctx,
+        harvest: bool,
+        _soft_only: bool,
+        tool: Option<&str>,
+        match_tool: bool,
+    ) -> bool {
+        if harvest {
+            // Picking a block up by using it is not done yet.
+            return false;
+        }
+        self.hub.hit_in(
+            self.g,
+            self.ground,
+            self.out,
+            self.pid,
+            pos,
+            ctx.slot,
+            Some((tool.map(str::to_owned), match_tool)),
+        );
+        true
+    }
+
+    fn other(&mut self, ty: &str, ctx: &crate::chains::Ctx) {
+        // A block's own interaction that opens something: benches.
+        if ty.starts_with("Open")
+            && let Some(at) = ctx.target_block
+        {
+            self.out.uses.push((self.pid, at));
+        }
+    }
+
+    fn cancel(&mut self, chain: i32, fork: Option<proto::ForkedChainId>) {
+        if let Ok(p) = packet(
+            id::CANCEL_INTERACTION_CHAIN,
+            &proto::CancelInteractionChain {
+                chain_id: chain,
+                forked_id: fork,
+            },
+        ) {
+            self.out.to.push((self.pid, p));
+        }
+    }
+
+    fn set_active_slot(&mut self, section: i32, slot: i32) {
+        if let Ok(p) = packet(
+            id::SET_ACTIVE_SLOT,
+            &proto::SetActiveSlot {
+                inventory_section_id: section,
+                active_slot: slot,
+            },
+        ) {
+            self.out.to.push((self.pid, p));
+        }
+    }
+
+    fn change_hotbar_slot(&mut self, slot: i32) {
+        if (0..9).contains(&slot)
+            && let Some(e) = self.g.players.get_mut(&self.pid)
+        {
+            e.hotbar_slot = slot;
+        }
+    }
+
+    fn play(&mut self, p: proto::PlayInteractionFor, view_distance: f64, owner_too: bool) {
+        let Some(at) = self.player().and_then(|e| e.position.clone()) else {
+            return;
+        };
+        let Ok(pk) = packet(id::PLAY_INTERACTION_FOR, &p) else {
+            return;
+        };
+        for (id, e) in &self.g.players {
+            if *id == self.pid && !owner_too {
+                continue;
+            }
+            let near = e.position.as_ref().is_some_and(|o| {
+                let d = [o.x - at.x, o.y - at.y, o.z - at.z];
+                d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= view_distance * view_distance
+            });
+            if near {
+                self.out.to.push((*id, pk.clone()));
+            }
+        }
+    }
+
+    fn network_id(&self) -> i32 {
+        self.pid
+    }
+}
+
 /// Packets and drops a world step produces, sent once the locks are gone.
 #[derive(Default)]
 struct Outgoing {
@@ -4282,6 +4572,8 @@ struct Outgoing {
     drops: Vec<(Vec<(String, i32)>, [f64; 3])>,
     /// Stacks a player drops (speed 1, spec 11).
     throws: Vec<(i32, Stack)>,
+    /// Blocks players used: a bench there opens once the step is over.
+    uses: Vec<(i32, Pos)>,
 }
 
 /// A part's offset packed as the official server does (5 bits each:
@@ -4640,6 +4932,9 @@ impl Hub {
         for (pid, st) in out.throws {
             self.throw_item(pid, st, 1.0);
         }
+        for (pid, (x, y, z)) in out.uses {
+            let _ = self.open_bench(pid, x, y, z);
+        }
         r
     }
 
@@ -4659,6 +4954,7 @@ impl Hub {
         self.world_step(|hub, g, ground, out| {
             hub.send_player_updates(g, out);
             g.in_tick = true;
+            hub.chains_step(g, ground, dt, out);
             let todo = std::mem::take(&mut g.ticking);
             for (sec, index) in todo {
                 hub.check_support(g, ground, block_of(sec, index), out);
@@ -4675,6 +4971,46 @@ impl Hub {
             g.in_tick = false;
             g.tick += 1;
         });
+    }
+
+    /// Every player's interaction chains run one tick (spec 18); the
+    /// states go back to the player in one packet.
+    fn chains_step(&self, g: &mut Inner, ground: &Ground, dt: f32, out: &mut Outgoing) {
+        let mut ids: Vec<i32> = g
+            .players
+            .iter()
+            .filter(|(_, e)| !e.chains.is_idle())
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        for pid in ids {
+            let Some(mut manager) = g
+                .players
+                .get_mut(&pid)
+                .map(|e| std::mem::take(&mut e.chains))
+            else {
+                continue;
+            };
+            manager.tick(
+                &self.chains,
+                &mut ChainHost {
+                    hub: self,
+                    g,
+                    ground,
+                    out,
+                    pid,
+                },
+                dt,
+            );
+            if let Some(m) = manager.take_packet()
+                && let Ok(p) = packet(id::SYNC_INTERACTION_CHAINS, &m)
+            {
+                out.to.push((pid, p));
+            }
+            if let Some(e) = g.players.get_mut(&pid) {
+                e.chains = manager;
+            }
+        }
     }
 
     fn check_support(&self, g: &mut Inner, ground: &Ground, (x, y, z): Pos, out: &mut Outgoing) {

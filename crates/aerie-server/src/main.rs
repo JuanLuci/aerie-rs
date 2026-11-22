@@ -11,6 +11,7 @@
 
 mod account;
 mod cache;
+mod chains;
 mod changes;
 mod chunk;
 mod common;
@@ -256,6 +257,39 @@ async fn main() -> Result<()> {
     info!("block support: {} block types", rules.len());
     let (r, i, b) = book.counts();
     info!("crafting: {r} recipes, {i} items, {b} benches");
+    // Interactions as the server runs them (spec 18).
+    let chain_book = {
+        let reg = |id: u32| {
+            registries
+                .iter()
+                .find(|(i, _)| *i == id)
+                .map(|(_, b)| b.as_slice())
+        };
+        let table = extras
+            .iter()
+            .find(|(n, _)| n == chains::TABLE)
+            .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
+        match (reg(66), reg(67)) {
+            (Some(i), Some(r)) => {
+                match chains::Book::build(i, r, reg(68), reg(54), reg(40), &table) {
+                    Ok(b) => {
+                        info!(
+                            "interactions: {} interactions, {} root interactions",
+                            b.inters.iter().flatten().count(),
+                            b.roots.iter().flatten().count()
+                        );
+                        b
+                    }
+                    Err(e) => {
+                        warn!("interactions not read: {e}");
+                        Default::default()
+                    }
+                }
+            }
+            _ => Default::default(),
+        }
+    };
     let settings = Arc::new(login::Settings {
         name: arg(&args, "--name").unwrap_or_else(|| "Aerie".into()),
         motd: arg(&args, "--motd").unwrap_or_else(|| "An Aerie server".into()),
@@ -284,6 +318,7 @@ async fn main() -> Result<()> {
                     arg(&args, "--game-mode").is_some_and(|m| m.eq_ignore_ascii_case("creative")),
                 )
                 .with_book(book)
+                .with_chains(chain_book)
                 .with_consume(&consume)
                 .with_rules(rules)
                 .with_eye_height(eye_height);
@@ -451,6 +486,11 @@ fn build_registries(assets: Option<String>, capture: Option<&[(u32, Vec<u8>)]>) 
     match registries::physics::table(&ctx) {
         Ok(t) => extras.push((crate::support::TABLE.to_string(), t.into_bytes())),
         Err(e) => warn!("physics table not built: {e}"),
+    }
+    // Interaction types as the server runs them.
+    match registries::interactions::server_table(&ctx) {
+        Ok(t) => extras.push((crate::chains::TABLE.to_string(), t.into_bytes())),
+        Err(e) => warn!("interaction types table not built: {e}"),
     }
     // Stat types as the server runs them.
     match registries::entity_stat_types::table(&ctx) {

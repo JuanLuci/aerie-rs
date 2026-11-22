@@ -326,9 +326,22 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
                 frame::encode(4, &pong, &mut wire)?;
             }
             104 => {
-                // JoinWorld: ready for chunks now, ready for gameplay right after.
+                // JoinWorld: ready for chunks now, ready for gameplay a
+                // moment later, as a client that loads the world first (the
+                // official server only starts waiting for it once the spawn
+                // chunk is loaded; a ready sent before that is lost and it
+                // then takes the client for not ready for 10 s).
                 frame::encode(105, &[0b01], &mut wire)?;
-                frame::encode(105, &[0b10], &mut wire)?;
+                {
+                    let tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        let mut w = Vec::new();
+                        if frame::encode(105, &[0b10], &mut w).is_ok() {
+                            let _ = tx.send(w);
+                        }
+                    });
+                }
                 // Unless replaying interactions (which must not move the
                 // probe): a position, then the chat lines, so a server can
                 // be tested past the join.

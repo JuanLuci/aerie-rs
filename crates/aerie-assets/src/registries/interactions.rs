@@ -1559,6 +1559,60 @@ fn clear_tags(i: &mut p::Interaction) {
     )
 }
 
+/// What the server needs to run interactions and the packets do not say:
+/// one line per interaction, `index<TAB>server type<TAB>{fields}`, the
+/// fields being the server-only settings the asset gives (absent ones
+/// keep the server's defaults).
+pub fn server_table(ctx: &Ctx) -> Result<String> {
+    const FIELDS: &[&str] = &[
+        "ViewDistance",
+        "Tool",
+        "MatchTool",
+        "DefaultOk",
+        "ValidateForkPositions",
+        "MaxForkPositionViolations",
+    ];
+    let store = ctx.store(PATH)?;
+    let order = ctx.order(PATH, BUILTIN)?;
+    let idx = ctx.indexes(PATH, BUILTIN)?;
+    let mut out = String::new();
+    for (n, k) in order.iter().enumerate() {
+        let i = idx.get(&k.to_lowercase()).copied().unwrap_or(n as i32);
+        let unknown = store
+            .own
+            .get(k)
+            .is_some_and(|v| v.get("$Unknown").is_some());
+        let (ty, a) = if !store.own.contains_key(k) || unknown {
+            let ty = match k.as_str() {
+                "*Change_Active_Slot" => "ChangeActiveSlot",
+                "*Simple_Crafting_Default"
+                | "*Diagram_Crafting_Default"
+                | "*Structural_Crafting_Default" => "OpenBenchPage",
+                "*UseNPC" => "UseNPC",
+                "*PickupItem" => "PickupItem",
+                _ => "Simple",
+            };
+            (ty.to_owned(), Value::Null)
+        } else {
+            (type_of(&store, k), store.resolved(k, "Interaction"))
+        };
+        let mut fields = serde_json::Map::new();
+        for f in FIELDS {
+            if let Some(v) = a.get(*f) {
+                fields.insert((*f).to_owned(), v.clone());
+            }
+        }
+        if let Some(w) = a
+            .obj("Effects")
+            .and_then(|e| e.get("WaitForAnimationToFinish"))
+        {
+            fields.insert("WaitForAnimationToFinish".to_owned(), w.clone());
+        }
+        out += &format!("{i}\t{ty}\t{}\n", Value::Object(fields));
+    }
+    Ok(out)
+}
+
 pub fn build(ctx: &Ctx) -> Result<p::UpdateInteractions> {
     let store = ctx.store(PATH)?;
     let order = ctx.order(PATH, BUILTIN)?;
