@@ -16,6 +16,7 @@ mod changes;
 mod chunk;
 mod common;
 mod crafting;
+mod effects;
 mod gather;
 mod inventory;
 mod items;
@@ -290,6 +291,18 @@ async fn main() -> Result<()> {
             _ => Default::default(),
         }
     };
+    let effect_book = {
+        let table = extras
+            .iter()
+            .find(|(n, _)| n == effects::TABLE)
+            .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
+        registries
+            .iter()
+            .find(|(i, _)| *i == 51)
+            .and_then(|(_, b)| effects::Book::build(b, &table).ok())
+            .unwrap_or_default()
+    };
     let settings = Arc::new(login::Settings {
         name: arg(&args, "--name").unwrap_or_else(|| "Aerie".into()),
         motd: arg(&args, "--motd").unwrap_or_else(|| "An Aerie server".into()),
@@ -319,6 +332,7 @@ async fn main() -> Result<()> {
                 )
                 .with_book(book)
                 .with_chains(chain_book)
+                .with_effects(effect_book)
                 .with_consume(&consume)
                 .with_rules(rules)
                 .with_eye_height(eye_height);
@@ -341,15 +355,26 @@ async fn main() -> Result<()> {
     {
         let settings = settings.clone();
         tokio::spawn(async move {
-            let mut every =
-                tokio::time::interval(std::time::Duration::from_nanos(1_000_000_000 / 30));
-            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // As the official loop: a tick starts one step after the last
+            // one started, never earlier — the timer wakes a little
+            // before and the rest is spun, so a tick's time step is the
+            // step plus a few microseconds (periodic effects count on it).
+            let step = std::time::Duration::from_nanos(1_000_000_000 / 30);
+            let mut last = std::time::Instant::now();
             // How long each tick takes (spec 13): the panel each second, a
             // `perf:` line every 10 s.
             let mut perf = perf::Perf::default();
             loop {
-                every.tick().await;
+                let next = last + step;
+                let early = next - std::time::Duration::from_micros(1500);
+                if early > std::time::Instant::now() {
+                    tokio::time::sleep_until(early.into()).await;
+                }
+                while std::time::Instant::now() < next {
+                    std::hint::spin_loop();
+                }
                 let start = std::time::Instant::now();
+                last = start;
                 settings.hub.tick();
                 let end = std::time::Instant::now();
                 let due = perf.tick(end - start, end, || settings.hub.perf_counts());
@@ -486,6 +511,11 @@ fn build_registries(assets: Option<String>, capture: Option<&[(u32, Vec<u8>)]>) 
     match registries::physics::table(&ctx) {
         Ok(t) => extras.push((crate::support::TABLE.to_string(), t.into_bytes())),
         Err(e) => warn!("physics table not built: {e}"),
+    }
+    // What the server needs of entity effects beyond their packets.
+    match registries::entity_effects::server_table(&ctx) {
+        Ok(t) => extras.push((crate::effects::TABLE.to_string(), t.into_bytes())),
+        Err(e) => warn!("effects table not built: {e}"),
     }
     // Interaction types as the server runs them.
     match registries::interactions::server_table(&ctx) {

@@ -135,6 +135,8 @@ struct Entry {
     placed_ops: std::collections::HashSet<(i32, String, i32)>,
     /// The interaction chains it runs (spec 18).
     chains: crate::chains::Manager,
+    /// The effects active on it (spec 19).
+    effects: crate::effects::Controller,
     /// The movement states the client last reported.
     movement: proto::MovementStates,
 }
@@ -288,6 +290,7 @@ pub struct Hub {
     stat_types: crate::stats::Types,
     /// Interactions and root interactions as the server runs them.
     chains: crate::chains::Book,
+    effects: crate::effects::Book,
 }
 
 /// Who gets a player's component update.
@@ -995,6 +998,11 @@ impl Hub {
         600.0
     }
 
+    pub fn with_effects(mut self, b: crate::effects::Book) -> Self {
+        self.effects = b;
+        self
+    }
+
     pub fn with_chains(mut self, b: crate::chains::Book) -> Self {
         self.chains = b;
         self
@@ -1157,8 +1165,8 @@ impl Hub {
             e.stats
                 .minimize(t, i as usize, crate::stats::Predictable::Own);
         }
-        // Effects give none yet.
-        e.stats.apply_summed(t, "Effect", &[]);
+        e.stats
+            .apply_summed(t, "Effect", &e.effects.modifiers(&self.effects));
         let mut sums = Vec::new();
         for slot in 0..4 {
             let Some(st) = e.inv.get(inventory::ARMOR, slot) else {
@@ -1423,6 +1431,7 @@ impl Hub {
                     no_physics: false,
                     placed_ops: Default::default(),
                     chains: Default::default(),
+                    effects: Default::default(),
                     movement: Default::default(),
                     inv_dirty: Default::default(),
                 },
@@ -4767,6 +4776,38 @@ impl crate::chains::Host for ChainHost<'_> {
         }
     }
 
+    fn apply_effect(&mut self, effect: i32, duration: Option<f32>) {
+        let (book, types) = (&self.hub.effects, &self.hub.stat_types);
+        let Some(e) = self.g.players.get_mut(&self.pid) else {
+            return;
+        };
+        let who = StatWho {
+            creative: e.creative,
+            sprinting: e.sprinting,
+            gliding: e.gliding,
+        };
+        let ok = book
+            .get(effect)
+            .is_some_and(|x| e.stats.met(types, &who, &x.conditions));
+        if e.effects.add(book, effect, duration, ok) {
+            e.mods_dirty = true;
+        }
+    }
+
+    fn has_effect(&self, effect: i32) -> bool {
+        self.player().is_some_and(|e| e.effects.has(effect))
+    }
+
+    fn clear_effect(&mut self, effect: i32) {
+        let Some(how) = self.hub.effects.get(effect).map(|x| x.removal) else {
+            return;
+        };
+        if let Some(e) = self.g.players.get_mut(&self.pid) {
+            e.effects.remove(effect, how);
+            e.mods_dirty = true;
+        }
+    }
+
     fn stat(&self, index: i32) -> Option<(f32, f32, f32)> {
         let e = self.player()?;
         let i = usize::try_from(index).ok()?;
@@ -5201,7 +5242,11 @@ impl Hub {
         self.world_step(|hub, g, ground, out| {
             hub.send_player_updates(g, out);
             g.in_tick = true;
+            // Effects tick before the chains that may add new ones; their
+            // updates go out after.
+            hub.effects_step(g, dt);
             hub.chains_step(g, ground, dt, out);
+            hub.effects_updates(g);
             let todo = std::mem::take(&mut g.ticking);
             for (sec, index) in todo {
                 hub.check_support(g, ground, block_of(sec, index), out);
@@ -5218,6 +5263,58 @@ impl Hub {
             g.in_tick = false;
             g.tick += 1;
         });
+    }
+
+    /// Every player's effects run one tick (spec 19): their stat changes,
+    /// the ones that end, and the updates for viewers.
+    fn effects_step(&self, g: &mut Inner, dt: f32) {
+        use crate::stats::Predictable::All;
+        let types = &self.stat_types;
+        for e in g.players.values_mut() {
+            if !e.effects.is_empty() {
+                let who = StatWho {
+                    creative: e.creative,
+                    sprinting: e.sprinting,
+                    gliding: e.gliding,
+                };
+                let Entry { effects, stats, .. } = e;
+                let mut changes = Vec::new();
+                let left = effects.tick(
+                    &self.effects,
+                    dt,
+                    |x| stats.met(types, &who, &x.conditions),
+                    |list, percent| changes.push((list.to_vec(), percent)),
+                );
+                for (list, percent) in changes {
+                    for (i, amount) in list {
+                        let Ok(i) = usize::try_from(i) else { continue };
+                        let amount = match (percent, stats.max(i), stats.min(i)) {
+                            (true, Some(max), Some(min)) => amount * (max - min) / 100.0,
+                            _ => amount,
+                        };
+                        stats.add(types, i, amount, All);
+                    }
+                }
+                if left {
+                    e.mods_dirty = true;
+                }
+            }
+        }
+    }
+
+    /// The effect changes of the tick, for every viewer.
+    fn effects_updates(&self, g: &mut Inner) {
+        let mut updates = Vec::new();
+        for (pid, e) in g.players.iter_mut() {
+            if let Some(u) = e.effects.take_changes() {
+                updates.push((
+                    *pid,
+                    Audience::All,
+                    proto::ComponentUpdate::EntityEffectsUpdate(Box::new(u)),
+                ));
+            }
+        }
+        g.stat_updates.extend(updates);
     }
 
     /// Every player's interaction chains run one tick (spec 18); the

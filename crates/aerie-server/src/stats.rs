@@ -127,7 +127,7 @@ pub struct Types {
     pub sprint_delay: Option<(usize, f32)>,
 }
 
-fn conds(v: Option<&Value>) -> Vec<Cond> {
+pub fn conds(v: Option<&Value>) -> Vec<Cond> {
     v.and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -637,7 +637,7 @@ impl StatMap {
         }
     }
 
-    fn met(&self, types: &Types, who: &impl Who, conds: &[Cond]) -> bool {
+    pub fn met(&self, types: &Types, who: &impl Who, conds: &[Cond]) -> bool {
         conds.iter().all(|c| {
             let v = match &c.kind {
                 Kind::Alive => who.alive(),

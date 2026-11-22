@@ -226,6 +226,23 @@ pub enum Kind {
         percent: bool,
         ability_cost: bool,
     },
+    /// An entity effect on the entity that runs the chain (other targets:
+    /// not yet): applied (for a duration, or the effect's own when 0),
+    /// tested, cleared.
+    ApplyEffect {
+        effect: i32,
+        duration: f32,
+        user: bool,
+    },
+    EffectCondition {
+        effects: Vec<i32>,
+        all: bool,
+        user: bool,
+    },
+    ClearEffect {
+        effect: i32,
+        user: bool,
+    },
     /// Changes the active hotbar slot: to a fixed slot, or to the chain's
     /// target slot.
     ChangeActiveSlot(i32),
@@ -603,6 +620,23 @@ impl Book {
                 }
             }
             I::ModifyInventoryInteraction(s) => Kind::ModifyInventory(s.clone()),
+            I::ApplyEffectInteraction(s) if ty == "ApplyEffect" => Kind::ApplyEffect {
+                effect: s.effect_id,
+                duration: extra
+                    .get("Duration")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32,
+                user: s.entity_target == p::InteractionTarget::USER,
+            },
+            I::EffectConditionInteraction(s) if ty == "EffectCondition" => Kind::EffectCondition {
+                effects: s.entity_effects.clone(),
+                all: s.r#match == p::Match::ALL,
+                user: s.entity_target == p::InteractionTarget::USER,
+            },
+            I::ClearEntityEffectInteraction(s) if ty == "ClearEntityEffect" => Kind::ClearEffect {
+                effect: s.effect_id,
+                user: s.entity_target == p::InteractionTarget::USER,
+            },
             I::ChangeStatInteraction(s) if ty == "ChangeStat" => Kind::ChangeStat {
                 stats: s.stat_modifiers.clone().unwrap_or_default(),
                 percent: s.value_type == p::ValueType::PERCENT,
@@ -1058,6 +1092,10 @@ pub trait Host {
         percent: bool,
         behaviour: p::ChangeStatBehaviour,
     );
+    /// An effect is put on the entity (`None`: for the effect's own time).
+    fn apply_effect(&mut self, effect: i32, duration: Option<f32>);
+    fn has_effect(&self, effect: i32) -> bool;
+    fn clear_effect(&mut self, effect: i32);
     /// A stat's value, minimum and maximum.
     fn stat(&self, index: i32) -> Option<(f32, f32, f32)>;
     /// The inventory move a slot change was waiting for is made now, and
@@ -2820,6 +2858,34 @@ impl Manager {
                         });
                     if !afford {
                         set(chain, St::FAILED);
+                    }
+                    tail(chain);
+                }
+            }
+            Kind::ApplyEffect {
+                effect,
+                duration,
+                user,
+            } => {
+                if first {
+                    if *user {
+                        host.apply_effect(*effect, (*duration > 0.0).then_some(*duration));
+                    }
+                    tail(chain);
+                }
+            }
+            Kind::EffectCondition { effects, all, user } => {
+                if first {
+                    if *user && effects.iter().any(|&i| host.has_effect(i) != *all) {
+                        set(chain, St::FAILED);
+                    }
+                    tail(chain);
+                }
+            }
+            Kind::ClearEffect { effect, user } => {
+                if first {
+                    if *user {
+                        host.clear_effect(*effect);
                     }
                     tail(chain);
                 }

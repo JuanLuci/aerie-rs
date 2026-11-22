@@ -158,6 +158,56 @@ pub fn effect(ctx: &Ctx, id: &str, a: &Value) -> Result<EntityEffect> {
     })
 }
 
+/// What the server needs of an effect and the packet does not carry: one
+/// line per effect, `index<TAB>{RemovalBehavior, Invulnerable,
+/// RawStatModifiers: [[stat, multiplicative, amount]], ApplyConditions}`.
+pub fn server_table(ctx: &Ctx) -> Result<String> {
+    let store = ctx.store(PATH)?;
+    let order = ctx.order(PATH, &[])?;
+    let idx = ctx.indexes(PATH, &[])?;
+    let mut out = String::new();
+    for (n, k) in order.iter().enumerate() {
+        let i = idx.get(&k.to_lowercase()).copied().unwrap_or(n as i32);
+        let a = store.resolved(k, "EntityEffect");
+        let mut o = serde_json::Map::new();
+        for f in ["RemovalBehavior", "Invulnerable", "ApplyConditions"] {
+            if let Some(v) = a.get(f) {
+                o.insert(f.to_owned(), v.clone());
+            }
+        }
+        let mut raw = Vec::new();
+        for (stat, list) in a
+            .obj("RawStatModifiers")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+        {
+            let s = ctx.index_or(
+                entity_stat_types::PATH,
+                entity_stat_types::BUILTIN,
+                Some(stat),
+                i32::MIN,
+            )?;
+            if s == i32::MIN {
+                continue;
+            }
+            for m in list.as_array().into_iter().flatten() {
+                let mult = m
+                    .str_at("CalculationType")
+                    .is_some_and(|c| c.eq_ignore_ascii_case("Multiplicative"));
+                raw.push(serde_json::json!([s, mult, m.f32_or("Amount", 0.0)]));
+            }
+        }
+        if !raw.is_empty() {
+            o.insert("RawStatModifiers".to_owned(), Value::Array(raw));
+        }
+        if !o.is_empty() {
+            out += &format!("{i}\t{}\n", Value::Object(o));
+        }
+    }
+    Ok(out)
+}
+
 pub fn build(ctx: &Ctx) -> Result<UpdateEntityEffects> {
     let store = ctx.store(PATH)?;
     let order = ctx.order(PATH, &[])?;

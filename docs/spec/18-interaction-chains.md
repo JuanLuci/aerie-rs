@@ -333,6 +333,7 @@ failed) and, after its own logic, jumps to label 0 when it failed.
   least its cost (or, with "less than", below it); a lenient condition
   also passes on a positive value of a stat that can go negative.
   Percent costs compare the stat's fill.
+- **Apply effect**, **effect condition**, **clear effect**: spec 19.
 - **Use entity** (instant, waits for the client): the root the target
   entity gives the chain's type is entered; no entity, out of reach or no
   such root: failed.
@@ -410,8 +411,8 @@ on both servers, same answers:
 - a use chain that never sends its client data: the same first answer and
   the same cancel after the timeout;
 - eating an apple (a made-up client chain: the charge reported after
-  2.6 s): the same states up to the effect step, and the apple taken;
-  from there the effect types are still to do;
+  2.6 s): the same states to the end, the apple taken, the effects of
+  spec 19;
 - hotbar swaps: two accepted, one naming the wrong active slot: the same
   cancel and slot correction;
 - another kind of item moved onto the active slot: the same server chain

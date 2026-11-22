@@ -1566,6 +1566,7 @@ fn clear_tags(i: &mut p::Interaction) {
 pub fn server_table(ctx: &Ctx) -> Result<String> {
     const FIELDS: &[&str] = &[
         "ViewDistance",
+        "Duration",
         "Tool",
         "MatchTool",
         "DefaultOk",
