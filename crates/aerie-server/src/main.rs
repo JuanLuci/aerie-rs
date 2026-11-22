@@ -11,15 +11,18 @@
 
 mod account;
 mod cache;
+mod changes;
 mod chunk;
 mod common;
 mod crafting;
 mod gather;
 mod inventory;
+mod items;
 mod join;
 mod login;
 mod probe;
 mod proxy;
+mod support;
 mod terrain;
 mod tls;
 mod world;
@@ -67,6 +70,9 @@ async fn main() -> Result<()> {
             name: arg(&args, "--name"),
             chat: arg(&args, "--chat"),
             send: arg(&args, "--send"),
+            goto: arg(&args, "--goto"),
+            use_block: arg(&args, "--use-block"),
+            after: arg(&args, "--after"),
             interactions: arg(&args, "--interactions").map(PathBuf::from),
         };
         return probe::run(upstream, capture, opts).await;
@@ -225,6 +231,20 @@ async fn main() -> Result<()> {
         .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
         .unwrap_or_default();
     info!("{} items used up by interactions", consume.lines().count());
+    let physics = extras
+        .iter()
+        .find(|(n, _)| n == support::TABLE)
+        .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+        .unwrap_or_default();
+    let rules = support::Rules::new(&registries, &physics);
+    let eye_height = extras
+        .iter()
+        .find(|(n, _)| n == join::PLAYER_MODEL)
+        .and_then(|(_, b)| {
+            <aerie_protocol::proto::Model as aerie_protocol::wire::Wire>::decode(b, 0).ok()
+        })
+        .map_or(1.6, |(m, _)| m.eye_height as f64);
+    info!("block support: {} block types", rules.len());
     let (r, i, b) = book.counts();
     info!("crafting: {r} recipes, {i} items, {b} benches");
     let settings = Arc::new(login::Settings {
@@ -244,7 +264,9 @@ async fn main() -> Result<()> {
             let hub = world::Hub::with_names(blocks, block_names)
                 .with_gather(gather)
                 .with_book(book)
-                .with_consume(&consume);
+                .with_consume(&consume)
+                .with_rules(rules)
+                .with_eye_height(eye_height);
             // Changed blocks are kept on disk (`--world DIR`, default `aerie-world`).
             let dir = PathBuf::from(arg(&args, "--world").unwrap_or_else(|| "aerie-world".into()));
             if checking { hub } else { hub.with_world(dir)? }
@@ -260,6 +282,19 @@ async fn main() -> Result<()> {
             .unwrap_or(0xae1e),
     });
     let endpoint = quinn::Endpoint::server(server_config, bind)?;
+    // The world ticks 30 times a second (spec 10).
+    {
+        let settings = settings.clone();
+        tokio::spawn(async move {
+            let mut every =
+                tokio::time::interval(std::time::Duration::from_nanos(1_000_000_000 / 30));
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                every.tick().await;
+                settings.hub.tick();
+            }
+        });
+    }
     let mode = if settings.account.is_some() {
         "authenticated"
     } else {
@@ -379,6 +414,11 @@ fn build_registries(assets: Option<String>, capture: Option<&[(u32, Vec<u8>)]>) 
     match registries::consume::table(&ctx) {
         Ok(t) => extras.push(("consume".to_string(), t.into_bytes())),
         Err(e) => warn!("consume table not built: {e}"),
+    }
+    // Block support: drop types, physics drops, drop lists.
+    match registries::physics::table(&ctx) {
+        Ok(t) => extras.push((crate::support::TABLE.to_string(), t.into_bytes())),
+        Err(e) => warn!("physics table not built: {e}"),
     }
     // Crafting benches.
     match registries::benches::table(&ctx) {

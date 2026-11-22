@@ -149,18 +149,6 @@ impl Generator {
         }
         s
     }
-
-    /// `SetColumn.heightmap` of column (cx, cz): the grass height, index
-    /// z * 32 + x.
-    pub fn heightmap(&self, cx: i32, cz: i32) -> Vec<i32> {
-        let mut v = Vec::with_capacity(SIZE * SIZE);
-        for z in 0..SIZE as i32 {
-            for x in 0..SIZE as i32 {
-                v.push(self.height(cx * SIZE as i32 + x, cz * SIZE as i32 + z));
-            }
-        }
-        v
-    }
 }
 
 #[cfg(test)]

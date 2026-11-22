@@ -31,6 +31,7 @@ pub mod models;
 pub mod music;
 pub mod particle_spawners;
 pub mod particles;
+pub mod physics;
 pub mod projectile_configs;
 pub mod recipes;
 pub mod resource_types;

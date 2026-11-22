@@ -59,6 +59,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustls",
+ "serde_json",
  "sha2",
  "tokio",
  "tracing",

@@ -65,6 +65,12 @@ pub struct Options {
     pub chat: Option<String>,
     /// Packets to send after the chat lines: `id:hex;id:hex`.
     pub send: Option<String>,
+    /// Then walk (teleport) to `x y z`.
+    pub goto: Option<String>,
+    /// Then use the block at `x y z` (a `Use` interaction chain).
+    pub use_block: Option<String>,
+    /// Packets to send after that: `id:hex;id:hex`.
+    pub after: Option<String>,
     /// A folder of recorded client packets (`--record`): its interaction
     /// chains are sent again once in the world, moved to the block under the
     /// probe's spawn, to see how a server answers them.
@@ -72,7 +78,22 @@ pub struct Options {
 }
 
 /// The interaction chains of a `--record` folder, in order.
-fn recorded_chains(dir: &std::path::Path) -> Result<Vec<proto::SyncInteractionChains>> {
+/// The interaction chains of a recording, in order, with the time each
+/// was received (milliseconds; when the recording has it).
+fn recorded_chains(
+    dir: &std::path::Path,
+) -> Result<Vec<(Option<u64>, proto::SyncInteractionChains)>> {
+    let mut times: std::collections::HashMap<u32, u64> = Default::default();
+    if let Ok(index) = std::fs::read_to_string(dir.join("index.tsv")) {
+        for l in index.lines() {
+            let w: Vec<&str> = l.split('\t').collect();
+            if let (Some(seq), Some(ms)) = (w.first(), w.get(5))
+                && let (Ok(seq), Ok(ms)) = (seq.parse(), ms.parse())
+            {
+                times.insert(seq, ms);
+            }
+        }
+    }
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.to_string_lossy().contains("-290-"))
@@ -80,7 +101,18 @@ fn recorded_chains(dir: &std::path::Path) -> Result<Vec<proto::SyncInteractionCh
     files.sort();
     files
         .iter()
-        .map(|f| Ok(proto::SyncInteractionChains::decode(&std::fs::read(f)?, 0)?.0))
+        .map(|f| {
+            let seq = f
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.split('-').next())
+                .and_then(|n| n.parse::<u32>().ok());
+            let at = seq.and_then(|s| times.get(&s).copied());
+            Ok((
+                at,
+                proto::SyncInteractionChains::decode(&std::fs::read(f)?, 0)?.0,
+            ))
+        })
         .collect()
 }
 
@@ -268,12 +300,80 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
                     frame::encode(id.parse()?, &bytes, &mut w)?;
                     later.push(w);
                 }
+                if let Some(g) = &opts.goto {
+                    let v: Vec<f64> = g
+                        .split_whitespace()
+                        .filter_map(|x| x.parse().ok())
+                        .collect();
+                    if let [x, y, z] = v[..] {
+                        let mut payload = Vec::new();
+                        proto::ClientMovement {
+                            absolute_position: Some(proto::Position { x, y, z }),
+                            ..Default::default()
+                        }
+                        .encode(&mut payload)?;
+                        let mut w = Vec::new();
+                        frame::encode(108, &payload, &mut w)?;
+                        later.push(w);
+                    }
+                }
+                if let Some(b) = &opts.use_block {
+                    let v: Vec<i32> = b
+                        .split_whitespace()
+                        .filter_map(|x| x.parse().ok())
+                        .collect();
+                    if let [x, y, z] = v[..] {
+                        let chain = proto::SyncInteractionChain {
+                            initial: true,
+                            interaction_type: proto::InteractionType::USE,
+                            chain_id: 1,
+                            active_hotbar_slot: 0,
+                            active_utility_slot: -1,
+                            active_tools_slot: -1,
+                            override_root_interaction: i32::MIN,
+                            equip_slot: -1,
+                            operation_base_index: 0,
+                            state: proto::InteractionState::NOT_FINISHED,
+                            data: Some(proto::InteractionChainData {
+                                entity_id: -1,
+                                block_position: Some(proto::BlockPosition { x, y, z }),
+                                target_slot: i32::MIN,
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        };
+                        let mut payload = Vec::new();
+                        proto::SyncInteractionChains {
+                            updates: vec![chain],
+                        }
+                        .encode(&mut payload)?;
+                        let mut w = Vec::new();
+                        frame::encode(290, &payload, &mut w)?;
+                        later.push(w);
+                    }
+                }
+                for p in opts.after.iter().flat_map(|c| c.split(';')) {
+                    if p.trim() == "wait" {
+                        // Nothing sent: one more pause.
+                        later.push(Vec::new());
+                        continue;
+                    }
+                    let Some((id, hex)) = p.trim().split_once(':') else {
+                        continue;
+                    };
+                    let bytes: Vec<u8> = (0..hex.len() / 2)
+                        .filter_map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok())
+                        .collect();
+                    let mut w = Vec::new();
+                    frame::encode(id.parse()?, &bytes, &mut w)?;
+                    later.push(w);
+                }
                 if !later.is_empty() {
                     let tx = out_tx.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(Duration::from_secs(4)).await;
                         for w in later {
-                            if tx.send(w).is_err() {
+                            if !w.is_empty() && tx.send(w).is_err() {
                                 break;
                             }
                             tokio::time::sleep(Duration::from_millis(700)).await;
@@ -313,7 +413,7 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
                     );
                     let first = chains
                         .iter()
-                        .flat_map(|m| &m.updates)
+                        .flat_map(|m| &m.1.updates)
                         .find_map(|c| c.data.as_ref()?.block_position.clone());
                     if let Some(first) = first {
                         let d = (target.0 - first.x, target.1 - first.y, target.2 - first.z);
@@ -323,8 +423,18 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
                         );
                         let list = std::mem::take(&mut chains);
                         let tx = out_tx.clone();
+                        // Chat lines (a game mode, say) go first.
+                        let wait = if opts.chat.is_some() { 8 } else { 0 };
                         tokio::spawn(async move {
-                            for mut m in list {
+                            tokio::time::sleep(Duration::from_secs(wait)).await;
+                            let mut last: Option<u64> = None;
+                            for (at, mut m) in list {
+                                // The recorded pace when known.
+                                if let (Some(a), Some(l)) = (at, last) {
+                                    tokio::time::sleep(Duration::from_millis(a.saturating_sub(l)))
+                                        .await;
+                                }
+                                last = at.or(last);
                                 for c in &mut m.updates {
                                     shift(c, d);
                                 }
@@ -336,7 +446,9 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
                                 {
                                     break;
                                 }
-                                tokio::time::sleep(Duration::from_millis(60)).await;
+                                if at.is_none() {
+                                    tokio::time::sleep(Duration::from_millis(60)).await;
+                                }
                             }
                         });
                     }

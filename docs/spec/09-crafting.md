@@ -80,9 +80,66 @@ pocket window, the 2D sound `SFX_Player_Craft_Item_Inventory` (UI). A bench
 plays its `CompletedSoundEventId` where it stands. Missing inputs give a
 `Notification` (`server.general.crafting.missingIngredient`).
 
-Recipes with `TimeSeconds` above 0 are queued at benches on the official
-server, with progress in the window data; Aerie makes them at once for
-now.
+### Queue (timed recipes, structural benches)
+
+The pocket window always crafts at once. A `Crafting` bench crafts at once
+when the recipe's `TimeSeconds` is 0, else queues it; a structural bench
+always queues. The quantity asked is first capped at what the inventory
+could hold of the primary output (45 slots × its max stack ÷ the output
+quantity). A crafting bench (not the pocket window) refuses a recipe while
+the queue's first job is a different one. At most 32 jobs.
+
+Each tick the player's queue runs with the tick's measured length: when
+the first job has no unit in progress, a unit starts and its inputs are
+taken (from the inventory, or for a structural bench from its input slot;
+not in creative); missing inputs drop the job with the missing-ingredient
+notification. The running unit's time grows; the window data gets
+`progress` (0–1), and an `UpdateWindow` goes out when it changed by more
+than 5 %, half a second passed, it reached 1, went back, or the first
+time. A finished unit gives one unit's outputs (what does not fit drops),
+the leftover time runs the next unit in the same tick, and `queueSize`
+(units left in the queue) is updated; when the queue empties the bench
+block goes back to its `default` state.
+
+When a bench craft is accepted the bench block switches to its interaction
+state `CraftCompleted` (queued) or `CraftCompletedInstant`, and the bench's
+`CompletedSoundEventId` plays at the block (SFX). A state switch changes
+the block without particles. The extra resources are sent again with the
+next window update.
+
+Windows go out once per tick when changed (`UpdateWindow`: id, data, the
+window's own slots for a structural window, the extra resources when they
+were refreshed), after the inventory.
+
+### Structural benches
+
+`StructuralCrafting` benches (builder's bench) open a `StructuralCrafting`
+window whose data has, after the common bench keys, `selected` (0),
+`allowBlockGroupCycling`, `alwaysShowInventoryHints`, then the open keys,
+`memoriesPerLevel` and `inventoryHints` (indexes over hotbar then storage of
+the stacks some bench recipe takes as first input, refreshed when those
+change). The window holds 65 slots: an input slot (0) that only takes
+items some option can be made from, and 64 option slots that take and give
+nothing. Putting an input lists the recipes of this bench with exactly
+that one input: header categories first, then by the bench's category
+order, then by id; each fills an option slot with its first output;
+`dividerIndex` (how many are in header categories) and `optionSlotRecipes`
+join the data. `SelectSlotAction{slot}` sets `selected`. A craft queues
+the selected option's recipe paid from the input slot and plays the
+primary output item's `Drop` sound (UI). `ChangeBlockAction{down}` (when
+cycling is allowed) turns the input into the previous or next block of its
+block group, keeping the quantity, with that item's `Drop` sound.
+
+### Closing a bench
+
+The client's `CloseWindow` is echoed; the bench block goes back to its
+`default` state; the queue is cancelled (the running unit's inputs come
+back) and, if there was one, the bench's `FailedSoundEventId` plays; the
+close sound plays; a structural input goes back to the inventory (or
+drops).
+
+Processing benches (furnace, campfire), diagram benches, tier upgrades,
+chests near benches and known recipes are not done yet.
 
 ## Items used up by an interaction
 

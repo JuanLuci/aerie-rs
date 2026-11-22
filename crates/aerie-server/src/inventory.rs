@@ -66,24 +66,26 @@ impl Inventory {
         }
     }
 
-    /// Adds to stacks of the item, then free slots, hotbar first then
-    /// storage. Returns what did not fit.
-    pub fn add(&mut self, item: &str, mut n: i32) -> i32 {
-        for sec in [HOTBAR, STORAGE] {
+    /// Adds as the official pickup does (default preferences): existing
+    /// stacks of the item over hotbar, storage, backpack in slot order, then
+    /// empty slots in that order, each up to `max`. Returns what did not fit.
+    pub fn add(&mut self, item: &str, mut n: i32, max: i32) -> i32 {
+        let max = max.max(1);
+        for sec in [HOTBAR, STORAGE, -9] {
             let Some(s) = self.section(sec) else { continue };
             for x in s.iter_mut().flatten() {
-                if x.0 == item && x.1 < STACK && n > 0 {
-                    let k = n.min(STACK - x.1);
+                if x.0 == item && x.1 < max && n > 0 {
+                    let k = n.min(max - x.1);
                     x.1 += k;
                     n -= k;
                 }
             }
         }
-        for sec in [HOTBAR, STORAGE] {
+        for sec in [HOTBAR, STORAGE, -9] {
             let Some(s) = self.section(sec) else { continue };
             for x in s.iter_mut() {
                 if x.is_none() && n > 0 {
-                    let k = n.min(STACK);
+                    let k = n.min(max);
                     *x = Some((item.to_owned(), k));
                     n -= k;
                 }
@@ -189,9 +191,37 @@ impl Inventory {
         }
     }
 
+    /// Every stack, section by section.
+    pub fn all(&self) -> Vec<(String, i32)> {
+        self.sections
+            .iter()
+            .flat_map(|(_, v)| v.iter().flatten().cloned())
+            .collect()
+    }
+
+    /// Sections whose content differs from `before`'s.
+    pub fn changed_since(&self, before: &Inventory) -> Vec<i32> {
+        self.sections
+            .iter()
+            .zip(&before.sections)
+            .filter(|(a, b)| a.1 != b.1)
+            .map(|(a, _)| a.0)
+            .collect()
+    }
+
     /// The whole inventory as `UpdatePlayerInventory`.
     pub fn packet(&self) -> proto::UpdatePlayerInventory {
+        let all: Vec<i32> = self.sections.iter().map(|(i, _)| *i).collect();
+        self.packet_of(&all)
+    }
+
+    /// `UpdatePlayerInventory` with only the given sections (the others
+    /// null), as the official server sends changes once per tick.
+    pub fn packet_of(&self, which: &[i32]) -> proto::UpdatePlayerInventory {
         let sec = |id: i32| {
+            if !which.contains(&id) {
+                return None;
+            }
             let (_, v) = self.sections.iter().find(|(i, _)| *i == id).unwrap();
             Some(proto::InventorySection {
                 items: Some(
@@ -264,9 +294,9 @@ mod tests {
     #[test]
     fn add_move_swap_save() {
         let mut inv = Inventory::default();
-        assert_eq!(inv.add("Wood", 5), 0);
+        assert_eq!(inv.add("Wood", 5, 100), 0);
         assert_eq!(inv.get(HOTBAR, 0), Some(("Wood".into(), 5)));
-        inv.add("Stone", 3);
+        inv.add("Stone", 3, 100);
         inv.move_stack((HOTBAR, 0), 2, (STORAGE, 4));
         assert_eq!(inv.get(HOTBAR, 0), Some(("Wood".into(), 3)));
         assert_eq!(inv.get(STORAGE, 4), Some(("Wood".into(), 2)));

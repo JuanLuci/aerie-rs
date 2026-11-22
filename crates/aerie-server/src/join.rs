@@ -54,9 +54,6 @@ mod id {
 const BUILT_READY_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long to wait for `ClientReady` before sending the world anyway.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
-/// When block changes from interactions are sent again (see
-/// `Hub::interactions`).
-const REASSERT: [Duration; 2] = [Duration::from_millis(1500), Duration::from_secs(4)];
 
 /// The official server pings about every 5 s (spec 05).
 const PING_EVERY: Duration = Duration::from_secs(5);
@@ -104,7 +101,7 @@ pub const TIME_SETTINGS: &str = "time_settings";
 pub const MOVEMENT_SETTINGS: &str = "movement_settings";
 
 /// Packet ids of the world settings sent with the player.
-mod settings_id {
+pub(crate) mod settings_id {
     pub const NETWORK_TICK: u32 = 5;
     pub const UPDATE_MOVEMENT_SETTINGS: u32 = 110;
     pub const SET_UPDATE_RATE: u32 = 29;
@@ -528,7 +525,7 @@ fn uniform_tint(rgba: [u8; 4]) -> Vec<i8> {
 const GRASS_TINT: [u8; 4] = [0x28, 0x95, 0x5b, 0xff];
 
 /// Block changes inside a section: (x, y, z within it, block id).
-pub type Overlay<'a> = &'a dyn Fn(i32, i32, i32) -> Vec<(usize, usize, usize, i32)>;
+pub type Overlay<'a> = &'a dyn Fn(i32, i32, i32) -> Vec<(usize, usize, usize, i32, i32, i32)>;
 
 /// One column of the built world, as the official server sends it: its
 /// `SetColumn`, then each section with its environment and fluids. The
@@ -539,29 +536,48 @@ fn column(
     layers: &[i32],
     generator: Option<&crate::terrain::Generator>,
     overlay: Overlay,
+    opaque: &dyn Fn(i32) -> bool,
 ) -> Result<Vec<Out>> {
-    let top = (layers.len() as i32 - 1).max(0);
-    let mut out = vec![Out::new(
-        id::SET_COLUMN,
-        &proto::SetColumn {
-            x: cx,
-            z: cz,
-            // Highest solid layer of each column (index z * 32 + x).
-            heightmap: match generator {
-                Some(g) => g.heightmap(cx, cz),
-                None => vec![top; 1024],
-            },
-            tintmap: uniform_tint(GRASS_TINT),
-        },
-    )?];
+    let mut sections = Vec::new();
     for cy in 0..BUILT_SECTIONS {
         let mut section = match generator {
             Some(g) => g.section(cx, cy, cz),
             None => chunk::flat(cy, layers),
         };
-        for (x, y, z, b) in overlay(cx, cy, cz) {
+        for (x, y, z, b, r, f) in overlay(cx, cy, cz) {
             section.set(x, y, z, b);
+            section.rotations[crate::chunk::index(x, y, z)] = r;
+            section.fillers[crate::chunk::index(x, y, z)] = f;
         }
+        sections.push(section);
+    }
+    // The highest block that is not transparent in each column (index
+    // z * 32 + x; none: i32::MIN), as the official heightmap (spec 10).
+    let mut heightmap = vec![i32::MIN; 1024];
+    for z in 0..chunk::SIZE {
+        for x in 0..chunk::SIZE {
+            'col: for (cy, s) in sections.iter().enumerate().rev() {
+                for y in (0..chunk::SIZE).rev() {
+                    let b = s.blocks[chunk::index(x, y, z)];
+                    if b != 0 && opaque(b) {
+                        heightmap[z * chunk::SIZE + x] = (cy * chunk::SIZE + y) as i32;
+                        break 'col;
+                    }
+                }
+            }
+        }
+    }
+    let mut out = vec![Out::new(
+        id::SET_COLUMN,
+        &proto::SetColumn {
+            x: cx,
+            z: cz,
+            heightmap,
+            tintmap: uniform_tint(GRASS_TINT),
+        },
+    )?];
+    for (cy, section) in sections.into_iter().enumerate() {
+        let cy = cy as i32;
         let data = section.encode();
         out.push(Out::new(
             id::SET_CHUNK,
@@ -618,6 +634,8 @@ fn built(
     captured: Option<Captured>,
     start: (f64, f64, f64),
     overlay: Overlay,
+    opaque: &dyn Fn(i32) -> bool,
+    damage: &dyn Fn(i32, i32) -> Vec<(u32, Vec<u8>)>,
 ) -> Result<World> {
     let (ccx, ccz) = column_of(start);
     let join = Out::new(
@@ -670,7 +688,12 @@ fn built(
         .collect();
     area.sort_by_key(|(x, z)| (x - ccx).pow(2) + (z - ccz).pow(2));
     for (cx, cz) in area {
-        after.extend(column(cx, cz, layers, generator, overlay)?);
+        after.extend(column(cx, cz, layers, generator, overlay, opaque)?);
+        after.extend(
+            damage(cx, cz)
+                .into_iter()
+                .map(|(id, payload)| Out { id, payload }),
+        );
     }
     after.push(Out {
         id: id::CLEAR_WORLD_MAP,
@@ -709,6 +732,7 @@ struct Recorder {
     dir: std::path::PathBuf,
     seq: u32,
     kept: BTreeMap<u32, u32>,
+    start: std::time::Instant,
 }
 
 /// Packets of each kind kept by `--record`.
@@ -724,17 +748,26 @@ impl Seen {
         } else {
             RECORD_EACH
         };
-        if *n >= limit {
+        // Never cut: windows and inventory actions, and interaction chains
+        // that start something other than a left click (using a bench,
+        // eating, placing), which the official comparison needs.
+        // Every interaction chain packet, so a recording can be replayed
+        // whole (with its timing) against the official server.
+        let always = (172..=176).contains(&f.id)
+            || (202..=204).contains(&f.id)
+            || f.id == world::id::SYNC_INTERACTION_CHAINS;
+        if *n >= limit && !always {
             return;
         }
         *n += 1;
         let name = table::info(f.id).map_or("?", |i| i.name);
         let file = format!("{:04}-{}-{name}.bin", r.seq, f.id);
         let line = format!(
-            "{}\t{}\t{name}\t{}\tfrom-client\n",
+            "{}\t{}\t{name}\t{}\tfrom-client\t{}\n",
             r.seq,
             f.id,
-            f.payload.len()
+            f.payload.len(),
+            r.start.elapsed().as_millis()
         );
         r.seq += 1;
         let ok = std::fs::write(r.dir.join(&file), &f.payload).and_then(|_| {
@@ -910,6 +943,8 @@ async fn in_world(
                     captured,
                     start,
                     &overlay,
+                    &|b| hub.opaque(b),
+                    &|x, z| hub.damage_packets(x, z),
                 )?,
                 false,
             )
@@ -933,7 +968,6 @@ async fn in_world(
     }
 
     let mut ready = Ready::default();
-    let mut reassert: Vec<(tokio::time::Instant, world::BlockChange)> = Vec::new();
     let mut seen = Seen::default();
     if let Some(dir) = &settings.record {
         let dir = dir.join(&player.username);
@@ -944,6 +978,7 @@ async fn in_world(
                     dir,
                     seq: 0,
                     kept: BTreeMap::new(),
+                    start: std::time::Instant::now(),
                 });
             }
             Err(e) => warn!("cannot record into {}: {e}", dir.display()),
@@ -968,7 +1003,7 @@ async fn in_world(
                 break;
             }
         };
-        if !client_packet(&f, hub, client_id, &mut ready, &mut seen, &mut reassert) {
+        if !client_packet(&f, hub, client_id, &mut ready, &mut seen) {
             return Ok(());
         }
     }
@@ -989,7 +1024,7 @@ async fn in_world(
         "world sent: {} game, {} chunk and {} map packets",
         sent[0], sent[1], sent[2]
     );
-    hub.starter_kit(client_id)?;
+    hub.send_inventory(client_id)?;
     hub.enter_world(
         client_id,
         seen_by_others(client_id, &settings.player, &player.username, start)?,
@@ -1008,7 +1043,6 @@ async fn in_world(
     // In the world: ping, deliver what other players cause, and read the client.
     let mut ping = tokio::time::interval(PING_EVERY);
     let mut report = tokio::time::interval(Duration::from_secs(10));
-    let mut tick = tokio::time::interval(Duration::from_millis(250));
     // Columns this client has: the built area at first; more as it moves.
     let mut columns: std::collections::HashSet<(i32, i32)> = if replayed {
         Default::default()
@@ -1024,7 +1058,7 @@ async fn in_world(
     loop {
         tokio::select! {
             f = g.next() => {
-                if !client_packet(&f?, hub, client_id, &mut ready, &mut seen, &mut reassert) {
+                if !client_packet(&f?, hub, client_id, &mut ready, &mut seen) {
                     break;
                 }
             }
@@ -1041,15 +1075,6 @@ async fn in_world(
                 ping_id += 1;
                 g.send_raw(id::PING, &ping_packet(ping_id)?).await?;
             }
-            _ = tick.tick(), if !reassert.is_empty() => {
-                let now = tokio::time::Instant::now();
-                for (_, ((x, y, z), b)) in reassert.extract_if(.., |(t, _)| *t <= now) {
-                    // Only if nothing changed it since.
-                    if hub.block_at(x, y, z) == Some(b) {
-                        hub.set_block(x, y, z, b)?;
-                    }
-                }
-            }
             _ = stream_tick.tick(), if !replayed => {
                 // Columns around the player that it does not have yet, the
                 // nearest first, a few per round.
@@ -1062,9 +1087,14 @@ async fn in_world(
                     todo.sort_by_key(|(x, z)| (x - pcx).pow(2) + (z - pcz).pow(2));
                     for (cx, cz) in todo.into_iter().take(STREAM_PER_ROUND) {
                         let overlay = |x, y, z| hub.changes_in(x, y, z);
-                        for p in column(cx, cz, &layers, generator.as_ref(), &overlay)? {
+                        for p in column(cx, cz, &layers, generator.as_ref(), &overlay, &|b| hub.opaque(b))? {
                             let mut wire = Vec::new();
                             frame::encode(p.id, &p.payload, &mut wire)?;
+                            streams.chunks.write_all(&wire).await?;
+                        }
+                        for (id, payload) in hub.damage_packets(cx, cz) {
+                            let mut wire = Vec::new();
+                            frame::encode(id, &payload, &mut wire)?;
                             streams.chunks.write_all(&wire).await?;
                         }
                         columns.insert((cx, cz));
@@ -1089,14 +1119,7 @@ async fn in_world(
 }
 
 /// Handles one client packet in the world. `false` when the client left.
-fn client_packet(
-    f: &Frame,
-    hub: &Hub,
-    client_id: i32,
-    ready: &mut Ready,
-    seen: &mut Seen,
-    reassert: &mut Vec<(tokio::time::Instant, world::BlockChange)>,
-) -> bool {
+fn client_packet(f: &Frame, hub: &Hub, client_id: i32, ready: &mut Ready, seen: &mut Seen) -> bool {
     seen.record(f);
     let handled = match f.id {
         world::id::CLIENT_MOVEMENT => Some(hub.movement(client_id, &f.payload)),
@@ -1111,16 +1134,7 @@ fn client_packet(
         world::id::SET_CREATIVE_ITEM | world::id::SMART_GIVE_CREATIVE_ITEM => {
             Some(hub.creative_item(client_id, f.id, &f.payload))
         }
-        world::id::SYNC_INTERACTION_CHAINS => {
-            Some(hub.interactions(client_id, &f.payload).map(|c| {
-                let now = tokio::time::Instant::now();
-                for ch in c {
-                    for after in REASSERT {
-                        reassert.push((now + after, ch));
-                    }
-                }
-            }))
-        }
+        world::id::SYNC_INTERACTION_CHAINS => Some(hub.interactions(client_id, &f.payload)),
         _ => None,
     };
     if let Some(r) = handled {
@@ -1183,6 +1197,8 @@ mod tests {
             None,
             SPAWN,
             &|_, _, _| Vec::new(),
+            &|_| true,
+            &|_, _| Vec::new(),
         )
         .unwrap();
         let solid = w

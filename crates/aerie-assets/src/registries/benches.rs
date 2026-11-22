@@ -2,11 +2,13 @@
 //! (`Type`, `Id`, `Categories` with `Id`, `Icon`, `Name`).
 //!
 //! Written as text lines for the start-up cache: `W block type id open
-//! close completed` (type is the `BenchType` number, then the sound event
-//! indexes of `LocalOpenSoundEventId`, `LocalCloseSoundEventId` and
-//! `CompletedSoundEventId`, 0 for none), per category in order `C block id
-//! icon name` (`-` for none), and `S name index` for the sounds crafting
-//! plays outside benches.
+//! close completed failed` (type is the `BenchType` number, then the sound
+//! event indexes of `LocalOpenSoundEventId`, `LocalCloseSoundEventId`,
+//! `CompletedSoundEventId` and `FailedSoundEventId`, 0 for none), per category in order `C block id
+//! icon name` (`-` for none; structural benches list names only), `H block
+//! category` per header category, `F block cycling hints` (structural
+//! benches' `AllowBlockGroupCycling` and `AlwaysShowInventoryHints`), and
+//! `S name index` for the sounds crafting plays outside benches.
 
 use aerie_protocol::proto::BenchType;
 use serde_json::Value;
@@ -42,11 +44,12 @@ pub fn table(ctx: &Ctx) -> Result<String> {
             })
         };
         out += &format!(
-            "W {k} {} {id} {} {} {}\n",
+            "W {k} {} {id} {} {} {} {}\n",
             ty.0,
             sound("LocalOpenSoundEventId")?,
             sound("LocalCloseSoundEventId")?,
             sound("CompletedSoundEventId")?,
+            sound("FailedSoundEventId")?,
         );
         for c in b
             .get("Categories")
@@ -54,13 +57,27 @@ pub fn table(ctx: &Ctx) -> Result<String> {
             .into_iter()
             .flatten()
         {
-            out += &format!(
-                "C {k} {} {} {}\n",
-                or_dash(c.str_at("Id")),
-                or_dash(c.str_at("Icon")),
-                or_dash(c.str_at("Name")),
-            );
+            match c {
+                // Structural benches list plain category names.
+                Value::String(id) => out += &format!("C {k} {} - -\n", or_dash(Some(id.clone()))),
+                _ => {
+                    out += &format!(
+                        "C {k} {} {} {}\n",
+                        or_dash(c.str_at("Id")),
+                        or_dash(c.str_at("Icon")),
+                        or_dash(c.str_at("Name")),
+                    )
+                }
+            }
         }
+        for h in b.strings("HeaderCategories").unwrap_or_default() {
+            out += &format!("H {k} {}\n", or_dash(Some(h)));
+        }
+        out += &format!(
+            "F {k} {} {}\n",
+            b.bool_or("AllowBlockGroupCycling", false) as u8,
+            b.bool_or("AlwaysShowInventoryHints", false) as u8
+        );
     }
     for name in SOUNDS {
         let i = super::sound_events::index(ctx, Some(name))?;
@@ -72,4 +89,4 @@ pub fn table(ctx: &Ctx) -> Result<String> {
 }
 
 /// Sounds the official crafting plays outside bench assets.
-pub const SOUNDS: &[&str] = &["SFX_Player_Craft_Item_Inventory"];
+pub const SOUNDS: &[&str] = &["SFX_Player_Craft_Item_Inventory", "SFX_Player_Pickup_Item"];

@@ -31,6 +31,15 @@ pub mod id {
     pub const SET_CREATIVE_ITEM: u32 = 171;
     pub const SMART_GIVE_CREATIVE_ITEM: u32 = 173;
     pub const UPDATE_PLAYER_INVENTORY: u32 = 170;
+    pub const SERVER_SET_BLOCKS: u32 = 141;
+    pub const SET_CHUNK: u32 = 131;
+    pub const SET_CHUNK_HEIGHTMAP: u32 = 132;
+    pub const SPAWN_PARTICLE_SYSTEM: u32 = 152;
+    pub const SPAWN_BLOCK_PARTICLE_SYSTEM: u32 = 153;
+    pub const UPDATE_BLOCK_DAMAGES: u32 = 117;
+    pub const SERVER_SET_HEIGHT: u32 = 183;
+    pub const SERVER_SET_HEIGHTS: u32 = 184;
+    pub const NOTIFICATION: u32 = 212;
     pub const PLAY_SOUND_2D: u32 = 154;
     pub const PLAY_SOUND_3D: u32 = 155;
     pub const OPEN_WINDOW: u32 = 200;
@@ -43,38 +52,10 @@ pub mod id {
     pub const REMOVE_FROM_PLAYER_LIST: u32 = 225;
 }
 
-/// An item lying on the ground.
-#[derive(Clone)]
-struct Dropped {
-    item: String,
-    quantity: i32,
-    at: proto::Position,
-    since: std::time::Instant,
-}
-
 /// Network ids of dropped items start here, far from players'.
 const FIRST_ITEM_ID: i32 = 1_000_000;
-/// How close a player picks an item up, and after how long.
-const PICKUP_RADIUS: f64 = 1.75;
-const PICKUP_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
-
-/// A block change: position and block id (0 is air).
-pub type BlockChange = ((i32, i32, i32), i32);
 
 /// Hotbar slots.
-
-/// Blocks a player gets on joining, those that exist.
-const STARTER: &[&str] = &[
-    "Rock_Stone",
-    "Soil_Dirt",
-    "Soil_Grass",
-    "Rock_Stone_Brick",
-    "Wood_Oak_Planks",
-    "Wood_Oak_Trunk",
-    "Rock_Sandstone",
-    "Soil_Sand",
-    "Glass",
-];
 
 /// Most blocks `/fill` changes at once.
 const FILL_MAX: i64 = 32 * 32 * 32;
@@ -107,10 +88,14 @@ struct Entry {
     look: Option<proto::Direction>,
     /// The open crafting window.
     window: Option<crate::crafting::Window>,
+    /// Queued crafts (spec 09).
+    queue: crate::crafting::Queue,
     /// Ids for windows the server opens start at 1.
     next_window: i32,
     /// Chains that may use up the held item: chain id → (item, hotbar slot).
     consuming: HashMap<i32, (String, i32)>,
+    /// Inventory sections changed this tick (sent at its end).
+    inv_dirty: std::collections::BTreeSet<i32>,
 }
 
 #[derive(Default)]
@@ -133,6 +118,28 @@ pub struct Hub {
     consume: HashMap<(String, i32), (f32, i32, bool)>,
     /// The ground under the changes: the generator, or flat layers.
     ground: Mutex<Option<(Vec<i32>, Option<crate::terrain::Generator>)>>,
+    /// Block support rules and drops (spec 10).
+    rules: crate::support::Rules,
+    /// Eye height of the player model (picked-up items fly to a fifth of it).
+    eye_height: f64,
+    /// When the last world tick ran.
+    last_tick: Mutex<Option<std::time::Instant>>,
+}
+
+/// A position.
+type Pos = (i32, i32, i32);
+
+/// How a block change happens (the official server's set-block settings
+/// that matter here).
+#[derive(Clone, Copy, Default)]
+pub struct How {
+    /// Mark the block's area for support checks (a player's or physics'
+    /// change).
+    pub physics: bool,
+    /// Removed by physics: its particle is `Physics`, not `Break`.
+    pub by_physics: bool,
+    /// No particles (an interaction state change).
+    pub quiet: bool,
 }
 
 #[derive(Default)]
@@ -141,10 +148,36 @@ struct Inner {
     players: BTreeMap<i32, Entry>,
     /// Blocks changed since the server started, sent to whoever joins.
     placed: BTreeMap<(i32, i32, i32), i32>,
-    /// Damaged blocks: health left (1 is whole).
-    health: HashMap<(i32, i32, i32), f32>,
+    /// Rotation index of changed blocks (absent: 0).
+    rotations: HashMap<Pos, i32>,
+    /// Parts of multi-block blocks: packed offset from the main cell.
+    fillers: HashMap<Pos, i32>,
+    /// Support values (spec 10; absent: 0, 15 decoration).
+    support: HashMap<Pos, u8>,
+    /// Blocks to check for support at the next tick: (section, index).
+    ticking: std::collections::BTreeSet<(Pos, i32)>,
+    /// Changed positions per section, sent at the end of each tick.
+    sections: HashMap<Pos, crate::changes::SectionChanges>,
+    /// Sections changed this tick.
+    touched: std::collections::BTreeSet<Pos>,
+    /// Highest non-transparent block per column, once known.
+    tops: HashMap<(i32, i32), i32>,
+    /// Columns whose height changed this tick: chunk column → indexes.
+    heights: BTreeMap<(i32, i32), std::collections::BTreeSet<i32>>,
+    /// World ticks so far.
+    tick: u64,
+    /// Damaged blocks: health left (1 is whole) and the last hit.
+    health: HashMap<(i32, i32, i32), (f32, std::time::Instant)>,
+    /// Health changes per section waiting for the end of the tick.
+    damage_deltas: HashMap<Pos, crate::changes::Deltas>,
     /// Items lying on the ground, by network id.
-    items: BTreeMap<i32, Dropped>,
+    items: BTreeMap<i32, crate::items::Item>,
+    /// Picked-up copies flying to players.
+    flights: BTreeMap<i32, crate::items::Flight>,
+    /// Item entities removed since clients last heard.
+    gone: Vec<i32>,
+    /// Inside a world tick (items made now start moving the next tick).
+    in_tick: bool,
     next_item: i32,
 }
 
@@ -280,135 +313,317 @@ impl Hub {
         }
     }
 
-    /// One hit on a block: creative breaks it at once; otherwise the hit
-    /// takes the held tool's power (or the bare hand's) from the block's
-    /// health, everyone sees the cracks (`UpdateBlockDamage`), and at no
-    /// health it breaks and drops its item. Returns the change when it
-    /// breaks.
-    fn hit(
-        &self,
-        player: i32,
-        x: i32,
-        y: i32,
-        z: i32,
-        held: Option<&str>,
-    ) -> Result<Option<BlockChange>> {
-        let creative = self
-            .inner
-            .lock()
-            .unwrap()
-            .players
-            .get(&player)
-            .is_none_or(|e| e.creative);
-        if creative || self.gather.is_empty() {
-            return Ok(Some(((x, y, z), 0)));
-        }
-        let block = self.block_in_world(x, y, z);
-        if block == 0 {
-            return Ok(None);
-        }
-        let Some(key) = self.keys_by_id.get(&block).cloned() else {
-            return Ok(None);
-        };
-        let held = held.filter(|h| !h.is_empty() && *h != "Empty");
-        let Some((power, drop)) = self.gather.hit(&key, held) else {
-            return Ok(None);
-        };
-        let left = {
-            let mut g = self.inner.lock().unwrap();
-            let h = g.health.entry((x, y, z)).or_insert(1.0);
-            *h -= power;
-            let left = *h;
-            if left <= 0.0 {
-                g.health.remove(&(x, y, z));
+    /// One hit on a block (spec 12): creative breaks it at once without
+    /// drops; otherwise the spec the held item gives decides the damage,
+    /// effects and drops.
+    fn hit(&self, player: i32, x: i32, y: i32, z: i32, held: Option<&str>) {
+        let held = held
+            .filter(|h| !h.is_empty() && *h != "Empty")
+            .map(str::to_owned);
+        self.world_step(|hub, g, ground, out| {
+            use crate::support::World;
+            let creative = g.players.get(&player).is_none_or(|e| e.creative);
+            // A part of a multi-block block: the hit goes to its main cell.
+            let f = unpack_filler(g.fillers.get(&(x, y, z)).copied().unwrap_or(0));
+            let (x, y, z) = (x - f[0], y - f[1], z - f[2]);
+            let (block, rot) = View {
+                g,
+                ground,
+                hub_rules: &hub.rules,
             }
-            left
-        };
-        self.broadcast(&packet(
-            id::UPDATE_BLOCK_DAMAGE,
-            &proto::UpdateBlockDamage {
-                block_position: Some(proto::BlockPosition { x, y, z }),
-                damage: left.max(0.0),
-                delta: -power,
-            },
-        )?);
-        if left > 0.0 {
-            return Ok(None);
-        }
-        if let Some((item, n)) = drop {
-            self.drop_item(&item, n, x as f64 + 0.5, y as f64 + 0.25, z as f64 + 0.5)?;
-        }
-        Ok(Some(((x, y, z), 0)))
+            .block(x, y, z);
+            if block == 0 {
+                return;
+            }
+            let center = hub.block_center(block, rot, (x, y, z));
+            if creative {
+                hub.break_block(g, ground, (x, y, z), None, out);
+                return;
+            }
+            let Some(key) = hub.keys_by_id.get(&block).cloned() else {
+                return;
+            };
+            let deco = g.support.get(&(x, y, z)) == Some(&crate::support::DECO);
+            match hub.gather.hit(&key, held.as_deref(), deco) {
+                crate::gather::Hit::Nothing => {}
+                crate::gather::Hit::Unbreakable => {
+                    hub.effect(g, &hub.gather.unbreakable.clone(), center, out);
+                    if let Some(i) = held.as_deref().and_then(|h| hub.gather.item(h))
+                        && i.tool
+                        && i.incorrect_sound > 0
+                    {
+                        hub.sound_near(g, i.incorrect_sound, center, out);
+                    }
+                }
+                crate::gather::Hit::Damage {
+                    damage,
+                    item,
+                    list,
+                    quantity,
+                    spec,
+                } => {
+                    let (sec, index) = section_of(x, y, z);
+                    let now = std::time::Instant::now();
+                    let h = g.health.get(&(x, y, z)).map_or(1.0, |h| h.0) - damage;
+                    let destroyed = h < 0.0 || h.abs() < 1.0e-5;
+                    if h > 0.0 && h < 1.0 && !destroyed {
+                        g.health.insert((x, y, z), (h, now));
+                        let d = g.damage_deltas.entry(sec).or_default();
+                        d.add(index, -damage);
+                    } else {
+                        g.health.remove(&(x, y, z));
+                        if let Some(d) = g.damage_deltas.get_mut(&sec) {
+                            d.remove(index);
+                        }
+                    }
+                    if destroyed {
+                        let drops = (item, list, quantity);
+                        hub.break_block(g, ground, (x, y, z), Some(drops), out);
+                    } else if let Some(b) = hub.rules.block(block)
+                        && b.hit_sound > 0
+                    {
+                        hub.sound_near(g, b.hit_sound, center, out);
+                    }
+                    let layer = spec.as_ref().map_or(0, |s| s.hit_sound).max(0);
+                    let layer = if layer != 0 {
+                        layer
+                    } else {
+                        held.as_deref()
+                            .and_then(|h| hub.gather.item(h))
+                            .filter(|i| i.tool)
+                            .map_or(0, |i| i.hit_sound)
+                    };
+                    if layer != 0 {
+                        hub.sound_near(g, layer, center, out);
+                    }
+                    if spec.as_ref().is_some_and(|s| s.incorrect) {
+                        hub.effect(g, &hub.gather.incorrect.clone(), center, out);
+                    }
+                }
+            }
+        });
     }
 
-    /// An item on the ground, seen by everyone.
+    /// The centre of a block (its hitbox's centre).
+    fn block_center(&self, id: i32, rot: i32, (x, y, z): Pos) -> [f64; 3] {
+        match self.rules.center(id, rot) {
+            Some(c) => [x as f64 + c[0], y as f64 + c[1], z as f64 + c[2]],
+            None => [x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5],
+        }
+    }
+
+    /// A block broken by a player (spec 12): break sound, the block gone
+    /// with its area marked for support checks, then the drops (none in
+    /// creative).
+    fn break_block(
+        &self,
+        g: &mut Inner,
+        ground: &Ground,
+        (x, y, z): Pos,
+        drops: Option<(Option<String>, Option<String>, i32)>,
+        out: &mut Outgoing,
+    ) {
+        use crate::support::World;
+        let (block, rot) = View {
+            g,
+            ground,
+            hub_rules: &self.rules,
+        }
+        .block(x, y, z);
+        let center = self.block_center(block, rot, (x, y, z));
+        if let Some(b) = self.rules.block(block)
+            && b.break_sound > 0
+        {
+            self.sound_near(g, b.break_sound, center, out);
+        }
+        let how = How {
+            physics: true,
+            ..Default::default()
+        };
+        if self.change(g, ground, (x, y, z), 0, 0, how, out).is_some() {
+            self.mark_area(g, x, y, z, block, rot);
+        }
+        let Some((item, list, quantity)) = drops else {
+            return;
+        };
+        if quantity <= 0 {
+            return;
+        }
+        let stacks = if item.is_none() && list.is_none() {
+            self.rules
+                .block(block)
+                .and_then(|b| b.item.clone())
+                .map(|i| vec![(i, quantity)])
+                .unwrap_or_default()
+        } else {
+            self.rules.roll(&crate::support::Drop {
+                item,
+                list,
+                quantity,
+            })
+        };
+        out.drops
+            .push((stacks, [x as f64 + 0.5, y as f64, z as f64 + 0.5]));
+    }
+
+    /// A sound at a point for the players within its reach (SFX).
+    fn sound_near(&self, g: &Inner, index: i32, at: [f64; 3], out: &mut Outgoing) {
+        let reach = self.rules.sound_distance(index) as f64;
+        let Ok(p) = sound_3d_packet(index, proto::SoundCategory::SFX, at) else {
+            return;
+        };
+        for (&pid, e) in &g.players {
+            if let Some(q) = &e.position
+                && dist2([q.x, q.y, q.z], at) <= reach * reach
+            {
+                out.to.push((pid, p.clone()));
+            }
+        }
+    }
+
+    /// A gathering effect: its particle system for players within 75
+    /// blocks, its sound.
+    fn effect(&self, g: &Inner, e: &crate::gather::Effect, at: [f64; 3], out: &mut Outgoing) {
+        if let Some(name) = &e.particle
+            && let Ok(p) = packet(
+                id::SPAWN_PARTICLE_SYSTEM,
+                &proto::SpawnParticleSystem {
+                    particle_system_id: Some(name.clone()),
+                    position: Some(proto::Position {
+                        x: at[0],
+                        y: at[1],
+                        z: at[2],
+                    }),
+                    rotation: None,
+                    scale: 1.0,
+                    color: None,
+                    max_duration: 0.0,
+                },
+            )
+        {
+            for (&pid, pe) in &g.players {
+                if let Some(q) = &pe.position
+                    && dist2([q.x, q.y, q.z], at) <= 75.0 * 75.0
+                {
+                    out.to.push((pid, p.clone()));
+                }
+            }
+        }
+        if e.sound > 0 {
+            self.sound_near(g, e.sound, at, out);
+        }
+    }
+
+    /// Block health for one tick (spec 12): blocks left alone for 5 s heal
+    /// 0.1 a second; the changes go out per section.
+    fn health_step(&self, g: &mut Inner, dt: f32, out: &mut Outgoing) {
+        let now = std::time::Instant::now();
+        let healing: Vec<(Pos, f32)> = g
+            .health
+            .iter()
+            .filter(|(_, (_, last))| now.duration_since(*last).as_millis() >= 5000)
+            .map(|(p, (h, _))| (*p, *h))
+            .collect();
+        for (p, h) in healing {
+            let (sec, index) = section_of(p.0, p.1, p.2);
+            let mut delta = 0.1 * dt;
+            let after = h + delta;
+            if after < 1.0 {
+                if let Some(x) = g.health.get_mut(&p) {
+                    x.0 = after;
+                }
+            } else {
+                delta = 1.0 - h;
+                g.health.remove(&p);
+            }
+            g.damage_deltas.entry(sec).or_default().add(index, delta);
+        }
+        let secs: Vec<Pos> = g.damage_deltas.keys().copied().collect();
+        for sec in secs {
+            let Some(d) = g.damage_deltas.get_mut(&sec) else {
+                continue;
+            };
+            let list = d.take();
+            if list.is_empty() {
+                continue;
+            }
+            let health = |g: &Inner, i: i32| {
+                let (x, y, z) = block_of(sec, i);
+                g.health.get(&(x, y, z)).map_or(1.0, |h| h.0)
+            };
+            let p = if list.len() == 1 {
+                let (i, delta) = list[0];
+                let (x, y, z) = block_of(sec, i);
+                packet(
+                    id::UPDATE_BLOCK_DAMAGE,
+                    &proto::UpdateBlockDamage {
+                        block_position: Some(proto::BlockPosition { x, y, z }),
+                        damage: health(g, i),
+                        delta,
+                    },
+                )
+            } else {
+                let cmds = list
+                    .iter()
+                    .map(|&(i, delta)| proto::BlockDamageCmd {
+                        index: i as i16,
+                        damage: health(g, i),
+                        delta,
+                    })
+                    .collect();
+                packet(
+                    id::UPDATE_BLOCK_DAMAGES,
+                    &proto::UpdateBlockDamages {
+                        x: sec.0,
+                        y: sec.1,
+                        z: sec.2,
+                        cmds,
+                    },
+                )
+            };
+            if let Ok(p) = p {
+                out.all.push(p);
+            }
+        }
+    }
+
+    /// An item on the ground (spec 11).
     pub fn drop_item(&self, item: &str, quantity: i32, x: f64, y: f64, z: f64) -> Result<()> {
-        let (nid, d) = {
-            let mut g = self.inner.lock().unwrap();
+        self.drop_items(vec![(item.to_owned(), quantity)], [x, y, z]);
+        Ok(())
+    }
+
+    /// Stacks dropped together at one place: straight up for one, spread
+    /// on a circle for more.
+    pub fn drop_items(&self, stacks: Vec<(String, i32)>, at: [f64; 3]) {
+        if stacks.is_empty() {
+            return;
+        }
+        let angle = rand::random::<f32>() * std::f32::consts::TAU;
+        let vels = crate::items::launch(stacks.len(), angle);
+        let mut g = self.inner.lock().unwrap();
+        let born = g.tick + g.in_tick as u64;
+        for ((item, n), vel) in stacks.into_iter().zip(vels) {
+            if n <= 0 {
+                continue;
+            }
             g.next_item = g.next_item.max(FIRST_ITEM_ID) + 1;
             let nid = g.next_item;
-            let d = Dropped {
-                item: item.to_owned(),
-                quantity,
-                at: proto::Position { x, y, z },
-                since: std::time::Instant::now(),
-            };
-            g.items.insert(nid, d.clone());
-            (nid, d)
-        };
-        self.broadcast(&packet(
-            id::ENTITY_UPDATES,
-            &proto::EntityUpdates {
-                removed: None,
-                updates: Some(vec![item_entity(nid, &d)]),
-            },
-        )?);
-        Ok(())
+            let life = self.item_life(&item);
+            g.items
+                .insert(nid, crate::items::Item::new(&item, n, at, vel, life, born));
+        }
     }
 
-    /// Items near a player go into its inventory.
-    pub fn pick_up(&self, player: i32) -> Result<()> {
-        let taken: Vec<(i32, Dropped)> = {
-            let mut g = self.inner.lock().unwrap();
-            let Some(p) = g.players.get(&player).and_then(|e| e.position.clone()) else {
-                return Ok(());
-            };
-            let near: Vec<i32> = g
-                .items
-                .iter()
-                .filter(|(_, d)| {
-                    d.since.elapsed() >= PICKUP_DELAY
-                        && (d.at.x - p.x).powi(2)
-                            + (d.at.y - (p.y + 0.5)).powi(2)
-                            + (d.at.z - p.z).powi(2)
-                            <= PICKUP_RADIUS * PICKUP_RADIUS
-                })
-                .map(|(i, _)| *i)
-                .collect();
-            near.into_iter()
-                .filter_map(|i| g.items.remove(&i).map(|d| (i, d)))
-                .collect()
-        };
-        if taken.is_empty() {
-            return Ok(());
-        }
-        self.broadcast(&packet(
-            id::ENTITY_UPDATES,
-            &proto::EntityUpdates {
-                removed: Some(taken.iter().map(|(i, _)| *i).collect()),
-                updates: None,
-            },
-        )?);
-        for (_, d) in taken {
-            self.add_item(player, &d.item, d.quantity)?;
-        }
-        Ok(())
+    /// Seconds an item lies before it disappears (the default gameplay
+    /// config's `ItemEntity.Lifetime`).
+    fn item_life(&self, _item: &str) -> f32 {
+        600.0
     }
 
-    /// Adds to the inventory (stacks first, hotbar then storage).
-    pub fn add_item(&self, id: i32, item: &str, quantity: i32) -> Result<()> {
-        self.with_inventory(id, |inv| inv.add(item, quantity))?;
-        Ok(())
+    pub fn with_eye_height(mut self, h: f64) -> Self {
+        self.eye_height = h;
+        self
     }
 
     /// Adds a player; returns its network id and the outbox to drain. The
@@ -434,11 +649,6 @@ impl Hub {
             if let Ok(p) = player_list_add(everyone) {
                 let _ = tx.send(p);
             }
-            for (&(x, y, z), &b) in &g.placed {
-                if let Ok(p) = set_block_packet(x, y, z, b) {
-                    let _ = tx.send(p);
-                }
-            }
             g.players.insert(
                 id,
                 Entry {
@@ -453,8 +663,10 @@ impl Hub {
                     body: None,
                     look: None,
                     window: None,
+                    queue: Default::default(),
                     next_window: 0,
                     consuming: HashMap::new(),
+                    inv_dirty: Default::default(),
                 },
             );
             id
@@ -523,15 +735,14 @@ impl Hub {
         id: i32,
         f: impl FnOnce(&mut Inventory) -> T,
     ) -> Result<Option<T>> {
-        let (r, p) = {
-            let mut g = self.inner.lock().unwrap();
-            let Some(e) = g.players.get_mut(&id) else {
-                return Ok(None);
-            };
-            let r = f(&mut e.inv);
-            (r, packet(id::UPDATE_PLAYER_INVENTORY, &e.inv.packet())?)
+        let mut g = self.inner.lock().unwrap();
+        let Some(e) = g.players.get_mut(&id) else {
+            return Ok(None);
         };
-        self.send(id, p);
+        let before = e.inv.clone();
+        let r = f(&mut e.inv);
+        let changed = e.inv.changed_since(&before);
+        e.inv_dirty.extend(changed);
         Ok(Some(r))
     }
 
@@ -542,6 +753,10 @@ impl Hub {
         match packet_id {
             self::id::MOVE_ITEM_STACK => {
                 let (m, _) = proto::MoveItemStack::decode(payload, 0)?;
+                if m.from_section_id >= 0 || m.to_section_id >= 0 {
+                    self.move_with_window(id, &m);
+                    return Ok(());
+                }
                 self.with_inventory(id, |inv| {
                     inv.move_stack(
                         (m.from_section_id, m.from_slot_id),
@@ -573,6 +788,96 @@ impl Hub {
         Ok(())
     }
 
+    /// A move between the player's inventory and a structural window's
+    /// slots (slot 0 the input, 1–64 the options, which take nothing).
+    fn move_with_window(&self, id: i32, m: &proto::MoveItemStack) {
+        let mut g = self.inner.lock().unwrap();
+        let Some(e) = g.players.get_mut(&id) else {
+            return;
+        };
+        let Some(wid) = e
+            .window
+            .as_ref()
+            .filter(|w| w.kind == crate::crafting::Kind::Structural)
+            .map(|w| w.id)
+        else {
+            return;
+        };
+        let get = |e: &Entry, sec: i32, slot: i32| -> Option<crate::inventory::Slot> {
+            if sec == wid {
+                let w = e.window.as_ref()?;
+                return match slot {
+                    0 => Some(w.input.clone()),
+                    s if s >= 1 => Some(
+                        w.options
+                            .get(s as usize - 1)
+                            .map(|(i, n, _)| (i.clone(), *n)),
+                    ),
+                    _ => None,
+                };
+            }
+            if sec < 0 {
+                Some(e.inv.get(sec, slot))
+            } else {
+                None
+            }
+        };
+        let (Some(from), Some(to)) = (
+            get(e, m.from_section_id, m.from_slot_id),
+            get(e, m.to_section_id, m.to_slot_id),
+        ) else {
+            return;
+        };
+        // The options never take or give items; the input takes only what
+        // some option can be made from.
+        if (m.from_section_id == wid && m.from_slot_id != 0)
+            || (m.to_section_id == wid && m.to_slot_id != 0)
+        {
+            return;
+        }
+        let Some((item, have)) = from.clone() else {
+            return;
+        };
+        let w = e.window.as_ref().unwrap();
+        let valid = |it: &str| self.book.structural_options(&w.bench, it).0.len() > 0;
+        let max = self.book.max_stack(&item);
+        let n = m.quantity.min(have).max(0);
+        let (new_from, new_to) = match to.clone() {
+            None => (Some((item.clone(), have - n)), Some((item.clone(), n))),
+            Some((other, k)) if other == item => {
+                let n = n.min(max - k).max(0);
+                (Some((item.clone(), have - n)), Some((item.clone(), k + n)))
+            }
+            Some(other) if n >= have => (Some(other), Some((item.clone(), have))),
+            Some(_) => return,
+        };
+        let into_input = |slot: &Option<(String, i32)>| slot.as_ref().is_none_or(|(i, _)| valid(i));
+        if m.to_section_id == wid && !into_input(&new_to) {
+            return;
+        }
+        if m.from_section_id == wid && !into_input(&new_from.clone().filter(|(_, n)| *n > 0)) {
+            return;
+        }
+        let before = e.inv.clone();
+        let put = |e: &mut Entry, sec: i32, slot: i32, v: Option<(String, i32)>| {
+            let v = v.filter(|(_, n)| *n > 0);
+            if sec == wid {
+                if let Some(w) = e.window.as_mut() {
+                    w.input = v;
+                }
+            } else {
+                e.inv.set(sec, slot, v);
+            }
+        };
+        put(e, m.from_section_id, m.from_slot_id, new_from);
+        put(e, m.to_section_id, m.to_slot_id, new_to);
+        let changed = e.inv.changed_since(&before);
+        e.inv_dirty.extend(changed);
+        if let Some(w) = e.window.as_mut() {
+            self.update_options(w);
+        }
+    }
+
     /// Drops an item a block and a half in front of a player.
     fn drop_in_front(&self, id: i32, item: &str, n: i32) -> Result<()> {
         let (p, yaw) = {
@@ -595,59 +900,70 @@ impl Hub {
             debug!("window type {} not opened", m.r#type.0);
             return Ok(());
         }
-        {
-            let mut g = self.inner.lock().unwrap();
-            let Some(e) = g.players.get_mut(&id) else {
-                return Ok(());
-            };
-            e.window = Some(crate::crafting::Window::fieldcraft());
-        }
+        let w = crate::crafting::Window::fieldcraft(&self.book);
         let u = proto::UpdateWindow {
             id: 0,
-            window_data: Some(self.book.fieldcraft_data()),
+            window_data: Some(w.data.text()),
             inventory: None,
             extra_resources: None,
         };
+        if let Some(e) = self.inner.lock().unwrap().players.get_mut(&id) {
+            e.window = Some(w);
+        }
         self.send(id, packet(self::id::UPDATE_WINDOW, &u)?);
         Ok(())
     }
 
     /// A player used the bench block at (x, y, z) (or a part of it next to
-    /// it): opens its window (`SetPage` Bench, then `OpenWindow`).
-    /// `false` when there is no bench there.
+    /// it): opens its window (spec 09). `false` when there is no bench there.
     pub fn open_bench(&self, id: i32, x: i32, y: i32, z: i32) -> Result<bool> {
-        let found = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)]
-            .iter()
-            .find_map(|&(dx, dz)| {
-                let b = self.block_in_world(x + dx, y, z + dz);
-                let key = self.keys_by_id.get(&b)?;
-                Some((
-                    key.clone(),
-                    self.book.bench(key)?.clone(),
-                    (x + dx, y, z + dz),
-                ))
-            });
+        // A part of the bench: its main cell.
+        let f = unpack_filler(
+            self.inner
+                .lock()
+                .unwrap()
+                .fillers
+                .get(&(x, y, z))
+                .copied()
+                .unwrap_or(0),
+        );
+        let (x, y, z) = (x - f[0], y - f[1], z - f[2]);
+        let found = {
+            let b = self.block_in_world(x, y, z);
+            self.keys_by_id
+                .get(&b)
+                .and_then(|key| Some((key.clone(), self.book.bench(key)?.clone(), (x, y, z))))
+        };
         let Some((key, bench, at)) = found else {
             return Ok(false);
         };
         let window_type = match proto::BenchType(bench.kind) {
-            proto::BenchType::DIAGRAM_CRAFTING => proto::WindowType::DIAGRAM_CRAFTING,
             proto::BenchType::STRUCTURAL_CRAFTING => proto::WindowType::STRUCTURAL_CRAFTING,
-            proto::BenchType::PROCESSING => proto::WindowType::PROCESSING,
-            _ => proto::WindowType::BASIC_CRAFTING,
+            proto::BenchType::CRAFTING => proto::WindowType::BASIC_CRAFTING,
+            _ => {
+                // Processing and diagram benches: not done yet (PARITY).
+                info!("{key} ({}) cannot be opened yet", bench.id);
+                return Ok(true);
+            }
         };
-        let wid = {
+        let w = {
             let mut g = self.inner.lock().unwrap();
             let Some(e) = g.players.get_mut(&id) else {
                 return Ok(true);
             };
+            if e.window.is_some() {
+                return Ok(true);
+            }
             e.next_window = e.next_window.max(0) + 1;
-            e.window = Some(crate::crafting::Window {
-                id: e.next_window,
-                bench: bench.clone(),
-                block: Some((key.clone(), at)),
-            });
-            e.next_window
+            let Some(mut w) = self.book.bench_window(e.next_window, &key, at, &bench) else {
+                return Ok(true);
+            };
+            if w.kind == crate::crafting::Kind::Structural {
+                let hints = self.book.inventory_hints(&bench, &e.inv);
+                w.data.set("inventoryHints", json_ints(&hints));
+            }
+            e.window = Some(w.clone());
+            w
         };
         self.sound_2d(id, bench.open_sound)?;
         let page = proto::SetPage {
@@ -655,14 +971,16 @@ impl Hub {
             can_close_through_interaction: true,
         };
         self.send(id, packet(self::id::SET_PAGE, &page)?);
-        let w = proto::OpenWindow {
-            id: wid,
+        let o = proto::OpenWindow {
+            id: w.id,
             window_type,
-            window_data: Some(self.book.bench_data(&key, &bench)),
-            inventory: None,
-            extra_resources: Some(proto::ExtraResources { resources: None }),
+            window_data: Some(w.data.text()),
+            inventory: w.section(),
+            extra_resources: Some(proto::ExtraResources {
+                resources: Some(Vec::new()),
+            }),
         };
-        self.send(id, packet(self::id::OPEN_WINDOW, &w)?);
+        self.send(id, packet(self::id::OPEN_WINDOW, &o)?);
         info!("opened {} ({}) for {id}", key, bench.id);
         Ok(true)
     }
@@ -670,107 +988,545 @@ impl Hub {
     /// A UI sound for one player (none for index 0).
     fn sound_2d(&self, id: i32, index: i32) -> Result<()> {
         if index > 0 {
-            let s = proto::PlaySoundEvent2D {
-                sound_event_index: index,
-                category: proto::SoundCategory::UI,
-                volume_modifier: 1.0,
-                pitch_modifier: 1.0,
-            };
-            self.send(id, packet(self::id::PLAY_SOUND_2D, &s)?);
+            self.send(id, sound_2d_packet(index)?);
         }
         Ok(())
     }
 
-    /// `CloseWindow` from the client: forgotten and confirmed.
+    /// `CloseWindow` from the client: confirmed, then the bench's close
+    /// steps (spec 09): its block back to its default state, the queue
+    /// cancelled (inputs of the running craft given back, the failed
+    /// sound), the close sound, a structural input given back.
     pub fn close_window(&self, id: i32, payload: &[u8]) -> Result<()> {
         let (m, _) = proto::CloseWindow::decode(payload, 0)?;
-        let closed = {
-            let mut g = self.inner.lock().unwrap();
-            match g.players.get_mut(&id) {
-                Some(e) if e.window.as_ref().is_some_and(|w| w.id == m.id) => e.window.take(),
-                _ => None,
-            }
-        };
         self.send(id, packet(self::id::CLOSE_WINDOW, &m)?);
-        if let Some(w) = closed {
-            self.sound_2d(id, w.bench.close_sound)?;
+        self.world_step(|hub, g, ground, out| {
+            let Some(e) = g.players.get_mut(&id) else {
+                return;
+            };
+            if !e.window.as_ref().is_some_and(|w| w.id == m.id) {
+                return;
+            }
+            let w = e.window.take().unwrap();
+            let refunded = hub.cancel_crafting(e);
+            let input = w.input.clone();
+            if let Some((_, at)) = &w.block {
+                hub.set_block_state(g, ground, *at, "default", out);
+            }
+            if refunded
+                && w.bench.failed_sound > 0
+                && let Ok(p) = sound_2d_packet(w.bench.failed_sound)
+            {
+                out.to.push((id, p));
+            }
+            if w.bench.close_sound > 0
+                && let Ok(p) = sound_2d_packet(w.bench.close_sound)
+            {
+                out.to.push((id, p));
+            }
+            if let Some((item, n)) = input
+                && let Some(e) = g.players.get_mut(&id)
+            {
+                let before = e.inv.clone();
+                let left = e.inv.add(&item, n, hub.book.max_stack(&item));
+                let changed = e.inv.changed_since(&before);
+                e.inv_dirty.extend(changed);
+                if left > 0
+                    && let Some(p) = e.position.clone()
+                {
+                    out.drops.push((vec![(item, left)], [p.x, p.y + 1.0, p.z]));
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// Cancels a player's crafting queue: the running craft's inputs come
+    /// back. `true` if there was a queue.
+    fn cancel_crafting(&self, e: &mut Entry) -> bool {
+        let jobs = std::mem::take(&mut e.queue.jobs);
+        let Some(first) = jobs.into_iter().next() else {
+            return false;
+        };
+        if let Some(taken) = first.taken.get((first.started - 1).max(0) as usize)
+            && first.started > first.completed
+        {
+            let before = e.inv.clone();
+            for (item, n) in taken {
+                e.inv.add(item, *n, self.book.max_stack(item));
+            }
+            let changed = e.inv.changed_since(&before);
+            e.inv_dirty.extend(changed);
+        }
+        true
+    }
+
+    /// Switches a bench block to one of its interaction states (no
+    /// particles, no physics), as the official crafting does.
+    fn set_block_state(
+        &self,
+        g: &mut Inner,
+        ground: &Ground,
+        at: Pos,
+        state: &str,
+        out: &mut Outgoing,
+    ) {
+        use crate::support::World;
+        let (cur, rot) = View {
+            g,
+            ground,
+            hub_rules: &self.rules,
+        }
+        .block(at.0, at.1, at.2);
+        let Some(b) = self.rules.block(cur) else {
+            return;
+        };
+        let Some(&(_, to)) = b.states.iter().find(|(n, _)| n == state) else {
+            return;
+        };
+        let how = How {
+            quiet: true,
+            ..Default::default()
+        };
+        self.change(g, ground, at, to, rot, how, out);
+    }
+
+    /// `SendWindowAction` (spec 09): crafting, picking a structural option,
+    /// cycling a structural input through its block group.
+    pub fn window_action(&self, id: i32, payload: &[u8]) -> Result<()> {
+        let (m, _) = proto::SendWindowAction::decode(payload, 0)?;
+        let mut unknown = None;
+        self.world_step(|hub, g, ground, out| {
+            let Some(e) = g.players.get_mut(&id) else {
+                return;
+            };
+            let Some(w) = e.window.as_ref().filter(|w| w.id == m.id).cloned() else {
+                debug!("action in window {} that is not open", m.id);
+                return;
+            };
+            use crate::crafting::Kind;
+            match (&m.action, w.kind) {
+                (proto::WindowAction::SelectSlotAction(a), Kind::Structural) => {
+                    let slot = a.slot.clamp(0, crate::crafting::OPTION_SLOTS as i32 - 1);
+                    if let Some(w) = e.window.as_mut()
+                        && slot != w.selected
+                    {
+                        w.selected = slot;
+                        w.data.set("selected", slot.to_string());
+                        w.dirty = true;
+                    }
+                }
+                (proto::WindowAction::ChangeBlockAction(a), Kind::Structural) => {
+                    if w.bench.cycling {
+                        hub.cycle_input(id, e, a.down, out);
+                    }
+                }
+                (proto::WindowAction::CraftRecipeAction(a), Kind::Structural) => {
+                    let Some((_, _, recipe)) = w.options.get(w.selected as usize).cloned() else {
+                        return;
+                    };
+                    if let Some(p) = hub
+                        .book
+                        .recipe(&recipe)
+                        .and_then(|r| r.primary_output.as_ref())
+                        .and_then(|o| o.item_id.clone())
+                    {
+                        let s = hub.book.drop_sound(&p);
+                        if s > 0
+                            && let Ok(p) = sound_2d_packet(s)
+                        {
+                            out.to.push((id, p));
+                        }
+                    }
+                    if hub.queue_craft(e, &w, &recipe, a.quantity, true) {
+                        let left = e.queue.remaining();
+                        if let Some(w) = e.window.as_mut() {
+                            w.data.set("queueSize", left.to_string());
+                        }
+                    }
+                    if let Some(w) = e.window.as_mut() {
+                        w.dirty = true;
+                    }
+                }
+                (proto::WindowAction::CraftRecipeAction(a), Kind::Pocket) => {
+                    let Some(recipe) = a.recipe_id.clone() else {
+                        return;
+                    };
+                    if hub.book.recipe(&recipe).is_none() {
+                        unknown = Some(recipe);
+                        return;
+                    }
+                    hub.craft_now(id, e, &w, &recipe, a.quantity, out);
+                    let s = hub.book.sound("SFX_Player_Craft_Item_Inventory");
+                    if s > 0
+                        && let Ok(p) = sound_2d_packet(s)
+                    {
+                        out.to.push((id, p));
+                    }
+                }
+                (proto::WindowAction::CraftRecipeAction(a), Kind::Simple) => {
+                    let Some(recipe) = a.recipe_id.clone() else {
+                        return;
+                    };
+                    if hub.book.recipe(&recipe).is_none() {
+                        unknown = Some(recipe);
+                        return;
+                    }
+                    let timed = hub.book.seconds(&recipe) > 0.0;
+                    let accepted = if timed {
+                        let ok = hub.queue_craft(e, &w, &recipe, a.quantity, false);
+                        if ok {
+                            let left = e.queue.remaining();
+                            if let Some(w) = e.window.as_mut() {
+                                w.data.set("queueSize", left.to_string());
+                            }
+                        }
+                        ok
+                    } else {
+                        hub.craft_now(id, e, &w, &recipe, a.quantity, out)
+                    };
+                    if let Some(w) = e.window.as_mut() {
+                        w.extra_dirty = true;
+                        w.dirty = true;
+                    }
+                    if accepted && let Some((_, at)) = &w.block {
+                        let state = if timed {
+                            "CraftCompleted"
+                        } else {
+                            "CraftCompletedInstant"
+                        };
+                        let at = *at;
+                        hub.set_block_state(g, ground, at, state, out);
+                        if w.bench.completed_sound > 0 {
+                            let center = [at.0 as f64 + 0.5, at.1 as f64 + 0.5, at.2 as f64 + 0.5];
+                            if let Ok(p) = sound_3d_packet(
+                                w.bench.completed_sound,
+                                proto::SoundCategory::SFX,
+                                center,
+                            ) {
+                                out.all.push(p);
+                            }
+                        }
+                    }
+                }
+                (other, _) => debug!("window action not handled: {other:?}"),
+            }
+        });
+        if let Some(r) = unknown {
+            warn!("{id} asked for unknown recipe {r}");
         }
         Ok(())
     }
 
-    /// `SendWindowAction`: crafting a recipe in the open window.
-    pub fn window_action(&self, id: i32, payload: &[u8]) -> Result<()> {
-        let (m, _) = proto::SendWindowAction::decode(payload, 0)?;
-        let proto::WindowAction::CraftRecipeAction(a) = &m.action else {
-            debug!("window action not handled: {:?}", m.action);
-            return Ok(());
-        };
-        let Some(recipe) = a.recipe_id.clone() else {
-            return Ok(());
-        };
-        let (window, creative) = {
-            let g = self.inner.lock().unwrap();
-            let Some(e) = g.players.get(&id) else {
-                return Ok(());
-            };
-            (e.window.clone(), e.creative)
-        };
-        let Some(w) = window.filter(|w| w.id == m.id) else {
-            debug!("craft in window {} that is not open", m.id);
-            return Ok(());
-        };
-        let bench = w.bench.id.clone();
-        let made = self
-            .with_inventory(id, |inv| {
-                let r = self
-                    .book
-                    .craft(inv, &recipe, a.quantity, w.bench.kind, &bench, creative);
-                if let Ok(out) = &r {
-                    let left: Vec<(String, i32)> = out
-                        .iter()
-                        .map(|(item, n)| (item.clone(), inv.add(item, *n)))
-                        .filter(|(_, n)| *n > 0)
-                        .collect();
-                    return Ok((out.clone(), left));
-                }
-                r.map(|o| (o, Vec::new()))
-            })?
-            .unwrap_or(Err(crate::crafting::Refused::Missing));
-        match made {
-            Ok((out, left)) => {
-                info!("{id} crafted {recipe} ×{}: {out:?}", a.quantity);
-                for (item, n) in left {
-                    self.drop_in_front(id, &item, n)?;
-                }
-                match &w.block {
-                    // At a bench: its sound, where it stands, for everyone.
-                    Some((_, (x, y, z))) if w.bench.completed_sound > 0 => {
-                        let s = proto::PlaySoundEvent3D {
-                            sound_event_index: w.bench.completed_sound,
-                            category: proto::SoundCategory::SFX,
-                            position: Some(proto::Position {
-                                x: *x as f64 + 0.5,
-                                y: *y as f64 + 0.5,
-                                z: *z as f64 + 0.5,
-                            }),
-                            volume_modifier: 1.0,
-                            pitch_modifier: 1.0,
-                        };
-                        self.broadcast(&packet(self::id::PLAY_SOUND_3D, &s)?);
-                    }
-                    Some(_) => {}
-                    None => {
-                        let s = self.book.sound("SFX_Player_Craft_Item_Inventory");
-                        self.sound_2d(id, s)?;
-                    }
-                }
-            }
-            Err(crate::crafting::Refused::Unknown) => {
-                warn!("{id} asked for unknown recipe {recipe}")
-            }
-            Err(e) => info!("{id} cannot craft {recipe} at {bench}: {e:?}"),
+    /// An instant craft (spec 09): checks, takes the inputs (not in
+    /// creative), gives the outputs; tells the player what is missing.
+    fn craft_now(
+        &self,
+        pid: i32,
+        e: &mut Entry,
+        w: &crate::crafting::Window,
+        recipe: &str,
+        requested: i32,
+        out: &mut Outgoing,
+    ) -> bool {
+        let quantity = requested.min(self.book.ceiling(recipe));
+        if quantity < 1
+            || self
+                .book
+                .allowed(recipe, w.bench.kind, &w.bench.id)
+                .is_err()
+        {
+            return false;
         }
-        Ok(())
+        if w.kind == crate::crafting::Kind::Simple
+            && e.queue.jobs.front().is_some_and(|j| j.recipe != recipe)
+        {
+            return false;
+        }
+        let before = e.inv.clone();
+        if !e.creative {
+            for _ in 0..quantity {
+                if self.book.take_unit(&mut e.inv, recipe).is_none() {
+                    e.inv = before;
+                    self.missing_ingredient(pid, recipe, out);
+                    return false;
+                }
+            }
+        }
+        for (item, n) in self.book.outputs(recipe, quantity) {
+            let left = e.inv.add(&item, n, self.book.max_stack(&item));
+            if left > 0
+                && let Some(p) = e.position.clone()
+            {
+                out.drops.push((vec![(item, left)], [p.x, p.y + 1.0, p.z]));
+            }
+        }
+        let changed = e.inv.changed_since(&before);
+        e.inv_dirty.extend(changed);
+        true
+    }
+
+    /// Queues a timed craft (spec 09); `from_input`: a structural bench's
+    /// input slot pays.
+    fn queue_craft(
+        &self,
+        e: &mut Entry,
+        w: &crate::crafting::Window,
+        recipe: &str,
+        requested: i32,
+        from_input: bool,
+    ) -> bool {
+        if self
+            .book
+            .allowed(recipe, w.bench.kind, &w.bench.id)
+            .is_err()
+        {
+            return false;
+        }
+        if w.kind == crate::crafting::Kind::Simple
+            && e.queue.jobs.front().is_some_and(|j| j.recipe != recipe)
+        {
+            return false;
+        }
+        let quantity = requested.min(self.book.ceiling(recipe));
+        if quantity < 1 || e.queue.jobs.len() >= 32 {
+            return false;
+        }
+        e.queue.jobs.push_back(crate::crafting::Job {
+            recipe: recipe.to_owned(),
+            quantity,
+            started: 0,
+            completed: 0,
+            seconds_done: 0.0,
+            seconds: self.book.seconds(recipe),
+            from_input,
+            taken: Vec::new(),
+        });
+        true
+    }
+
+    fn missing_ingredient(&self, pid: i32, recipe: &str, out: &mut Outgoing) {
+        let Some(item) = self
+            .book
+            .recipe(recipe)
+            .and_then(|r| r.primary_output.as_ref())
+            .and_then(|o| o.item_id.clone())
+        else {
+            return;
+        };
+        let msg = proto::FormattedMessage {
+            message_id: Some("server.general.crafting.missingIngredient".into()),
+            message_params: Some(vec![(
+                "item".into(),
+                proto::FormattedMessage {
+                    message_id: Some(self.book.item_name(&item)),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let n = proto::Notification {
+            message: Some(msg),
+            style: proto::NotificationStyle::DANGER,
+            ..Default::default()
+        };
+        if let Ok(p) = packet(self::id::NOTIFICATION, &n) {
+            out.to.push((pid, p));
+        }
+    }
+
+    /// A structural input cycled through its block group (spec 09).
+    fn cycle_input(&self, pid: i32, e: &mut Entry, down: bool, out: &mut Outgoing) {
+        let Some(w) = e.window.as_mut() else { return };
+        let Some((item, n)) = w.input.clone() else {
+            return;
+        };
+        let Some(group) = self.book.group_of(&item) else {
+            return;
+        };
+        let Some(i) = group.iter().position(|x| *x == item) else {
+            return;
+        };
+        let len = group.len();
+        let next = if down {
+            (i + len - 1) % len
+        } else {
+            (i + 1) % len
+        };
+        let next = group[next].clone();
+        w.input = Some((next.clone(), n));
+        let s = self.book.drop_sound(&next);
+        self.update_options(w);
+        if s > 0
+            && let Ok(p) = sound_2d_packet(s)
+        {
+            out.to.push((pid, p));
+        }
+    }
+
+    /// The options of a structural window after its input changed.
+    fn update_options(&self, w: &mut crate::crafting::Window) {
+        w.dirty = true;
+        w.options.clear();
+        let Some((item, _)) = w.input.clone() else {
+            return;
+        };
+        let (options, divider) = self.book.structural_options(&w.bench, &item);
+        if options.is_empty() {
+            return;
+        }
+        w.data.set("dividerIndex", divider.to_string());
+        let ids: Vec<String> = options.iter().map(|(_, _, r)| r.clone()).collect();
+        w.data.set(
+            "optionSlotRecipes",
+            format!(
+                "[{}]",
+                ids.iter()
+                    .map(|r| format!("{r:?}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        );
+        w.options = options;
+    }
+
+    /// The crafting queues for one tick (spec 09), then the windows that
+    /// changed go out.
+    fn crafting_step(&self, g: &mut Inner, ground: &Ground, dt: f32, out: &mut Outgoing) {
+        let ids: Vec<i32> = g.players.keys().copied().collect();
+        for pid in ids {
+            let mut left_dt = dt;
+            let mut emptied = None;
+            {
+                let Some(e) = g.players.get_mut(&pid) else {
+                    continue;
+                };
+                while left_dt > 0.0 && !e.queue.jobs.is_empty() {
+                    let creative = e.creative;
+                    let mut job = e.queue.jobs.pop_front().unwrap();
+                    if job.started < job.quantity && job.started <= job.completed {
+                        job.started += 1;
+                        if !creative {
+                            match self.take_job_unit(e, &job) {
+                                Some(t) => job.taken.push(t),
+                                None => {
+                                    self.missing_ingredient(pid, &job.recipe.clone(), out);
+                                    let left = e.queue.remaining();
+                                    if let Some(w) = e.window.as_mut() {
+                                        w.data.set("queueSize", left.to_string());
+                                    }
+                                    if e.queue.jobs.is_empty() {
+                                        emptied = e.window.as_ref().and_then(|w| w.block.clone());
+                                    }
+                                    continue;
+                                }
+                            }
+                        } else {
+                            job.taken.push(Vec::new());
+                        }
+                    }
+                    job.seconds_done += left_dt;
+                    let pct = if job.seconds <= 0.0 {
+                        1.0
+                    } else {
+                        (job.seconds_done / job.seconds).min(1.0)
+                    };
+                    if let Some(w) = e.window.as_mut() {
+                        w.progress(pct);
+                    }
+                    left_dt = 0.0;
+                    let mut done = false;
+                    if job.seconds_done >= job.seconds {
+                        left_dt = job.seconds_done - job.seconds;
+                        job.completed += 1;
+                        job.seconds_done = 0.0;
+                        let before = e.inv.clone();
+                        for (item, n) in self.book.outputs(&job.recipe, 1) {
+                            let left = e.inv.add(&item, n, self.book.max_stack(&item));
+                            if left > 0
+                                && let Some(p) = e.position.clone()
+                            {
+                                out.drops.push((vec![(item, left)], [p.x, p.y + 1.0, p.z]));
+                            }
+                        }
+                        let changed = e.inv.changed_since(&before);
+                        e.inv_dirty.extend(changed);
+                        done = job.completed == job.quantity;
+                    }
+                    let finished_unit = job.seconds_done == 0.0;
+                    if !done {
+                        e.queue.jobs.push_front(job);
+                    }
+                    if finished_unit {
+                        let left = e.queue.remaining();
+                        if let Some(w) = e.window.as_mut() {
+                            w.data.set("queueSize", left.to_string());
+                        }
+                        if e.queue.jobs.is_empty() {
+                            emptied = e.window.as_ref().and_then(|w| w.block.clone());
+                        }
+                    }
+                }
+            }
+            if let Some((_, at)) = emptied {
+                self.set_block_state(g, ground, at, "default", out);
+            }
+            // A structural window follows the player's hotbar and storage.
+            if let Some(e) = g.players.get_mut(&pid)
+                && (e.inv_dirty.contains(&inventory::HOTBAR)
+                    || e.inv_dirty.contains(&inventory::STORAGE))
+                && let Some(w) = e.window.as_mut()
+                && w.kind == crate::crafting::Kind::Structural
+            {
+                let hints = self.book.inventory_hints(&w.bench, &e.inv);
+                w.data.set("inventoryHints", json_ints(&hints));
+                w.dirty = true;
+            }
+            // Windows that changed this tick.
+            if let Some(e) = g.players.get_mut(&pid)
+                && let Some(w) = e.window.as_mut()
+                && w.dirty
+                && w.id != 0
+            {
+                w.dirty = false;
+                let extra = std::mem::take(&mut w.extra_dirty).then(|| proto::ExtraResources {
+                    resources: Some(Vec::new()),
+                });
+                let u = proto::UpdateWindow {
+                    id: w.id,
+                    window_data: Some(w.data.text()),
+                    inventory: w.section(),
+                    extra_resources: extra,
+                };
+                if let Ok(p) = packet(self::id::UPDATE_WINDOW, &u) {
+                    out.to.push((pid, p));
+                }
+            }
+        }
+    }
+
+    /// Takes one unit of a queued craft's inputs; what it took.
+    fn take_job_unit(
+        &self,
+        e: &mut Entry,
+        job: &crate::crafting::Job,
+    ) -> Option<Vec<(String, i32)>> {
+        if !job.from_input {
+            let before = e.inv.clone();
+            let t = self.book.take_unit(&mut e.inv, &job.recipe)?;
+            let changed = e.inv.changed_since(&before);
+            e.inv_dirty.extend(changed);
+            return Some(t);
+        }
+        let m = self.book.single_input(&job.recipe)?.clone();
+        let w = e.window.as_mut()?;
+        let (item, have) = w.input.clone()?;
+        if !self.book.is_material(&m, &item) || have < m.quantity {
+            return None;
+        }
+        w.input = (have > m.quantity).then(|| (item.clone(), have - m.quantity));
+        self.update_options(w);
+        Some(vec![(item, m.quantity)])
     }
 
     /// The creative inventory: `SetCreativeItem` puts an item in any slot,
@@ -817,30 +1573,17 @@ impl Hub {
         }
     }
 
-    /// A few building blocks in the hotbar (those the registry has), for a
-    /// player with nothing; a returning player gets its saved inventory.
-    pub fn starter_kit(&self, id: i32) -> Result<()> {
-        let empty = self
-            .inner
-            .lock()
-            .unwrap()
-            .players
-            .get(&id)
-            .is_some_and(|e| e.inv.to_text().is_empty());
-        if !empty {
-            return self.with_inventory(id, |_| ()).map(|_| ());
-        }
-        let mut any = false;
-        for b in STARTER {
-            if self.blocks.contains_key(&b.to_lowercase()) {
-                let key = self.names.get(&b.to_lowercase()).map_or(*b, String::as_str);
-                self.give(id, key, 100)?;
-                any = true;
-            }
-        }
-        if !any {
-            tracing::warn!("no starter blocks found in the registry");
-        }
+    /// The player's whole inventory as saved (empty for a new player, as
+    /// on the official server), sent at once.
+    pub fn send_inventory(&self, id: i32) -> Result<()> {
+        let p = {
+            let g = self.inner.lock().unwrap();
+            let Some(e) = g.players.get(&id) else {
+                return Ok(());
+            };
+            packet(id::UPDATE_PLAYER_INVENTORY, &e.inv.packet())?
+        };
+        self.send(id, p);
         Ok(())
     }
 
@@ -859,10 +1602,9 @@ impl Hub {
 
     /// Changes one block for everyone, now and for later joiners.
     pub fn set_block(&self, x: i32, y: i32, z: i32, block: i32) -> Result<()> {
-        let p = set_block_packet(x, y, z, block)?;
-        self.inner.lock().unwrap().placed.insert((x, y, z), block);
-        self.broadcast(&p);
-        self.save_change(x, y, z, block);
+        self.world_step(|hub, g, ground, out| {
+            hub.change(g, ground, (x, y, z), block, 0, How::default(), out);
+        });
         Ok(())
     }
 
@@ -877,7 +1619,14 @@ impl Hub {
             let mut g = self.inner.lock().unwrap();
             for line in text.lines() {
                 let w: Vec<&str> = line.split_whitespace().collect();
-                let [x, y, z, key] = w[..] else { continue };
+                let (x, y, z, key, rot, filler) = match w[..] {
+                    [x, y, z, key] => (x, y, z, key, 0, 0),
+                    [x, y, z, key, r] => (x, y, z, key, r.parse().unwrap_or(0), 0),
+                    [x, y, z, key, r, f] => {
+                        (x, y, z, key, r.parse().unwrap_or(0), f.parse().unwrap_or(0))
+                    }
+                    _ => continue,
+                };
                 let (Ok(x), Ok(y), Ok(z)) = (x.parse(), y.parse(), z.parse()) else {
                     continue;
                 };
@@ -888,11 +1637,37 @@ impl Hub {
                 };
                 if let Some(id) = id {
                     g.placed.insert((x, y, z), id);
+                    if rot != 0 {
+                        g.rotations.insert((x, y, z), rot);
+                    } else {
+                        g.rotations.remove(&(x, y, z));
+                    }
+                    if filler != 0 {
+                        g.fillers.insert((x, y, z), filler);
+                    } else {
+                        g.fillers.remove(&(x, y, z));
+                    }
                     n += 1;
                 }
             }
             drop(g);
             info!("loaded {n} block changes from {}", file.display());
+        }
+        if let Ok(text) = std::fs::read_to_string(dir.join("support.txt")) {
+            let mut g = self.inner.lock().unwrap();
+            for line in text.lines() {
+                let w: Vec<&str> = line.split_whitespace().collect();
+                if let [x, y, z, v] = w[..]
+                    && let (Ok(x), Ok(y), Ok(z), Ok(v)) =
+                        (x.parse(), y.parse(), z.parse(), v.parse::<u8>())
+                {
+                    if v == 0 {
+                        g.support.remove(&(x, y, z));
+                    } else {
+                        g.support.insert((x, y, z), v);
+                    }
+                }
+            }
         }
         self.save = Some(file);
         Ok(self)
@@ -932,24 +1707,34 @@ impl Hub {
         }
     }
 
-    fn save_change(&self, x: i32, y: i32, z: i32, block: i32) {
+    fn save_change(&self, x: i32, y: i32, z: i32, block: i32, rot: i32, filler: i32) {
         let Some(file) = &self.save else { return };
         let key = if block == 0 {
             "air".to_owned()
         } else {
-            match self.blocks.iter().find(|(_, i)| **i == block) {
-                Some((k, _)) => self.names.get(k).cloned().unwrap_or_else(|| k.clone()),
+            match self.keys_by_id.get(&block) {
+                Some(k) => k.clone(),
                 None => return,
             }
         };
-        use std::io::Write;
-        let r = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(file)
-            .and_then(|mut f| writeln!(f, "{x} {y} {z} {key}"));
-        if let Err(e) = r {
-            tracing::warn!("saving a block change failed: {e}");
+        let line = if filler != 0 {
+            format!("{x} {y} {z} {key} {rot} {filler}")
+        } else if rot != 0 {
+            format!("{x} {y} {z} {key} {rot}")
+        } else {
+            format!("{x} {y} {z} {key}")
+        };
+        append_line(file, &line);
+    }
+
+    /// Support values that are not 0 (decoration), in `support.txt` next
+    /// to `blocks.txt`.
+    fn save_support(&self, x: i32, y: i32, z: i32, v: u8) {
+        if let Some(file) = &self.save {
+            append_line(
+                &file.with_file_name("support.txt"),
+                &format!("{x} {y} {z} {v}"),
+            );
         }
     }
 
@@ -1053,7 +1838,7 @@ impl Hub {
             }
         }
         drop(g);
-        self.pick_up(id)
+        Ok(())
     }
 
     /// A player is in the world: the others get its entity (`view`, as the
@@ -1097,7 +1882,12 @@ impl Hub {
             }
         }
         // Items lying around.
-        theirs.extend(g.items.iter().map(|(n, d)| item_entity(*n, d)));
+        theirs.extend(
+            g.items
+                .iter()
+                .filter(|(_, d)| d.announced)
+                .map(|(n, d)| item_entity(*n, &d.item, d.quantity, d.pos)),
+        );
         if !theirs.is_empty() {
             let p = packet(
                 id::ENTITY_UPDATES,
@@ -1118,7 +1908,7 @@ impl Hub {
     /// Returns the changes, for the caller to assert again a little later:
     /// the client rolls its prediction back when the chain is not answered,
     /// which Aerie does not do yet.
-    pub fn interactions(&self, _player: i32, payload: &[u8]) -> Result<Vec<BlockChange>> {
+    pub fn interactions(&self, _player: i32, payload: &[u8]) -> Result<()> {
         let (m, _) = proto::SyncInteractionChains::decode(payload, 0)?;
         let mut changes = Vec::new();
         let mut hits = Vec::new();
@@ -1129,7 +1919,7 @@ impl Hub {
                 && c.interaction_type == proto::InteractionType::PRIMARY
             {
                 if let Some(t) = c.data.as_ref().and_then(|d| d.block_position.as_ref()) {
-                    hits.push(((t.x, t.y, t.z), c.item_in_hand_id.clone()));
+                    hits.push(((t.x, t.y, t.z), c.active_hotbar_slot));
                 }
             }
             if c.initial
@@ -1142,7 +1932,10 @@ impl Hub {
             }
             for d in c.interaction_data.iter().flatten().flatten() {
                 if let (Some(p), true) = (&d.block_position, d.placed_block_id != i32::MIN) {
-                    changes.push(((p.x, p.y, p.z), d.placed_block_id));
+                    let rot = d.block_rotation.as_ref().map_or(0, |r| {
+                        r.rotation_roll.0 * 16 + r.rotation_pitch.0 * 4 + r.rotation_yaw.0
+                    });
+                    changes.push(((p.x, p.y, p.z), d.placed_block_id, rot));
                 }
             }
             Ok(())
@@ -1157,23 +1950,72 @@ impl Hub {
         for (x, y, z) in uses {
             self.open_bench(_player, x, y, z)?;
         }
-        for ((x, y, z), held) in hits {
-            if let Some(c) = self.hit(_player, x, y, z, held.as_deref())? {
-                changes.push(c);
-            }
+        for ((x, y, z), slot) in hits {
+            // The server's own idea of the held item, as the official
+            // server uses (not the id the client names).
+            let held = self
+                .inner
+                .lock()
+                .unwrap()
+                .players
+                .get(&_player)
+                .and_then(|e| e.inv.get(inventory::HOTBAR, slot))
+                .map(|(item, _)| item);
+            self.hit(_player, x, y, z, held.as_deref());
         }
         changes.dedup();
-        for &((x, y, z), b) in &changes {
-            if self.block_at(x, y, z) != Some(b) {
-                self.set_block(x, y, z, b)?;
-            }
+        for &((x, y, z), b, rot) in &changes {
+            self.player_change(x, y, z, b, rot);
         }
-        Ok(changes)
+        Ok(())
+    }
+
+    /// Damaged blocks of a column, per section, as the official server
+    /// sends them when a client loads the chunk (`UpdateBlockDamages`, delta
+    /// 0).
+    pub fn damage_packets(&self, cx: i32, cz: i32) -> Vec<Packet> {
+        let g = self.inner.lock().unwrap();
+        let mut by_section: BTreeMap<Pos, Vec<proto::BlockDamageCmd>> = BTreeMap::new();
+        for (&(x, y, z), &(h, _)) in &g.health {
+            if x.div_euclid(32) != cx || z.div_euclid(32) != cz {
+                continue;
+            }
+            let (sec, index) = section_of(x, y, z);
+            by_section
+                .entry(sec)
+                .or_default()
+                .push(proto::BlockDamageCmd {
+                    index: index as i16,
+                    damage: h,
+                    delta: 0.0,
+                });
+        }
+        by_section
+            .into_iter()
+            .filter_map(|(sec, mut cmds)| {
+                cmds.sort_by_key(|c| c.index);
+                packet(
+                    id::UPDATE_BLOCK_DAMAGES,
+                    &proto::UpdateBlockDamages {
+                        x: sec.0,
+                        y: sec.1,
+                        z: sec.2,
+                        cmds,
+                    },
+                )
+                .ok()
+            })
+            .collect()
     }
 
     /// The changed blocks inside section (cx, cy, cz), as (x, y, z within
     /// the section, block id).
-    pub fn changes_in(&self, cx: i32, cy: i32, cz: i32) -> Vec<(usize, usize, usize, i32)> {
+    pub fn changes_in(
+        &self,
+        cx: i32,
+        cy: i32,
+        cz: i32,
+    ) -> Vec<(usize, usize, usize, i32, i32, i32)> {
         let g = self.inner.lock().unwrap();
         g.placed
             .iter()
@@ -1186,6 +2028,8 @@ impl Hub {
                     y.rem_euclid(32) as usize,
                     z.rem_euclid(32) as usize,
                     b,
+                    g.rotations.get(&(x, y, z)).copied().unwrap_or(0),
+                    g.fillers.get(&(x, y, z)).copied().unwrap_or(0),
                 )
             })
             .collect()
@@ -1249,6 +2093,31 @@ impl Hub {
                  /setblock <x> <y> <z> <block>, /fill <x1> <y1> <z1> <x2> <y2> <z2> <block>, \
                  /blocks <part of a name>, /give <item> [amount], /clear",
             ),
+            ("block", ["set", x, y, z, block]) => {
+                let here = self.position(id);
+                let b = if block.eq_ignore_ascii_case("empty") {
+                    Some(0)
+                } else {
+                    self.block_id(block)
+                };
+                match (block_coords(here.as_ref(), [x, y, z]), b) {
+                    (Some([x, y, z]), Some(b)) => {
+                        self.set_block(x, y, z, b)?;
+                        self.tell(id, &format!("Set {x} {y} {z} to {block}"));
+                    }
+                    _ => self.tell(id, "Usage: /block set <x> <y> <z> <block>"),
+                }
+            }
+            ("block", ["setticking", x, y, z]) => {
+                let here = self.position(id);
+                match block_coords(here.as_ref(), [x, y, z]) {
+                    Some([x, y, z]) => {
+                        self.set_ticking(x, y, z);
+                        self.tell(id, &format!("{x} {y} {z} will be checked"));
+                    }
+                    None => self.tell(id, "Usage: /block setticking <x> <y> <z>"),
+                }
+            }
             ("clear", []) => {
                 self.with_inventory(id, |inv| *inv = Inventory::default())?;
                 self.tell(id, "Inventory cleared");
@@ -1424,20 +2293,6 @@ fn player_list_add(players: Vec<proto::ServerPlayerListPlayer>) -> Result<Packet
     )
 }
 
-pub fn set_block_packet(x: i32, y: i32, z: i32, block_id: i32) -> Result<Packet> {
-    packet(
-        id::SERVER_SET_BLOCK,
-        &proto::ServerSetBlock {
-            x,
-            y,
-            z,
-            block_id,
-            filler: 0,
-            rotation: 0,
-        },
-    )
-}
-
 /// A plain chat line.
 pub fn server_message(text: &str) -> Result<Packet> {
     packet(
@@ -1453,32 +2308,51 @@ pub fn server_message(text: &str) -> Result<Packet> {
 }
 
 /// A dropped item's entity: where it lies and what it is.
-fn item_entity(nid: i32, d: &Dropped) -> proto::EntityUpdate {
+/// How clients first see an item entity: its stack (entity scale 0),
+/// intangible, its position.
+fn item_entity(nid: i32, item: &str, quantity: i32, pos: [f64; 3]) -> proto::EntityUpdate {
     proto::EntityUpdate {
         network_id: nid,
         removed: None,
         updates: Some(vec![
-            proto::ComponentUpdate::TransformUpdate(Box::new(proto::TransformUpdate {
-                transform: proto::ModelTransform {
-                    position: Some(d.at.clone()),
-                    body_orientation: None,
-                    look_orientation: None,
-                },
-            })),
-            proto::ComponentUpdate::ItemUpdate(Box::new(proto::ItemUpdate {
-                item: proto::ItemWithAllMetadata {
-                    item_id: d.item.clone(),
-                    quantity: d.quantity,
-                    durability: 0.0,
-                    max_durability: 0.0,
-                    quality: -1,
-                    override_dropped_item_animation: false,
-                    metadata: None,
-                },
-                entity_scale: 1.0,
-            })),
+            item_update(item, quantity),
+            proto::ComponentUpdate::IntangibleUpdate(Box::default()),
+            transform_update(pos),
         ]),
     }
+}
+
+fn item_update(item: &str, quantity: i32) -> proto::ComponentUpdate {
+    proto::ComponentUpdate::ItemUpdate(Box::new(proto::ItemUpdate {
+        item: item_packet(item, quantity),
+        entity_scale: 0.0,
+    }))
+}
+
+fn item_packet(item: &str, quantity: i32) -> proto::ItemWithAllMetadata {
+    proto::ItemWithAllMetadata {
+        item_id: item.to_owned(),
+        quantity,
+        durability: 0.0,
+        max_durability: 0.0,
+        quality: -1,
+        override_dropped_item_animation: false,
+        metadata: None,
+    }
+}
+
+fn transform_update(pos: [f64; 3]) -> proto::ComponentUpdate {
+    proto::ComponentUpdate::TransformUpdate(Box::new(proto::TransformUpdate {
+        transform: proto::ModelTransform {
+            position: Some(proto::Position {
+                x: pos[0],
+                y: pos[1],
+                z: pos[2],
+            }),
+            body_orientation: None,
+            look_orientation: None,
+        },
+    }))
 }
 
 pub fn teleport_packet(teleport_id: i8, to: proto::Position) -> Result<Packet> {
@@ -1590,16 +2464,20 @@ mod tests {
         let (a, mut ra) = hub.join("Ana", uuid::Uuid::from_u128(1));
         texts(&mut ra);
         hub.chat(a, &chat("/setblock 1 2 3 Rock_Stone")).unwrap();
-        assert_eq!(texts(&mut ra), ["#140", "Set 1 2 3 to Rock_Stone"]);
+        // The particle at once; the block at the end of the tick.
+        assert_eq!(texts(&mut ra), ["#153", "Set 1 2 3 to Rock_Stone"]);
+        hub.tick();
+        // The block, the column's new height, then the network tick.
+        assert_eq!(texts(&mut ra), ["#140", "#183", "#5"]);
         hub.chat(a, &chat("/setblock 1 2 3 Nope")).unwrap();
         assert_eq!(texts(&mut ra), ["No block Nope; try /blocks <name>"]);
         hub.chat(a, &chat("/fill 0 0 0 1 1 0 7")).unwrap();
         assert_eq!(texts(&mut ra).last().unwrap(), "Filled 4 blocks with 7");
-        let (_b, mut rb) = hub.join("Bia", uuid::Uuid::from_u128(2));
-        // Player list, then the 5 changed blocks, then the greeting.
-        let got = texts(&mut rb);
-        assert_eq!(got[0], "#224");
-        assert_eq!(got.iter().filter(|t| *t == "#140").count(), 5);
+        hub.tick();
+        // Four changes in one section and tick: one ServerSetBlocks.
+        assert_eq!(texts(&mut ra)[0], "#141");
+        // Later joiners get them in their chunks.
+        assert_eq!(hub.changes_in(0, 0, 0).len(), 5);
         hub.chat(a, &chat("/fill 0 0 0 100 100 100 7")).unwrap();
         assert!(texts(&mut ra).last().unwrap().contains("too many"));
     }
@@ -1625,14 +2503,11 @@ mod give_tests {
         let hub = Hub::new(HashMap::from([("rock_stone".to_owned(), 7)]));
         let (a, mut ra) = hub.join("Ana", uuid::Uuid::from_u128(1));
         while ra.try_recv().is_ok() {}
-        hub.starter_kit(a).unwrap();
-        let (i, p) = ra.try_recv().unwrap();
+        hub.send_inventory(a).unwrap();
+        let (i, _) = ra.try_recv().unwrap();
         assert_eq!(i, id::UPDATE_PLAYER_INVENTORY);
-        let (inv, _) = proto::UpdatePlayerInventory::decode(&p, 0).unwrap();
-        let hb = inv.hotbar.unwrap().items.unwrap();
-        assert_eq!(hb[0].1.item_id, "Rock_Stone");
-        assert_eq!(hub.give(a, "Torch", 5).unwrap(), 1);
         assert_eq!(hub.give(a, "Rock_Stone", 3).unwrap(), 0);
+        assert_eq!(hub.give(a, "Torch", 5).unwrap(), 1);
     }
 }
 
@@ -1686,26 +2561,28 @@ mod interaction_tests {
     #[test]
     fn break_and_place() {
         let hub = Hub::new(HashMap::new());
+        hub.set_ground(vec![1; 64], None);
         let (a, mut ra) = hub.join("Ana", uuid::Uuid::from_u128(1));
         hub.interactions(a, &sync(proto::InteractionType::PRIMARY, true, None))
             .unwrap();
+        hub.tick();
         assert_eq!(set_blocks(&mut ra), [(18, 63, 16, 0)]);
         // Holding the button sends more of the same chain: nothing new.
         hub.interactions(a, &sync(proto::InteractionType::PRIMARY, false, None))
             .unwrap();
+        hub.tick();
         assert!(set_blocks(&mut ra).is_empty());
         // The client reports where it placed a block.
-        let c = hub
-            .interactions(
-                a,
-                &sync(
-                    proto::InteractionType::SECONDARY,
-                    false,
-                    Some((17, 64, 14, 1530)),
-                ),
-            )
-            .unwrap();
-        assert_eq!(c, [((17, 64, 14), 1530)]);
+        hub.interactions(
+            a,
+            &sync(
+                proto::InteractionType::SECONDARY,
+                false,
+                Some((17, 64, 14, 1530)),
+            ),
+        )
+        .unwrap();
+        hub.tick();
         assert_eq!(set_blocks(&mut ra), [(17, 64, 14, 1530)]);
         // Reported again: already there, not sent again.
         hub.interactions(
@@ -1717,6 +2594,7 @@ mod interaction_tests {
             ),
         )
         .unwrap();
+        hub.tick();
         assert!(set_blocks(&mut ra).is_empty());
     }
 }
@@ -1737,10 +2615,8 @@ fn recorded_interactions() {
         .collect();
     files.sort();
     for f in files {
-        let c = hub.interactions(a, &std::fs::read(&f).unwrap()).unwrap();
-        if !c.is_empty() {
-            eprintln!("{}: {c:?}", f.file_name().unwrap().to_string_lossy());
-        }
+        hub.interactions(a, &std::fs::read(&f).unwrap()).unwrap();
+        hub.tick();
     }
 }
 
@@ -1808,6 +2684,7 @@ mod save_tests {
             .with_world(dir.clone())
             .unwrap();
         hub.set_block(1, 2, 3, 7).unwrap();
+        hub.set_block(4, 5, 6, 7).unwrap();
         hub.set_block(4, 5, 6, 0).unwrap();
         let again = Hub::with_names(blocks, names)
             .with_world(dir.clone())
@@ -1815,5 +2692,1051 @@ mod save_tests {
         assert_eq!(again.block_at(1, 2, 3), Some(7));
         assert_eq!(again.block_at(4, 5, 6), Some(0));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+fn append_line(file: &std::path::Path, line: &str) {
+    use std::io::Write;
+    let r = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file)
+        .and_then(|mut f| writeln!(f, "{line}"));
+    if let Err(e) = r {
+        warn!("saving to {} failed: {e}", file.display());
+    }
+}
+
+/// The ground under the changes, as the hub keeps it.
+type Ground = Option<(Vec<i32>, Option<crate::terrain::Generator>)>;
+
+fn ground_block(ground: &Ground, x: i32, y: i32, z: i32) -> i32 {
+    match ground {
+        Some((_, Some(g))) => g.block(x, y, z),
+        Some((layers, None)) => usize::try_from(y)
+            .ok()
+            .and_then(|y| layers.get(y))
+            .copied()
+            .unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// The world as block support sees it.
+struct View<'a> {
+    g: &'a Inner,
+    ground: &'a Ground,
+    hub_rules: &'a crate::support::Rules,
+}
+
+impl crate::support::World for View<'_> {
+    fn block(&self, x: i32, y: i32, z: i32) -> (i32, i32) {
+        if !(0..crate::support::WORLD_HEIGHT).contains(&y) {
+            return (0, 0);
+        }
+        let id = match self.g.placed.get(&(x, y, z)) {
+            Some(&b) => b,
+            None => ground_block(self.ground, x, y, z),
+        };
+        (id, self.g.rotations.get(&(x, y, z)).copied().unwrap_or(0))
+    }
+    fn support_value(&self, x: i32, y: i32, z: i32) -> u8 {
+        self.g.support.get(&(x, y, z)).copied().unwrap_or(0)
+    }
+}
+
+impl crate::items::Blocks for View<'_> {
+    fn solid_boxes(&self, x: i32, y: i32, z: i32) -> Option<Vec<[f64; 6]>> {
+        use crate::support::World;
+        let (id, rot) = self.block(x, y, z);
+        self.hub_rules.solid_boxes(id, rot)
+    }
+}
+
+/// Packets and drops a world step produces, sent once the locks are gone.
+#[derive(Default)]
+struct Outgoing {
+    all: Vec<Packet>,
+    to: Vec<(i32, Packet)>,
+    drops: Vec<(Vec<(String, i32)>, [f64; 3])>,
+}
+
+/// A part's offset packed as the official server does (5 bits each:
+/// x, z, y).
+fn pack_filler(c: [i32; 3]) -> i32 {
+    (c[0] & 31) | (c[2] & 31) << 5 | (c[1] & 31) << 10
+}
+
+fn unpack_filler(v: i32) -> [i32; 3] {
+    let sign = |n: i32| if n & 16 != 0 { n | -32 } else { n };
+    [sign(v & 31), sign(v >> 10 & 31), sign(v >> 5 & 31)]
+}
+
+fn json_ints(v: &[i32]) -> String {
+    format!(
+        "[{}]",
+        v.iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn sound_2d_packet(index: i32) -> Result<Packet> {
+    packet(
+        id::PLAY_SOUND_2D,
+        &proto::PlaySoundEvent2D {
+            sound_event_index: index,
+            category: proto::SoundCategory::UI,
+            volume_modifier: 1.0,
+            pitch_modifier: 1.0,
+        },
+    )
+}
+
+fn sound_3d_packet(index: i32, category: proto::SoundCategory, at: [f64; 3]) -> Result<Packet> {
+    packet(
+        id::PLAY_SOUND_3D,
+        &proto::PlaySoundEvent3D {
+            sound_event_index: index,
+            category,
+            position: Some(proto::Position {
+                x: at[0],
+                y: at[1],
+                z: at[2],
+            }),
+            volume_modifier: 1.0,
+            pitch_modifier: 1.0,
+        },
+    )
+}
+
+fn dist2(a: [f64; 3], b: [f64; 3]) -> f64 {
+    (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)
+}
+
+fn section_of(x: i32, y: i32, z: i32) -> (Pos, i32) {
+    (
+        (x.div_euclid(32), y.div_euclid(32), z.div_euclid(32)),
+        crate::chunk::index(
+            x.rem_euclid(32) as usize,
+            y.rem_euclid(32) as usize,
+            z.rem_euclid(32) as usize,
+        ) as i32,
+    )
+}
+
+fn block_of(sec: Pos, index: i32) -> Pos {
+    (
+        sec.0 * 32 + (index & 31),
+        sec.1 * 32 + (index >> 10),
+        sec.2 * 32 + ((index >> 5) & 31),
+    )
+}
+
+impl Hub {
+    pub fn with_rules(mut self, r: crate::support::Rules) -> Self {
+        self.rules = r;
+        self
+    }
+
+    /// Whether a block counts for the height of its column (not
+    /// transparent).
+    pub fn opaque(&self, id: i32) -> bool {
+        id != 0 && self.rules.block(id).is_none_or(|b| !b.transparent)
+    }
+
+    /// Marks a block for a support check at the next tick.
+    fn mark(g: &mut Inner, x: i32, y: i32, z: i32) {
+        if (0..crate::support::WORLD_HEIGHT).contains(&y) {
+            let (sec, i) = section_of(x, y, z);
+            g.ticking.insert((sec, i));
+        }
+    }
+
+    /// Marks a block's hitbox grown by one block (3×3×3 for a plain block).
+    fn mark_area(&self, g: &mut Inner, x: i32, y: i32, z: i32, id: i32, rot: i32) {
+        let cells = self.rules.cells(id, rot);
+        let lo = |a: usize| cells.iter().map(|c| c[a]).min().unwrap_or(0) - 1;
+        let hi = |a: usize| cells.iter().map(|c| c[a]).max().unwrap_or(0) + 1;
+        for dx in lo(0)..=hi(0) {
+            for dy in lo(1)..=hi(1) {
+                for dz in lo(2)..=hi(2) {
+                    Self::mark(g, x + dx, y + dy, z + dz);
+                }
+            }
+        }
+    }
+
+    /// The highest non-transparent block of a column at or below `from`.
+    fn scan_top(&self, view: &View, x: i32, z: i32, from: i32) -> i32 {
+        use crate::support::World;
+        (0..=from)
+            .rev()
+            .find(|&y| self.opaque(view.block(x, y, z).0))
+            .unwrap_or(i32::MIN)
+    }
+
+    fn top(&self, g: &mut Inner, ground: &Ground, x: i32, z: i32) -> i32 {
+        if let Some(&t) = g.tops.get(&(x, z)) {
+            return t;
+        }
+        let t = self.scan_top(
+            &View {
+                g,
+                ground,
+                hub_rules: &self.rules,
+            },
+            x,
+            z,
+            crate::support::WORLD_HEIGHT - 1,
+        );
+        g.tops.insert((x, z), t);
+        t
+    }
+
+    /// Changes one block (spec 10): kept, queued for clients at the end of
+    /// the tick, height, particles, support value, area marked when `how`
+    /// says so. Returns the old block and rotation if it changed.
+    #[allow(clippy::too_many_arguments)]
+    fn change(
+        &self,
+        g: &mut Inner,
+        ground: &Ground,
+        (x, y, z): Pos,
+        id: i32,
+        rot: i32,
+        how: How,
+        out: &mut Outgoing,
+    ) -> Option<(i32, i32)> {
+        let old_filler = g.fillers.get(&(x, y, z)).copied().unwrap_or(0);
+        let (old, old_rot) = self.set_cell(g, ground, (x, y, z), id, rot, 0, how, out)?;
+        // The old block's other parts go (spec 10, fillers).
+        if old != 0 {
+            self.remove_parts(g, ground, (x, y, z), old, old_rot, old_filler, how, out);
+        }
+        // The new block's other parts.
+        if id != 0 {
+            for c in self.rules.cells(id, rot) {
+                if c == [0, 0, 0] {
+                    continue;
+                }
+                let at = (x + c[0], y + c[1], z + c[2]);
+                let prev_filler = g.fillers.get(&at).copied().unwrap_or(0);
+                let filler = pack_filler(c);
+                if let Some((prev, prev_rot)) =
+                    self.set_cell(g, ground, at, id, rot, filler, how, out)
+                    && prev != 0
+                {
+                    self.remove_parts(g, ground, at, prev, prev_rot, prev_filler, how, out);
+                }
+            }
+        }
+        Some((old, old_rot))
+    }
+
+    /// Removes the other parts of a multi-block block whose part at `at`
+    /// had offset `filler`: the cells of its hitbox still holding it.
+    #[allow(clippy::too_many_arguments)]
+    fn remove_parts(
+        &self,
+        g: &mut Inner,
+        ground: &Ground,
+        at: Pos,
+        block: i32,
+        rot: i32,
+        filler: i32,
+        how: How,
+        out: &mut Outgoing,
+    ) {
+        use crate::support::World;
+        let f = unpack_filler(filler);
+        let base = (at.0 - f[0], at.1 - f[1], at.2 - f[2]);
+        for c in self.rules.cells(block, rot) {
+            if c == f {
+                continue;
+            }
+            let p = (base.0 + c[0], base.1 + c[1], base.2 + c[2]);
+            let here = View {
+                g,
+                ground,
+                hub_rules: &self.rules,
+            }
+            .block(p.0, p.1, p.2)
+            .0;
+            if here == block {
+                self.set_cell(g, ground, p, 0, 0, 0, how, out);
+            }
+        }
+    }
+
+    /// Sets one cell (block, rotation, filler): kept, queued for clients,
+    /// height, particles, support value, area marks. The old block and
+    /// rotation when it changed.
+    #[allow(clippy::too_many_arguments)]
+    fn set_cell(
+        &self,
+        g: &mut Inner,
+        ground: &Ground,
+        (x, y, z): Pos,
+        id: i32,
+        rot: i32,
+        filler: i32,
+        how: How,
+        out: &mut Outgoing,
+    ) -> Option<(i32, i32)> {
+        use crate::support::World;
+        if !(0..crate::support::WORLD_HEIGHT).contains(&y) {
+            return None;
+        }
+        let (old, old_rot) = View {
+            g,
+            ground,
+            hub_rules: &self.rules,
+        }
+        .block(x, y, z);
+        let old_filler = g.fillers.get(&(x, y, z)).copied().unwrap_or(0);
+        if old == id && old_rot == rot && old_filler == filler {
+            return None;
+        }
+        let old_top = self.top(g, ground, x, z);
+        g.placed.insert((x, y, z), id);
+        if rot != 0 {
+            g.rotations.insert((x, y, z), rot);
+        } else {
+            g.rotations.remove(&(x, y, z));
+        }
+        if filler != 0 {
+            g.fillers.insert((x, y, z), filler);
+        } else {
+            g.fillers.remove(&(x, y, z));
+        }
+        let (sec, index) = section_of(x, y, z);
+        let tick = g.tick;
+        g.sections.entry(sec).or_default().add(tick, index);
+        g.touched.insert(sec);
+        let new_top = if self.opaque(id) && y > old_top {
+            y
+        } else if y == old_top && !self.opaque(id) {
+            self.scan_top(
+                &View {
+                    g,
+                    ground,
+                    hub_rules: &self.rules,
+                },
+                x,
+                z,
+                y - 1,
+            )
+        } else {
+            old_top
+        };
+        if new_top != old_top {
+            g.tops.insert((x, z), new_top);
+            g.heights
+                .entry((x.div_euclid(32), z.div_euclid(32)))
+                .or_default()
+                .insert((z.rem_euclid(32) << 5) | x.rem_euclid(32));
+        }
+        let at = Some(proto::Position {
+            x: x as f64 + 0.5,
+            y: y as f64 + 0.5,
+            z: z as f64 + 0.5,
+        });
+        let particle = |block_id: i32, ev: proto::BlockParticleEvent| {
+            packet(
+                id::SPAWN_BLOCK_PARTICLE_SYSTEM,
+                &proto::SpawnBlockParticleSystem {
+                    block_id,
+                    particle_type: ev,
+                    position: at.clone(),
+                },
+            )
+        };
+        let gone = if how.by_physics {
+            proto::BlockParticleEvent::PHYSICS
+        } else {
+            proto::BlockParticleEvent::BREAK
+        };
+        let parts = if old != 0 && id == 0 {
+            vec![particle(old, gone)]
+        } else if old == 0 && id != 0 {
+            vec![particle(id, proto::BlockParticleEvent::BUILD)]
+        } else {
+            vec![
+                particle(old, proto::BlockParticleEvent::BREAK),
+                particle(id, proto::BlockParticleEvent::BUILD),
+            ]
+        };
+        if !how.quiet {
+            out.all.extend(parts.into_iter().flatten());
+        }
+        g.support.remove(&(x, y, z));
+        if how.physics && filler == 0 {
+            self.mark_area(g, x, y, z, id, rot);
+        }
+        self.save_change(x, y, z, id, rot, filler);
+        Some((old, old_rot))
+    }
+
+    /// Runs `f` on the world with both locks, then sends what it produced.
+    fn world_step<T>(&self, f: impl FnOnce(&Self, &mut Inner, &Ground, &mut Outgoing) -> T) -> T {
+        let mut out = Outgoing::default();
+        let r = {
+            let ground = self.ground.lock().unwrap();
+            let mut g = self.inner.lock().unwrap();
+            f(self, &mut g, &ground, &mut out)
+        };
+        for p in &out.all {
+            self.broadcast(p);
+        }
+        for (to, p) in out.to {
+            self.send(to, p);
+        }
+        for (stacks, at) in out.drops {
+            self.drop_items(stacks, at);
+        }
+        r
+    }
+
+    /// A block a player broke or placed (spec 10): its area is marked for
+    /// support checks; a placed block that the assets make decoration
+    /// (trunks, for instance) is never checked.
+    pub fn player_change(&self, x: i32, y: i32, z: i32, block: i32, rot: i32) {
+        self.world_step(|hub, g, ground, out| {
+            let how = How {
+                physics: true,
+                ..Default::default()
+            };
+            if let Some((old, old_rot)) = hub.change(g, ground, (x, y, z), block, rot, how, out) {
+                if block == 0 {
+                    hub.mark_area(g, x, y, z, old, old_rot);
+                } else if hub.rules.block(block).is_some_and(|b| b.deco_when_placed) {
+                    g.support.insert((x, y, z), crate::support::DECO);
+                    hub.save_support(x, y, z, crate::support::DECO);
+                }
+            }
+        });
+    }
+
+    /// The official `/block setticking`: one block checked next tick.
+    pub fn set_ticking(&self, x: i32, y: i32, z: i32) {
+        Self::mark(&mut self.inner.lock().unwrap(), x, y, z);
+    }
+
+    /// One world tick (30 a second): support checks of the blocks marked
+    /// before it, then the block and height changes of the tick go out.
+    pub fn tick(&self) {
+        let now = std::time::Instant::now();
+        let dt = match self.last_tick.lock().unwrap().replace(now) {
+            Some(t) => (now - t).as_secs_f32(),
+            None => crate::items::DT,
+        };
+        self.world_step(|hub, g, ground, out| {
+            g.in_tick = true;
+            let todo = std::mem::take(&mut g.ticking);
+            for (sec, index) in todo {
+                hub.check_support(g, ground, block_of(sec, index), out);
+            }
+            hub.flush(g, ground, out);
+            hub.health_step(g, dt, out);
+            hub.items_step(g, ground, dt, out);
+            hub.crafting_step(g, ground, dt, out);
+            // Inventories that changed, only their changed sections.
+            for (pid, e) in g.players.iter_mut() {
+                if e.inv_dirty.is_empty() {
+                    continue;
+                }
+                let which: Vec<i32> = std::mem::take(&mut e.inv_dirty).into_iter().collect();
+                if let Ok(p) = packet(id::UPDATE_PLAYER_INVENTORY, &e.inv.packet_of(&which)) {
+                    out.to.push((*pid, p));
+                }
+            }
+            g.in_tick = false;
+            g.tick += 1;
+        });
+    }
+
+    fn check_support(&self, g: &mut Inner, ground: &Ground, (x, y, z): Pos, out: &mut Outgoing) {
+        use crate::support::{DECO, Found, World};
+        let (id, rot) = View {
+            g,
+            ground,
+            hub_rules: &self.rules,
+        }
+        .block(x, y, z);
+        if id == 0 || g.support.get(&(x, y, z)) == Some(&DECO) || g.fillers.contains_key(&(x, y, z))
+        {
+            return;
+        }
+        let found = self.rules.check(
+            &View {
+                g,
+                ground,
+                hub_rules: &self.rules,
+            },
+            x,
+            y,
+            z,
+        );
+        let current = g.support.get(&(x, y, z)).copied().unwrap_or(0) as i32;
+        match found {
+            Found::NoRule => {}
+            Found::Direct => {
+                if current != 0 {
+                    g.support.remove(&(x, y, z));
+                    self.mark_neighbours(g, x, y, z, None);
+                }
+            }
+            Found::Distance(d) => {
+                if current == d {
+                    self.mark_neighbours(g, x, y, z, Some(d - 1));
+                } else {
+                    g.support.insert((x, y, z), d as u8);
+                    self.mark_neighbours(g, x, y, z, None);
+                }
+            }
+            Found::Unsupported => self.unsupported(g, ground, (x, y, z), id, rot, out),
+        }
+    }
+
+    /// Marks the 3×3×3 around a block, only those with a support value at
+    /// most `max` when given.
+    fn mark_neighbours(&self, g: &mut Inner, x: i32, y: i32, z: i32, max: Option<i32>) {
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                for dy in -1..=1 {
+                    let p = (x + dx, y + dy, z + dz);
+                    let v = g.support.get(&p).copied().unwrap_or(0) as i32;
+                    if max.is_none_or(|m| v <= m) {
+                        Self::mark(g, p.0, p.1, p.2);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A block without support (spec 10, "Removing an unsupported block").
+    fn unsupported(
+        &self,
+        g: &mut Inner,
+        ground: &Ground,
+        (x, y, z): Pos,
+        id: i32,
+        rot: i32,
+        out: &mut Outgoing,
+    ) {
+        let Some(b) = self.rules.block(id).cloned() else {
+            return;
+        };
+        if b.drop_type == 2 {
+            // Falling blocks become entities (spec 11), not done yet.
+            warn!(
+                "{} at {x} {y} {z} would fall (falling blocks not done)",
+                b.key
+            );
+            return;
+        }
+        if b.break_sound > 0 {
+            let (cx, cy, cz) = (x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5);
+            let reach = self.rules.sound_distance(b.break_sound) as f64;
+            if let Ok(p) = packet(
+                id::PLAY_SOUND_3D,
+                &proto::PlaySoundEvent3D {
+                    sound_event_index: b.break_sound,
+                    category: proto::SoundCategory::SFX,
+                    position: Some(proto::Position {
+                        x: cx,
+                        y: cy,
+                        z: cz,
+                    }),
+                    volume_modifier: 1.0,
+                    pitch_modifier: 1.0,
+                },
+            ) {
+                for (&pid, e) in &g.players {
+                    if let Some(at) = &e.position {
+                        let d2 = (at.x - cx).powi(2) + (at.y - cy).powi(2) + (at.z - cz).powi(2);
+                        if d2 <= reach * reach {
+                            out.to.push((pid, p.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        let how = How {
+            physics: true,
+            by_physics: true,
+            ..Default::default()
+        };
+        self.change(g, ground, (x, y, z), 0, 0, how, out);
+        self.mark_area(g, x, y, z, id, rot);
+        if b.drop_type == 0 {
+            let stacks = self.rules.roll(&b.physics_drops());
+            out.drops
+                .push((stacks, [x as f64 + 0.5, y as f64, z as f64 + 0.5]));
+        }
+    }
+
+    /// The end of a tick: block changes per section, then heights.
+    fn flush(&self, g: &mut Inner, ground: &Ground, out: &mut Outgoing) {
+        use crate::support::World;
+        let tick = g.tick;
+        let touched = std::mem::take(&mut g.touched);
+        for sec in touched {
+            let list = g
+                .sections
+                .get_mut(&sec)
+                .map(|s| s.take(tick))
+                .unwrap_or_default();
+            if list.is_empty() {
+                continue;
+            }
+            let view = View {
+                g,
+                ground,
+                hub_rules: &self.rules,
+            };
+            let p = if list.len() == 1 {
+                let (x, y, z) = block_of(sec, list[0]);
+                let (b, r) = view.block(x, y, z);
+                let f = g.fillers.get(&(x, y, z)).copied().unwrap_or(0);
+                packet(
+                    id::SERVER_SET_BLOCK,
+                    &proto::ServerSetBlock {
+                        x,
+                        y,
+                        z,
+                        block_id: b,
+                        filler: f as i16,
+                        rotation: r as i8,
+                    },
+                )
+            } else if list.len() < 1024 {
+                let cmds = list
+                    .iter()
+                    .map(|&i| {
+                        let (x, y, z) = block_of(sec, i);
+                        let (b, r) = view.block(x, y, z);
+                        proto::SetBlockCmd {
+                            index: i as i16,
+                            block_id: b,
+                            filler: g.fillers.get(&(x, y, z)).copied().unwrap_or(0) as i16,
+                            rotation: r as i8,
+                        }
+                    })
+                    .collect();
+                packet(
+                    id::SERVER_SET_BLOCKS,
+                    &proto::ServerSetBlocks {
+                        x: sec.0,
+                        y: sec.1,
+                        z: sec.2,
+                        cmds,
+                    },
+                )
+            } else {
+                self.section_packet(&view, sec)
+            };
+            match p {
+                Ok(p) => out.all.push(p),
+                Err(e) => warn!("block changes not sent: {e:#}"),
+            }
+        }
+        let heights = std::mem::take(&mut g.heights);
+        for ((cx, cz), idx) in heights {
+            let p = if idx.len() == 1 {
+                let i = *idx.iter().next().unwrap();
+                let (x, z) = (cx * 32 + (i & 31), cz * 32 + (i >> 5));
+                let height = g.tops.get(&(x, z)).copied().unwrap_or(i32::MIN);
+                packet(
+                    id::SERVER_SET_HEIGHT,
+                    &proto::ServerSetHeight { x, z, height },
+                )
+            } else if idx.len() < 512 {
+                let heights = idx
+                    .iter()
+                    .map(|&i| proto::SetHeightCmd {
+                        index: i as i16,
+                        height: g
+                            .tops
+                            .get(&(cx * 32 + (i & 31), cz * 32 + (i >> 5)))
+                            .copied()
+                            .unwrap_or(i32::MIN),
+                    })
+                    .collect();
+                packet(
+                    id::SERVER_SET_HEIGHTS,
+                    &proto::ServerSetHeights {
+                        x: cx,
+                        z: cz,
+                        heights,
+                    },
+                )
+            } else {
+                let mut heightmap = Vec::with_capacity(1024);
+                for z in 0..32 {
+                    for x in 0..32 {
+                        heightmap.push(self.top(g, ground, cx * 32 + x, cz * 32 + z));
+                    }
+                }
+                packet(
+                    id::SET_CHUNK_HEIGHTMAP,
+                    &proto::SetChunkHeightmap {
+                        x: cx,
+                        z: cz,
+                        heightmap,
+                    },
+                )
+            };
+            match p {
+                Ok(p) => out.all.push(p),
+                Err(e) => warn!("heights not sent: {e:#}"),
+            }
+        }
+    }
+
+    /// Dropped items for one tick (spec 11), then what clients see:
+    /// `NetworkTick` and `EntityUpdates`.
+    fn items_step(&self, g: &mut Inner, ground: &Ground, dt: f32, out: &mut Outgoing) {
+        use crate::items;
+        let tick = g.tick;
+        let mut updates: Vec<proto::EntityUpdate> = Vec::new();
+        let mut moved: Vec<i32> = Vec::new();
+        // Physics.
+        let ids: Vec<i32> = g.items.keys().copied().collect();
+        for nid in &ids {
+            let Some(mut it) = g.items.get(nid).cloned() else {
+                continue;
+            };
+            if it.born > tick {
+                continue;
+            }
+            let view = View {
+                g,
+                ground,
+                hub_rules: &self.rules,
+            };
+            items::move_out(&mut it.pos, &mut it.vel, &view);
+            items::gravity(&mut it.vel, dt);
+            if items::movement(&mut it.pos, &mut it.vel, dt, &view) {
+                moved.push(*nid);
+            }
+            if it.pos[1] < -32.0 {
+                g.items.remove(nid);
+                g.gone.push(*nid);
+                continue;
+            }
+            g.items.insert(*nid, it);
+        }
+        // Merging.
+        for nid in &ids {
+            let Some(it) = g.items.get(nid).cloned() else {
+                continue;
+            };
+            if it.born > tick {
+                continue;
+            }
+            let max = self.book.max_stack(&it.item);
+            if max <= 1 || it.quantity >= max {
+                continue;
+            }
+            let poll = g
+                .items
+                .get_mut(nid)
+                .map(|i| i.poll_merge_delay(dt))
+                .unwrap_or(false);
+            if !poll {
+                continue;
+            }
+            let mut near: Vec<(f64, i32)> = g
+                .items
+                .iter()
+                .filter(|(o, d)| *o != nid && d.born <= tick && d.item == it.item)
+                .map(|(o, d)| (dist2(d.pos, it.pos), *o))
+                .filter(|(d2, _)| *d2 <= items::MERGE_RADIUS * items::MERGE_RADIUS)
+                .collect();
+            // Nearest first; at the same distance the newest first (as the
+            // official server's removal list shows).
+            near.sort_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)));
+            let mut have = it.quantity;
+            for (_, o) in near {
+                let Some(other) = g.items.get(&o).cloned() else {
+                    continue;
+                };
+                if other.quantity >= max {
+                    continue;
+                }
+                let total = have + other.quantity;
+                if total <= max {
+                    g.items.remove(&o);
+                    g.gone.push(o);
+                    have = total;
+                } else if let Some(x) = g.items.get_mut(&o) {
+                    x.quantity = total - max;
+                    x.stack_changed = true;
+                    x.life = self.item_life(&x.item);
+                    have = max;
+                }
+                if let Some(x) = g.items.get_mut(nid) {
+                    x.quantity = have;
+                    x.stack_changed = true;
+                    x.life = self.item_life(&x.item);
+                }
+                if have >= max {
+                    break;
+                }
+            }
+        }
+        // Pickup.
+        let ids: Vec<i32> = g.items.keys().copied().collect();
+        for nid in ids {
+            let Some(mut it) = g.items.get(&nid).cloned() else {
+                continue;
+            };
+            if it.born > tick || !it.poll_pickup_delay(dt) || !it.poll_throttle(dt) {
+                g.items.insert(nid, it);
+                continue;
+            }
+            g.items.insert(nid, it.clone());
+            let mut players: Vec<(f64, i32)> = g
+                .players
+                .iter()
+                .filter_map(|(pid, e)| {
+                    let p = e.position.as_ref()?;
+                    let d2 = dist2([p.x, p.y, p.z], it.pos);
+                    (d2 <= items::PICKUP_RADIUS * items::PICKUP_RADIUS).then_some((d2, *pid))
+                })
+                .collect();
+            players.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (_, pid) in players {
+                let max = self.book.max_stack(&it.item);
+                let Some(e) = g.players.get_mut(&pid) else {
+                    continue;
+                };
+                let before = e.inv.clone();
+                let left = e.inv.add(&it.item, it.quantity, max);
+                if left == it.quantity {
+                    continue;
+                }
+                let taken = it.quantity - left;
+                let changed = e.inv.changed_since(&before);
+                e.inv_dirty.extend(changed);
+                self.notify_pickup(pid, &it.item, taken, it.pos, out);
+                let target = e.position.as_ref().map_or(it.pos, |p| [p.x, p.y, p.z]);
+                g.next_item = g.next_item.max(FIRST_ITEM_ID) + 1;
+                let fid = g.next_item;
+                if left == 0 {
+                    g.items.remove(&nid);
+                    g.gone.push(nid);
+                    g.flights.insert(
+                        fid,
+                        items::Flight {
+                            item: it.item.clone(),
+                            quantity: it.quantity,
+                            start: it.pos,
+                            pos: it.pos,
+                            to_player: pid,
+                            life: items::FLIGHT_TIME,
+                            announced: false,
+                            finished: false,
+                        },
+                    );
+                    let _ = target;
+                    break;
+                }
+                it.quantity = left;
+                it.stack_changed = true;
+                it.life = self.item_life(&it.item);
+                g.items.insert(nid, it.clone());
+                g.flights.insert(
+                    fid,
+                    items::Flight {
+                        item: it.item.clone(),
+                        quantity: left,
+                        start: it.pos,
+                        pos: it.pos,
+                        to_player: pid,
+                        life: items::FLIGHT_TIME,
+                        announced: false,
+                        finished: false,
+                    },
+                );
+            }
+        }
+        // Lifetimes.
+        let ids: Vec<i32> = g.items.keys().copied().collect();
+        for nid in ids {
+            if let Some(it) = g.items.get_mut(&nid)
+                && it.born <= tick
+            {
+                it.life -= dt;
+                if it.life <= 0.0 {
+                    g.items.remove(&nid);
+                    g.gone.push(nid);
+                }
+            }
+        }
+        // Flights to the players.
+        let fids: Vec<i32> = g.flights.keys().copied().collect();
+        for fid in fids {
+            let Some(mut f) = g.flights.remove(&fid) else {
+                continue;
+            };
+            if f.finished {
+                g.gone.push(fid);
+                continue;
+            }
+            let Some(p) = g.players.get(&f.to_player).and_then(|e| e.position.clone()) else {
+                g.gone.push(fid);
+                continue;
+            };
+            let target = [p.x, p.y + self.eye_height / 5.0, p.z];
+            if f.step(target, dt) {
+                f.finished = true;
+            }
+            if f.announced {
+                updates.push(proto::EntityUpdate {
+                    network_id: fid,
+                    removed: None,
+                    updates: Some(vec![transform_update(f.pos)]),
+                });
+            } else {
+                f.announced = true;
+                updates.push(proto::EntityUpdate {
+                    network_id: fid,
+                    removed: None,
+                    updates: Some(vec![
+                        item_update(&f.item, f.quantity),
+                        proto::ComponentUpdate::IntangibleUpdate(Box::default()),
+                        transform_update(f.pos),
+                    ]),
+                });
+            }
+            g.flights.insert(fid, f);
+        }
+        // What clients see of the items.
+        for (nid, it) in g.items.iter_mut() {
+            if it.born > tick {
+                continue;
+            }
+            if !it.announced {
+                it.announced = true;
+                it.stack_changed = false;
+                updates.push(item_entity(*nid, &it.item, it.quantity, it.pos));
+                continue;
+            }
+            let mut parts = Vec::new();
+            if it.stack_changed {
+                it.stack_changed = false;
+                parts.push(item_update(&it.item, it.quantity));
+            }
+            if moved.contains(nid) {
+                parts.push(transform_update(it.pos));
+            }
+            if !parts.is_empty() {
+                updates.push(proto::EntityUpdate {
+                    network_id: *nid,
+                    removed: None,
+                    updates: Some(parts),
+                });
+            }
+        }
+        let gone = std::mem::take(&mut g.gone);
+        if let Ok(p) = packet(
+            crate::join::settings_id::NETWORK_TICK,
+            &proto::NetworkTick {
+                tick_duration_micros: (dt * 1_000_000.0) as i32,
+                server_tick: tick as i32,
+            },
+        ) {
+            out.all.push(p);
+        }
+        if !updates.is_empty() || !gone.is_empty() {
+            if let Ok(p) = packet(
+                id::ENTITY_UPDATES,
+                &proto::EntityUpdates {
+                    removed: (!gone.is_empty()).then_some(gone),
+                    updates: (!updates.is_empty()).then_some(updates),
+                },
+            ) {
+                out.all.push(p);
+            }
+        }
+    }
+
+    /// The pickup notification and sound (spec 11).
+    fn notify_pickup(&self, pid: i32, item: &str, n: i32, at: [f64; 3], out: &mut Outgoing) {
+        let name = proto::FormattedMessage {
+            message_id: Some(self.book.item_name(item)),
+            ..Default::default()
+        };
+        let msg = proto::FormattedMessage {
+            message_id: Some("server.general.pickedUpItem".into()),
+            message_params: Some(vec![("item".into(), name)]),
+            ..Default::default()
+        };
+        if let Ok(p) = packet(
+            id::NOTIFICATION,
+            &proto::Notification {
+                message: Some(msg),
+                secondary_message: None,
+                icon: None,
+                item: Some(item_packet(item, n)),
+                style: Default::default(),
+                tag: None,
+            },
+        ) {
+            out.to.push((pid, p));
+        }
+        let sound = self.book.sound("SFX_Player_Pickup_Item");
+        if sound > 0
+            && let Ok(p) = packet(
+                id::PLAY_SOUND_3D,
+                &proto::PlaySoundEvent3D {
+                    sound_event_index: sound,
+                    category: proto::SoundCategory::UI,
+                    position: Some(proto::Position {
+                        x: at[0],
+                        y: at[1],
+                        z: at[2],
+                    }),
+                    volume_modifier: 1.0,
+                    pitch_modifier: 1.0,
+                },
+            )
+        {
+            out.to.push((pid, p));
+        }
+    }
+
+    /// A whole section again (`SetChunk`), for 1024 changes or more.
+    fn section_packet(&self, view: &View, sec: Pos) -> Result<Packet> {
+        use crate::support::World;
+        let mut s = crate::chunk::Section::default();
+        for y in 0..32 {
+            for z in 0..32 {
+                for x in 0..32 {
+                    let (b, r) = view.block(
+                        sec.0 * 32 + x as i32,
+                        sec.1 * 32 + y as i32,
+                        sec.2 * 32 + z as i32,
+                    );
+                    s.blocks[crate::chunk::index(x, y, z)] = b;
+                    s.rotations[crate::chunk::index(x, y, z)] = r;
+                }
+            }
+        }
+        packet(
+            id::SET_CHUNK,
+            &proto::SetChunk {
+                x: sec.0,
+                y: sec.1,
+                z: sec.2,
+                local_light: Some(vec![0]),
+                global_light: None,
+                data: s.encode().map(|d| d.into_iter().map(|b| b as i8).collect()),
+            },
+        )
     }
 }

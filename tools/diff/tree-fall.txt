@@ -1,0 +1,14 @@
+/block set 530 140 254 Rock_Stone
+/block set 530 141 254 Wood_Oak_Trunk
+/block set 530 142 254 Wood_Oak_Trunk
+/block set 530 143 254 Wood_Oak_Trunk
+/block set 530 144 254 Wood_Oak_Trunk
+/block set 529 144 254 Plant_Leaves_Oak
+/block set 531 144 254 Plant_Leaves_Oak
+/block set 530 144 253 Plant_Leaves_Oak
+/block set 530 144 255 Plant_Leaves_Oak
+/block set 530 145 254 Plant_Leaves_Oak
+/block set 528 144 254 Plant_Leaves_Oak
+/block set 530 146 254 Plant_Leaves_Oak
+/block set 530 140 254 Empty
+/block setticking 530 141 254

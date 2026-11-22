@@ -22,6 +22,8 @@ pub const FIELDCRAFT: &str = "Fieldcraft";
 /// Registry packet ids.
 const UPDATE_ITEMS: u32 = 54;
 const UPDATE_RECIPES: u32 = 60;
+const UPDATE_ITEM_SOUND_SETS: u32 = 43;
+const UPDATE_BLOCK_GROUPS: u32 = 78;
 /// The official defaults (GameplayConfig CraftingConfig, Memories).
 const MAX_CHEST_COUNT: i32 = 100;
 const CHEST_HORIZONTAL_RADIUS: i32 = 14;
@@ -36,30 +38,189 @@ pub struct Bench {
     pub open_sound: i32,
     pub close_sound: i32,
     pub completed_sound: i32,
+    pub failed_sound: i32,
     /// (id, icon, name) in order.
     pub categories: Vec<(String, String, String)>,
+    /// Structural benches: header categories, block group cycling,
+    /// inventory hints always shown.
+    pub header_categories: Vec<String>,
+    pub cycling: bool,
+    pub always_hints: bool,
 }
+
+/// A JSON object whose keys keep their first position when set again (as
+/// the official window data does).
+#[derive(Clone, Debug, Default)]
+pub struct Data(Vec<(String, String)>);
+
+impl Data {
+    /// Sets `key` to a JSON value (already encoded).
+    pub fn set(&mut self, key: &str, value: String) {
+        match self.0.iter_mut().find(|(k, _)| k == key) {
+            Some(x) => x.1 = value,
+            None => self.0.push((key.to_owned(), value)),
+        }
+    }
+
+    pub fn text(&self) -> String {
+        let parts: Vec<String> = self
+            .0
+            .iter()
+            .map(|(k, v)| format!("{}:{v}", json(k)))
+            .collect();
+        format!("{{{}}}", parts.join(","))
+    }
+}
+
+/// The kinds of crafting windows Aerie opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Pocket,
+    /// A `Crafting` bench (workbench and the like).
+    Simple,
+    /// A `StructuralCrafting` bench (builder's bench).
+    Structural,
+}
+
+/// Options a structural window can show.
+pub const OPTION_SLOTS: usize = 64;
 
 /// A crafting window a player has open.
 #[derive(Clone, Debug)]
 pub struct Window {
     pub id: i32,
+    pub kind: Kind,
     pub bench: Bench,
     /// The bench block's key and position; none for the pocket window.
     pub block: Option<(String, (i32, i32, i32))>,
+    pub data: Data,
+    /// Data changed: an `UpdateWindow` goes out at the end of the tick.
+    pub dirty: bool,
+    /// The extra resources (chests near the bench) go with the next update.
+    pub extra_dirty: bool,
+    /// Structural windows: the input slot, the options (item, quantity,
+    /// recipe) and the selected option.
+    pub input: Option<(String, i32)>,
+    pub options: Vec<(String, i32, String)>,
+    pub selected: i32,
+    /// Progress last sent and when (updates are rate limited).
+    pub last_progress: f32,
+    pub last_progress_at: Option<std::time::Instant>,
 }
 
 impl Window {
-    pub fn fieldcraft() -> Self {
+    pub fn fieldcraft(book: &Book) -> Self {
+        let mut data = Data::default();
+        data.set("type", proto::BenchType::CRAFTING.0.to_string());
+        data.set("id", json(FIELDCRAFT));
+        data.set("name", json("client.inventory.fieldcraft.title"));
+        data.set("categories", "[]".into());
+        data.set("worldMemoriesLevel", MEMORIES_LEVEL.to_string());
+        let _ = book;
         Window {
             id: 0,
+            kind: Kind::Pocket,
             bench: Bench {
                 kind: proto::BenchType::CRAFTING.0,
                 id: FIELDCRAFT.into(),
                 ..Default::default()
             },
             block: None,
+            data,
+            dirty: false,
+            extra_dirty: false,
+            input: None,
+            options: Vec::new(),
+            selected: 0,
+            last_progress: 0.0,
+            last_progress_at: None,
         }
+    }
+
+    /// New progress of the running craft; marks the window for an update
+    /// as the official server does (a change of 5 %, half a second, done,
+    /// going back, or the first time).
+    pub fn progress(&mut self, p: f32) {
+        self.data.set("progress", fmt_f32(p));
+        if self.last_progress != p {
+            let now = std::time::Instant::now();
+            let long = self
+                .last_progress_at
+                .is_none_or(|t| now.duration_since(t).as_millis() > 500);
+            if p >= 1.0 || p < self.last_progress || p - self.last_progress > 0.05 || long {
+                self.last_progress = p;
+                self.last_progress_at = Some(now);
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// The window's own slots as `InventorySection` (structural: the input
+    /// then the options).
+    pub fn section(&self) -> Option<proto::InventorySection> {
+        if self.kind != Kind::Structural {
+            return None;
+        }
+        let mut items = Vec::new();
+        if let Some((item, n)) = &self.input {
+            items.push((0, stack(item, *n)));
+        }
+        for (i, (item, n, _)) in self.options.iter().enumerate() {
+            items.push((i as i32 + 1, stack(item, *n)));
+        }
+        Some(proto::InventorySection {
+            items: Some(items),
+            capacity: (1 + OPTION_SLOTS) as i16,
+        })
+    }
+}
+
+/// A float as Java's `Float.toString` writes it for these values.
+pub fn fmt_f32(v: f32) -> String {
+    let s = format!("{v}");
+    if s.contains('.') || s.contains('e') {
+        s
+    } else {
+        format!("{s}.0")
+    }
+}
+
+pub fn stack(item: &str, quantity: i32) -> proto::ItemWithAllMetadata {
+    proto::ItemWithAllMetadata {
+        item_id: item.to_owned(),
+        quantity,
+        durability: 0.0,
+        max_durability: 0.0,
+        quality: -1,
+        override_dropped_item_animation: false,
+        metadata: None,
+    }
+}
+
+/// One queued craft (timed recipes, structural benches).
+#[derive(Clone, Debug)]
+pub struct Job {
+    pub recipe: String,
+    pub quantity: i32,
+    pub started: i32,
+    pub completed: i32,
+    pub seconds_done: f32,
+    pub seconds: f32,
+    /// Inputs come from the structural window's input slot.
+    pub from_input: bool,
+    /// What each started unit took, to give back if cancelled.
+    pub taken: Vec<Vec<(String, i32)>>,
+}
+
+/// A player's crafting queue (at most 32 jobs).
+#[derive(Clone, Debug, Default)]
+pub struct Queue {
+    pub jobs: std::collections::VecDeque<Job>,
+}
+
+impl Queue {
+    pub fn remaining(&self) -> i32 {
+        self.jobs.iter().map(|j| j.quantity - j.completed).sum()
     }
 }
 
@@ -68,6 +229,8 @@ struct ItemInfo {
     resources: Vec<(String, i32)>,
     tags: Vec<i32>,
     name: Option<String>,
+    max_stack: i32,
+    sound_set: i32,
 }
 
 #[derive(Default)]
@@ -79,6 +242,10 @@ pub struct Book {
     memories_per_level: Vec<i32>,
     /// Sound name → event index.
     sounds: HashMap<String, i32>,
+    /// Item sound set index → its `Drop` sound event.
+    drop_sounds: HashMap<i32, i32>,
+    /// Block groups (block group cycling at structural benches).
+    groups: Vec<Vec<String>>,
 }
 
 /// Why a craft did not happen.
@@ -88,7 +255,6 @@ pub enum Refused {
     Unknown,
     /// Not made at this bench (or needs knowledge, memories, augments).
     WrongBench,
-    Missing,
 }
 
 fn dash(s: &str) -> String {
@@ -140,8 +306,31 @@ impl Book {
                                         .collect(),
                                     tags: it.tag_indexes.unwrap_or_default(),
                                     name: it.translation_properties.and_then(|t| t.name),
+                                    max_stack: it.max_stack,
+                                    sound_set: it.item_sound_set_index,
                                 },
                             );
+                        }
+                    }
+                }
+                UPDATE_ITEM_SOUND_SETS => {
+                    if let Ok((r, _)) = proto::UpdateItemSoundSets::decode(payload, 0) {
+                        for (i, set) in r.item_sound_sets.into_iter().flatten() {
+                            if let Some((_, e)) = set
+                                .sound_event_indices
+                                .iter()
+                                .flatten()
+                                .find(|(k, _)| *k == proto::ItemSoundEvent::DROP)
+                            {
+                                book.drop_sounds.insert(i, *e);
+                            }
+                        }
+                    }
+                }
+                UPDATE_BLOCK_GROUPS => {
+                    if let Ok((r, _)) = proto::UpdateBlockGroups::decode(payload, 0) {
+                        for (_, g) in r.groups.into_iter().flatten() {
+                            book.groups.push(g.names.unwrap_or_default());
                         }
                     }
                 }
@@ -151,7 +340,7 @@ impl Book {
         for l in benches.lines() {
             let w: Vec<&str> = l.split_whitespace().collect();
             match w[..] {
-                ["W", block, kind, id, open, close, completed] => {
+                ["W", block, kind, id, open, close, completed, failed] => {
                     book.benches.insert(
                         block.to_owned(),
                         Bench {
@@ -160,7 +349,8 @@ impl Book {
                             open_sound: open.parse().unwrap_or(0),
                             close_sound: close.parse().unwrap_or(0),
                             completed_sound: completed.parse().unwrap_or(0),
-                            categories: Vec::new(),
+                            failed_sound: failed.parse().unwrap_or(0),
+                            ..Default::default()
                         },
                     );
                 }
@@ -173,6 +363,17 @@ impl Book {
                         b.categories.push((dash(id), dash(icon), dash(name)));
                     }
                 }
+                ["H", block, cat] => {
+                    if let Some(b) = book.benches.get_mut(block) {
+                        b.header_categories.push(cat.to_owned());
+                    }
+                }
+                ["F", block, cycling, hints] => {
+                    if let Some(b) = book.benches.get_mut(block) {
+                        b.cycling = cycling == "1";
+                        b.always_hints = hints == "1";
+                    }
+                }
                 _ => {}
             }
         }
@@ -181,6 +382,24 @@ impl Book {
 
     pub fn counts(&self) -> (usize, usize, usize) {
         (self.recipes.len(), self.items.len(), self.benches.len())
+    }
+
+    /// Most of an item in one slot (the official default 100 for an unknown
+    /// item).
+    pub fn max_stack(&self, item: &str) -> i32 {
+        self.items
+            .get(item)
+            .map(|i| i.max_stack)
+            .filter(|&m| m > 0)
+            .unwrap_or(100)
+    }
+
+    /// The item's name key, for messages.
+    pub fn item_name(&self, item: &str) -> String {
+        self.items
+            .get(item)
+            .and_then(|i| i.name.clone())
+            .unwrap_or_else(|| format!("server.items.{item}.name"))
     }
 
     /// A sound event index by name, 0 when unknown.
@@ -209,60 +428,292 @@ impl Book {
         v
     }
 
-    /// `window_data` of the pocket window, as the official server writes it
-    /// (its category list stays empty).
-    pub fn fieldcraft_data(&self) -> String {
-        format!(
-            "{{\"type\":{},\"id\":{},\"name\":{},\"categories\":[],\"worldMemoriesLevel\":{MEMORIES_LEVEL}}}",
-            proto::BenchType::CRAFTING.0,
-            json(FIELDCRAFT),
-            json("client.inventory.fieldcraft.title"),
-        )
-    }
-
-    /// `window_data` of a bench window for the bench block `block`.
-    pub fn bench_data(&self, block: &str, bench: &Bench) -> String {
-        let name = self
-            .items
-            .get(block)
-            .and_then(|i| i.name.clone())
-            .unwrap_or_else(|| format!("server.items.{block}.name"));
-        let cats: Vec<String> = bench
-            .categories
-            .iter()
-            .map(|(id, icon, n)| {
-                let recipes: Vec<String> = self
-                    .recipes_for(&bench.id, id)
+    /// A bench window as the official server opens it (spec 09): its data
+    /// in the official key order.
+    pub fn bench_window(
+        &self,
+        id: i32,
+        block: &str,
+        at: (i32, i32, i32),
+        bench: &Bench,
+    ) -> Option<Window> {
+        let kind = match proto::BenchType(bench.kind) {
+            proto::BenchType::CRAFTING => Kind::Simple,
+            proto::BenchType::STRUCTURAL_CRAFTING => Kind::Structural,
+            _ => return None,
+        };
+        let name = self.item_name(block);
+        let mut d = Data::default();
+        d.set("type", bench.kind.to_string());
+        d.set("id", json(&bench.id));
+        d.set("name", json(&name));
+        d.set("blockItemId", json(block));
+        d.set("tierLevel", "1".into());
+        d.set("grantedAugmentTags", "[]".into());
+        match kind {
+            Kind::Simple => {
+                let cats: Vec<String> = bench
+                    .categories
                     .iter()
-                    .map(|r| json(r))
+                    .map(|(cid, icon, n)| {
+                        let recipes: Vec<String> = self
+                            .recipes_for(&bench.id, cid)
+                            .iter()
+                            .map(|r| json(r))
+                            .collect();
+                        format!(
+                            "{{\"id\":{},\"name\":{},\"icon\":{},\"craftableRecipes\":[{}]}}",
+                            json(cid),
+                            json(n),
+                            json(icon),
+                            recipes.join(",")
+                        )
+                    })
                     .collect();
-                format!(
-                    "{{\"id\":{},\"name\":{},\"icon\":{},\"craftableRecipes\":[{}]}}",
-                    json(id),
-                    json(n),
-                    json(icon),
-                    recipes.join(",")
-                )
-            })
-            .collect();
+                d.set("categories", format!("[{}]", cats.join(",")));
+            }
+            Kind::Structural => {
+                d.set("selected", "0".into());
+                d.set("allowBlockGroupCycling", bench.cycling.to_string());
+                d.set("alwaysShowInventoryHints", bench.always_hints.to_string());
+            }
+            Kind::Pocket => {}
+        }
+        d.set("worldMemoriesLevel", MEMORIES_LEVEL.to_string());
+        d.set("nearbyChestCount", "0".into());
+        d.set("maxChestCount", MAX_CHEST_COUNT.to_string());
+        d.set("chestHorizontalRadius", CHEST_HORIZONTAL_RADIUS.to_string());
+        d.set("chestVerticalRadius", CHEST_VERTICAL_RADIUS.to_string());
         let per: Vec<String> = self
             .memories_per_level
             .iter()
             .map(|n| n.to_string())
             .collect();
-        format!(
-            "{{\"type\":{},\"id\":{},\"name\":{},\"blockItemId\":{},\"tierLevel\":1,\
-             \"grantedAugmentTags\":[],\"categories\":[{}],\"worldMemoriesLevel\":{MEMORIES_LEVEL},\
-             \"nearbyChestCount\":0,\"maxChestCount\":{MAX_CHEST_COUNT},\
-             \"chestHorizontalRadius\":{CHEST_HORIZONTAL_RADIUS},\
-             \"chestVerticalRadius\":{CHEST_VERTICAL_RADIUS},\"memoriesPerLevel\":[{}]}}",
-            bench.kind,
-            json(&bench.id),
-            json(&name),
-            json(block),
-            cats.join(","),
-            per.join(",")
-        )
+        d.set("memoriesPerLevel", format!("[{}]", per.join(",")));
+        Some(Window {
+            id,
+            kind,
+            bench: bench.clone(),
+            block: Some((block.to_owned(), at)),
+            data: d,
+            dirty: false,
+            extra_dirty: false,
+            input: None,
+            options: Vec::new(),
+            selected: 0,
+            last_progress: 0.0,
+            last_progress_at: None,
+        })
+    }
+
+    /// Recipes made at a bench (type and id), by id.
+    fn bench_recipes(&self, kind: i32, bench: &str) -> Vec<(&String, &proto::CraftingRecipe)> {
+        let mut v: Vec<_> = self
+            .recipes
+            .iter()
+            .filter(|(_, r)| {
+                r.bench_requirement
+                    .iter()
+                    .flatten()
+                    .any(|b| b.r#type.0 == kind && b.id == bench)
+            })
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(b.0));
+        v
+    }
+
+    /// Whether `item` is the material `m`.
+    fn matches(&self, m: &proto::MaterialQuantity, item: &str) -> bool {
+        self.units(m, item).is_some()
+    }
+
+    /// Structural benches: the recipes an input stack can become, in the
+    /// official order (header categories first, then by category, then id).
+    pub fn structural_options(
+        &self,
+        bench: &Bench,
+        input: &str,
+    ) -> (Vec<(String, i32, String)>, usize) {
+        let header = |r: &proto::CraftingRecipe| {
+            r.bench_requirement.iter().flatten().any(|b| {
+                b.r#type.0 == bench.kind
+                    && b.id == bench.id
+                    && b.categories
+                        .iter()
+                        .flatten()
+                        .any(|c| bench.header_categories.contains(c))
+            })
+        };
+        let priority = |r: &proto::CraftingRecipe| {
+            r.bench_requirement
+                .iter()
+                .flatten()
+                .find(|b| b.r#type.0 == bench.kind && b.id == bench.id && b.categories.is_some())
+                .map(|b| {
+                    b.categories
+                        .iter()
+                        .flatten()
+                        .map(|c| {
+                            bench
+                                .categories
+                                .iter()
+                                .position(|(id, _, _)| id == c)
+                                .map_or(i32::MAX, |p| p as i32)
+                        })
+                        .min()
+                        .unwrap_or(i32::MAX)
+                })
+                .unwrap_or(i32::MAX)
+        };
+        let mut found: Vec<(&String, &proto::CraftingRecipe)> = self
+            .bench_recipes(bench.kind, &bench.id)
+            .into_iter()
+            .filter(|(_, r)| {
+                let ins = r.inputs.as_deref().unwrap_or(&[]);
+                ins.len() == 1 && self.matches(&ins[0], input)
+            })
+            .collect();
+        found.sort_by(|a, b| {
+            header(b.1)
+                .cmp(&header(a.1))
+                .then(priority(a.1).cmp(&priority(b.1)))
+                .then(a.0.cmp(b.0))
+        });
+        let divider = found.iter().take_while(|(_, r)| header(r)).count();
+        let mut options = Vec::new();
+        for (id, r) in found {
+            for b in r.bench_requirement.iter().flatten() {
+                if b.r#type.0 == bench.kind && b.id == bench.id && options.len() < OPTION_SLOTS {
+                    if let Some(o) = r.outputs.iter().flatten().next()
+                        && let Some(item) = &o.item_id
+                    {
+                        options.push((item.clone(), o.quantity, id.clone()));
+                    }
+                }
+            }
+        }
+        (options, divider)
+    }
+
+    /// Hotbar-then-storage slot indexes holding something a bench recipe
+    /// takes as its first input (structural `inventoryHints`).
+    pub fn inventory_hints(&self, bench: &Bench, inv: &Inventory) -> Vec<i32> {
+        let recipes = self.bench_recipes(bench.kind, &bench.id);
+        let mut out = Vec::new();
+        let mut i = 0;
+        for (sec, n) in [
+            (crate::inventory::HOTBAR, 9),
+            (crate::inventory::STORAGE, 36),
+        ] {
+            for slot in 0..n {
+                if let Some((item, _)) = inv.get(sec, slot)
+                    && recipes.iter().any(|(_, r)| {
+                        r.inputs
+                            .iter()
+                            .flatten()
+                            .next()
+                            .is_some_and(|m| self.matches(m, &item))
+                    })
+                {
+                    out.push(i);
+                }
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// The block group an item is in, for cycling.
+    pub fn group_of(&self, item: &str) -> Option<&Vec<String>> {
+        self.groups.iter().find(|g| g.iter().any(|n| n == item))
+    }
+
+    /// The item's `Drop` sound (0 for none).
+    pub fn drop_sound(&self, item: &str) -> i32 {
+        self.items
+            .get(item)
+            .and_then(|i| self.drop_sounds.get(&i.sound_set))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn recipe(&self, id: &str) -> Option<&proto::CraftingRecipe> {
+        self.recipes.get(id)
+    }
+
+    /// Most crafts the inventory could hold of the recipe's primary
+    /// output (the official ceiling on a requested quantity).
+    pub fn ceiling(&self, id: &str) -> i32 {
+        let Some(r) = self.recipes.get(id) else {
+            return 1;
+        };
+        let Some(p) = r.primary_output.as_ref() else {
+            return 1;
+        };
+        let Some(item) = &p.item_id else { return 1 };
+        let per = p.quantity.max(1) as i64;
+        let max = self.max_stack(item).max(1) as i64;
+        (45 * max / per).clamp(1, i32::MAX as i64) as i32
+    }
+
+    /// Whether recipe `id` can be made at bench (`kind`, `bench`) (spec 09).
+    pub fn allowed(&self, id: &str, kind: i32, bench: &str) -> Result<(), Refused> {
+        let r = self.recipes.get(id).ok_or(Refused::Unknown)?;
+        let at_bench = r.bench_requirement.iter().flatten().any(|b| {
+            b.r#type.0 == kind
+                && b.id == bench
+                && b.required_tier_level <= 1
+                && b.required_augment_tags
+                    .as_ref()
+                    .is_none_or(|t| t.is_empty())
+        });
+        if !at_bench || r.knowledge_required || r.required_memories_level > MEMORIES_LEVEL {
+            return Err(Refused::WrongBench);
+        }
+        Ok(())
+    }
+
+    /// Takes one unit's inputs from the player's inventory; what it took.
+    pub fn take_unit(&self, inv: &mut Inventory, id: &str) -> Option<Vec<(String, i32)>> {
+        let r = self.recipes.get(id)?;
+        let mut after = inv.clone();
+        for m in r.inputs.iter().flatten() {
+            if after.take_units(|item| self.units(m, item), m.quantity) > 0 {
+                return None;
+            }
+        }
+        let taken = diff(inv, &after);
+        *inv = after;
+        Some(taken)
+    }
+
+    /// The outputs of `quantity` crafts.
+    pub fn outputs(&self, id: &str, quantity: i32) -> Vec<(String, i32)> {
+        self.recipes
+            .get(id)
+            .map(|r| {
+                r.outputs
+                    .iter()
+                    .flatten()
+                    .filter_map(|m| Some((m.item_id.clone()?, m.quantity * quantity)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The recipe's time in seconds.
+    pub fn seconds(&self, id: &str) -> f32 {
+        self.recipes.get(id).map_or(0.0, |r| r.time_seconds)
+    }
+
+    /// The input material of a one-input recipe and its quantity.
+    pub fn single_input(&self, id: &str) -> Option<&proto::MaterialQuantity> {
+        self.recipes.get(id)?.inputs.as_ref()?.first()
+    }
+
+    /// Whether `item` is the material.
+    pub fn is_material(&self, m: &proto::MaterialQuantity, item: &str) -> bool {
+        self.matches(m, item)
     }
 
     /// Units of material `m` one `item` gives, if it is that material.
@@ -280,47 +731,18 @@ impl Book {
         }
         (m.item_tag != i32::MIN && info.tags.contains(&m.item_tag)).then_some(1)
     }
+}
 
-    /// Makes `quantity` of recipe `id` at bench (`kind`, `bench`): takes the
-    /// inputs and returns the outputs to give (item, count).
-    pub fn craft(
-        &self,
-        inv: &mut Inventory,
-        id: &str,
-        quantity: i32,
-        kind: i32,
-        bench: &str,
-        creative: bool,
-    ) -> Result<Vec<(String, i32)>, Refused> {
-        let r = self.recipes.get(id).ok_or(Refused::Unknown)?;
-        let quantity = quantity.max(1);
-        let at_bench = r.bench_requirement.iter().flatten().any(|b| {
-            b.r#type.0 == kind
-                && b.id == bench
-                && b.required_tier_level <= 1
-                && b.required_augment_tags
-                    .as_ref()
-                    .is_none_or(|t| t.is_empty())
-        });
-        if !at_bench || r.knowledge_required || r.required_memories_level > MEMORIES_LEVEL {
-            return Err(Refused::WrongBench);
-        }
-        if !creative {
-            let mut after = inv.clone();
-            for m in r.inputs.iter().flatten() {
-                let left = after.take_units(|item| self.units(m, item), m.quantity * quantity);
-                if left > 0 {
-                    return Err(Refused::Missing);
-                }
-            }
-            *inv = after;
-        }
-        Ok(r.outputs
-            .iter()
-            .flatten()
-            .filter_map(|m| Some((m.item_id.clone()?, m.quantity * quantity)))
-            .collect())
+/// Items `before` had that `after` lacks (what a removal took).
+fn diff(before: &Inventory, after: &Inventory) -> Vec<(String, i32)> {
+    let mut count: std::collections::BTreeMap<String, i32> = Default::default();
+    for (item, n) in before.all() {
+        *count.entry(item).or_default() += n;
     }
+    for (item, n) in after.all() {
+        *count.entry(item).or_default() -= n;
+    }
+    count.into_iter().filter(|(_, n)| *n > 0).collect()
 }
 
 #[cfg(test)]
@@ -366,35 +788,29 @@ mod tests {
     }
 
     #[test]
-    fn crafts_with_resources_and_items() {
+    fn units_resources_and_items() {
         let b = book();
         let mut inv = Inventory::default();
-        inv.add("Log", 5);
-        inv.add("Rock", 2);
-        assert_eq!(
-            b.craft(&mut inv, "Bench_Recipe", 1, 0, FIELDCRAFT, false),
-            Err(Refused::Missing)
-        );
+        inv.add("Log", 5, 100);
+        inv.add("Rock", 2, 100);
+        assert_eq!(b.take_unit(&mut inv, "Bench_Recipe"), None);
         assert_eq!(inv.get(-1, 0), Some(("Log".into(), 5)), "nothing taken");
-        inv.add("Rock", 1);
+        inv.add("Rock", 1, 100);
         assert_eq!(
-            b.craft(&mut inv, "Bench_Recipe", 1, 0, FIELDCRAFT, false),
-            Ok(vec![("Bench".into(), 1)])
+            b.take_unit(&mut inv, "Bench_Recipe"),
+            Some(vec![("Log".into(), 4), ("Rock".into(), 3)])
         );
         assert_eq!(inv.get(-1, 0), Some(("Log".into(), 1)));
-        assert_eq!(inv.get(-1, 1), None);
         assert_eq!(
-            b.craft(&mut inv, "Bench_Recipe", 1, 0, "Workbench", true),
+            b.allowed("Bench_Recipe", 0, "Workbench"),
             Err(Refused::WrongBench)
         );
-        assert_eq!(
-            b.craft(&mut inv, "Nope", 1, 0, FIELDCRAFT, true),
-            Err(Refused::Unknown)
-        );
+        assert_eq!(b.allowed("Nope", 0, FIELDCRAFT), Err(Refused::Unknown));
+        assert_eq!(b.outputs("Bench_Recipe", 2), vec![("Bench".into(), 2)]);
     }
 
     #[test]
-    fn bench_data_lists_recipes() {
+    fn bench_window_lists_recipes() {
         let mut b = book();
         b.recipes
             .get_mut("Bench_Recipe")
@@ -409,8 +825,14 @@ mod tests {
             categories: vec![("Tools".into(), "i.png".into(), "n".into())],
             ..Default::default()
         };
-        let d = b.bench_data("Bench_WorkBench", &bench);
+        let w = b
+            .bench_window(1, "Bench_WorkBench", (0, 0, 0), &bench)
+            .unwrap();
+        let d = w.data.text();
         assert!(d.contains("\"craftableRecipes\":[\"Bench_Recipe\"]"), "{d}");
         assert!(d.starts_with("{\"type\":0,\"id\":\"Workbench\""), "{d}");
+        let mut data = w.data.clone();
+        data.set("type", "5".into());
+        assert!(data.text().starts_with("{\"type\":5,"));
     }
 }
