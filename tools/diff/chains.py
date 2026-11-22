@@ -14,24 +14,15 @@ how the states are spread over packets. --final lists, per chain and fork,
 the last state sent for every step and the chain's last state instead,
 which does not depend on that.
 """
-import subprocess,os,re,sys,pathlib
+import re,sys,pathlib
 d=sys.argv[1]
 def opt(name,default=None):
     return sys.argv[sys.argv.index(name)+1] if name in sys.argv else default
 origin=[int(v) for v in opt('--origin').split(',')] if opt('--origin') else None
 start=int(opt('--from','0'))
-D=str(pathlib.Path(__file__).resolve().parents[2]/'target'/'release'/'examples'/'dump')
-rows=[l.rstrip('\n').split('\t') for l in open(d+'/index.tsv')]
-files={int(f.split('-')[0]):f for f in os.listdir(d) if f.endswith('.bin')}
-def dump(k,i):
-    return subprocess.run([D,str(i),os.path.join(d,files[k])],capture_output=True,text=True).stdout
+sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent))
+import cap
 names={}
-for r in rows:
-    if int(r[1])==67:
-        t=dump(int(r[0]),67)
-        for m in re.finditer(r'\n            \(\n                (\d+),\n                RootInteraction \{\n                    id: Some\(\n                        "([^"]+)"',t):
-            names[m.group(1)]=m.group(2)
-        break
 final='--final' in sys.argv
 chains={}
 def note(u,path):
@@ -73,13 +64,17 @@ def split_updates(t):
             if len(tail)>1: out[-len(parts)]=parts[0]+tail[1]
     return out
 seen=False
-for r in rows:
-    k,i=int(r[0]),int(r[1])
-    if k<start or i not in (290,291,177): continue
+for k,i,name,t in cap.packets(d,(67,290,291,177)):
+    if i==67:
+        if not names:
+            for m in re.finditer(r'\n            \(\n                (\d+),\n                RootInteraction \{\n                    id: Some\(\n                        "([^"]+)"',t):
+                names[m.group(1)]=m.group(2)
+        continue
+    if k<start: continue
     # Active slots sent at join are not answers to a chain.
     seen|=i!=177
     if not seen: continue
-    t=dump(k,i)
+    r=(k,i,name)
     t=re.sub(r'(root_interaction: )(\d+)',lambda m:m.group(1)+names.get(m.group(2),m.group(2)),t)
     if origin is None:
         m=re.search(r'BlockPosition \{\s*x: (-?\d+),\s*y: (-?\d+),\s*z: (-?\d+),',t)

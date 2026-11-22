@@ -7,3 +7,18 @@ edition = "2024"
 version = "0.0.0"
 publish = false
 license-file = "LICENSE"
+
+# Day-to-day builds: the workspace lightly optimized, dependencies fully
+# (they are built once). `--release` is for measuring performance.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# Release speed with quick rebuilds, for iterating against the servers:
+# cargo build --profile fast
+[profile.fast]
+inherits = "release"
+incremental = true
+codegen-units = 256

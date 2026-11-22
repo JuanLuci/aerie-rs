@@ -12,23 +12,18 @@ A sprint (stamina drain and the regeneration delay after it):
 
     aerie-server probe --upstream <server> --capture C --name Prober --listen 28 --sprint 3
 """
-import subprocess,os,re,sys
-import pathlib
-d=sys.argv[1]; D=str(pathlib.Path(__file__).resolve().parents[2]/'target'/'release'/'examples'/'dump')
-rows=[l.rstrip('\n').split('\t') for l in open(d+'/index.tsv')]
-files={int(f.split('-')[0]):f for f in os.listdir(d) if f.endswith('.bin')}
-me=None
-for r in rows:
-    k,i=int(r[0]),int(r[1])
+import re,sys,pathlib
+sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent))
+import cap
+d=sys.argv[1]
+me=None; joined=False
+for k,i,name,t in cap.packets(d,(100,210,161)):
     if i==100:
-        t=subprocess.run([D,'100',os.path.join(d,files[k])],capture_output=True,text=True).stdout
-        me=re.search(r'client_id: (-?\d+)',t).group(1)
+        me=re.search(r'client_id: (-?\d+)',t).group(1); joined=True
     if i==210 and k>100:
-        t=subprocess.run([D,'210',os.path.join(d,files[k])],capture_output=True,text=True).stdout
         m=re.search(r'message_id: Some\(\s*"([^"]+)"',t); v=re.findall(r'value: ([-\d.e]+),',t)
         print('MSG',m and m.group(1),v)
     if i==161:
-        t=subprocess.run([D,'161',os.path.join(d,files[k])],capture_output=True,text=True).stdout
         if 'EntityStatsUpdate' not in t: continue
         for blk in re.split(r'\n            EntityUpdate \{',t)[1:]:
             nid=re.search(r'network_id: (-?\d+)',blk).group(1)

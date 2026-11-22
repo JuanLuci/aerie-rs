@@ -12,3 +12,4 @@ aerie-world/
 
 # Tables generated from your own copy of the game (tools/gen.py).
 /gen/
+__pycache__/
