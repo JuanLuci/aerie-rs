@@ -375,12 +375,14 @@ async fn main() -> Result<()> {
                 let mut perf = perf::Perf::default();
                 loop {
                     let next = last + step;
-                    let early = next - std::time::Duration::from_micros(1500);
+                    // Sleeping wakes late by a millisecond or two on some
+                    // systems: the last three are waited out awake.
+                    let early = next - std::time::Duration::from_micros(3000);
                     if let Some(wait) = early.checked_duration_since(std::time::Instant::now()) {
                         std::thread::sleep(wait);
                     }
                     while std::time::Instant::now() < next {
-                        std::hint::spin_loop();
+                        std::thread::yield_now();
                     }
                     let start = std::time::Instant::now();
                     last = start;
