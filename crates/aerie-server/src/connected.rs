@@ -20,6 +20,8 @@ pub trait Cells {
     /// inverse.
     fn flip(&self, block: i32) -> u8;
     fn key(&self, block: i32) -> Option<&str>;
+    /// A patterned rule set by its id.
+    fn rule_set(&self, id: &str) -> Option<&p::ConnectedBlockRuleSetAsset>;
 }
 
 /// What a rule set wants at a cell: a block and rotation, and blocks at
@@ -854,7 +856,7 @@ pub fn desired(
             extra: Vec::new(),
         }),
         RuleSet::RoofConnectedBlockRuleSet(r) => roof(w, r, at, block, rot),
-        _ => None,
+        RuleSet::PatternedConnectedBlockRuleSet(s) => patterned(w, s, at, block, rot),
     }
 }
 
@@ -862,8 +864,343 @@ pub fn desired(
 fn only_on_placement(r: &RuleSet) -> bool {
     !matches!(
         r,
-        RuleSet::StairConnectedBlockRuleSet(_) | RuleSet::RoofConnectedBlockRuleSet(_)
+        RuleSet::StairConnectedBlockRuleSet(_)
+            | RuleSet::RoofConnectedBlockRuleSet(_)
+            | RuleSet::PatternedConnectedBlockRuleSet(_)
     )
+}
+
+// ---- Patterned rule sets (spec 23, "Patterned rule sets") ----
+
+type Matrix = [[i32; 3]; 3];
+
+fn cos90(q: i32) -> i32 {
+    [1, 0, -1, 0][q.rem_euclid(4) as usize]
+}
+
+fn sin90(q: i32) -> i32 {
+    [0, 1, 0, -1][q.rem_euclid(4) as usize]
+}
+
+/// A rotation index (roll × 16 + pitch × 4 + yaw) as a matrix.
+fn matrix(rot: i32) -> Matrix {
+    let (y, p, r) = (rot % 4, (rot / 4) % 4, (rot / 16) % 4);
+    let (cy, sy, cp, sp, cr, sr) = (cos90(y), sin90(y), cos90(p), sin90(p), cos90(r), sin90(r));
+    [
+        [cy * cr + sy * sp * sr, -cy * sr + sy * sp * cr, sy * cp],
+        [cp * sr, cp * cr, -sp],
+        [-sy * cr + cy * sp * sr, sy * sr + cy * sp * cr, cy * cp],
+    ]
+}
+
+fn times(a: &Matrix, b: &Matrix) -> Matrix {
+    let mut m = [[0; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            m[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+        }
+    }
+    m
+}
+
+fn transposed(a: &Matrix) -> Matrix {
+    let mut m = [[0; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            m[i][j] = a[j][i];
+        }
+    }
+    m
+}
+
+fn quarter_of(sin: i32, cos: i32) -> i32 {
+    match (sin, cos) {
+        (1, 0) => 1,
+        (0, -1) => 2,
+        (-1, 0) => 3,
+        _ => 0,
+    }
+}
+
+/// Back to a rotation index: pitch from the middle row, then yaw and
+/// roll (yaw alone when the pitch is a quarter either way).
+fn index_of(m: &Matrix) -> i32 {
+    let sp = -m[1][2];
+    let pitch = match sp {
+        1 => 1,
+        -1 => 3,
+        _ => 0,
+    };
+    let (yaw, roll) = if sp != 1 && sp != -1 {
+        (quarter_of(m[0][2], m[2][2]), quarter_of(m[1][0], m[1][1]))
+    } else {
+        (quarter_of(-m[2][0], m[0][0]), 0)
+    };
+    roll * 16 + pitch * 4 + yaw
+}
+
+/// `a` then `b`, as one rotation.
+fn compose(a: i32, b: i32) -> i32 {
+    if b == 0 {
+        return a;
+    }
+    if a == 0 {
+        return b;
+    }
+    index_of(&times(&matrix(a), &matrix(b)))
+}
+
+/// `b` seen from inside `a`.
+fn compose_inverse(a: i32, b: i32) -> i32 {
+    if a == 0 {
+        return b;
+    }
+    index_of(&times(&transposed(&matrix(a)), &matrix(b)))
+}
+
+/// A vector turned by a rotation index: roll, pitch, then yaw.
+fn apply(rot: i32, v: [i32; 3]) -> [i32; 3] {
+    turn(rot % 4, turn_x((rot / 4) % 4, turn_z((rot / 16) % 4, v)))
+}
+
+/// The opposite: yaw back, pitch back, roll back.
+fn undo(rot: i32, v: [i32; 3]) -> [i32; 3] {
+    turn_z(
+        -((rot / 16) % 4),
+        turn_x(-((rot / 4) % 4), turn(-(rot % 4), v)),
+    )
+}
+
+fn shape_tags(s: &p::ConnectedBlockShape) -> Option<&p::ConnectedBlockFaceTags> {
+    match s {
+        p::ConnectedBlockShape::TemplatedConnectedBlockShape(t) => t.face_tags.as_ref(),
+        p::ConnectedBlockShape::BlockTypeConnectedBlockShape(t) => t.face_tags.as_ref(),
+        p::ConnectedBlockShape::TagPatternConnectedBlockShape(t) => t.face_tags.as_ref(),
+    }
+}
+
+fn shape_turn(s: &p::ConnectedBlockShape) -> i32 {
+    match s {
+        p::ConnectedBlockShape::TemplatedConnectedBlockShape(t) => t.relative_rotation_index,
+        p::ConnectedBlockShape::BlockTypeConnectedBlockShape(t) => t.relative_rotation_index,
+        p::ConnectedBlockShape::TagPatternConnectedBlockShape(t) => t.relative_rotation_index,
+    }
+}
+
+fn tags_on(t: &p::ConnectedBlockFaceTags, d: [i32; 3]) -> Option<&Vec<String>> {
+    match d {
+        [0, 0, -1] => t.north.as_ref(),
+        [1, 0, 0] => t.east.as_ref(),
+        [0, 0, 1] => t.south.as_ref(),
+        [-1, 0, 0] => t.west.as_ref(),
+        [0, 1, 0] => t.up.as_ref(),
+        [0, -1, 0] => t.down.as_ref(),
+        _ => None,
+    }
+}
+
+fn tag_dirs(t: &p::ConnectedBlockFaceTags) -> Vec<([i32; 3], &Vec<String>)> {
+    [
+        ([0, 0, -1], &t.north),
+        ([1, 0, 0], &t.east),
+        ([0, 0, 1], &t.south),
+        ([-1, 0, 0], &t.west),
+        ([0, 1, 0], &t.up),
+        ([0, -1, 0], &t.down),
+    ]
+    .into_iter()
+    .filter_map(|(d, v)| Some((d, v.as_ref()?)))
+    .collect()
+}
+
+/// The shape name a block has in a patterned rule set's block map.
+fn shape_in_map(set: &p::PatternedConnectedBlockRuleSet, block: i32) -> Option<&str> {
+    set.shape_name_to_block_id
+        .iter()
+        .flatten()
+        .find(|(_, b)| *b == block)
+        .map(|(n, _)| n.as_str())
+}
+
+/// What a patterned rule set's rules see around a cell.
+struct Context<'a> {
+    w: &'a dyn Cells,
+    set: &'a p::PatternedConnectedBlockRuleSet,
+    asset: &'a p::ConnectedBlockRuleSetAsset,
+    origin: Pos,
+    rot: i32,
+}
+
+impl Context<'_> {
+    /// The block and rotation at a rule's position, turned by the
+    /// pattern's rotation; nothing for a part cell or an unloaded one.
+    fn at(&self, v: [i32; 3]) -> Option<(i32, i32)> {
+        let (block, rot, filler) = self.w.at(add(self.origin, apply(self.rot, v)))?;
+        (filler == 0).then(|| (block, compose_inverse(self.rot, rot)))
+    }
+
+    /// The shape a block is: by its own patterned rule set when it has
+    /// one, else by this one. (Its asset, the shape's name, the shape.)
+    fn shape_of(&self, block: i32) -> Option<(&str, &str, &p::ConnectedBlockShape)> {
+        let (set, asset) = match self.w.rules(block) {
+            Some(RuleSet::PatternedConnectedBlockRuleSet(s)) => {
+                match self.w.rule_set(&s.rule_set_id) {
+                    Some(a) => (&**s, a),
+                    None => (self.set, self.asset),
+                }
+            }
+            _ => (self.set, self.asset),
+        };
+        for (name, shape) in asset.shapes.iter().flatten() {
+            let fits = match shape {
+                p::ConnectedBlockShape::TemplatedConnectedBlockShape(t) => {
+                    shape_in_map(set, block).is_some()
+                        && shape_in_map(set, block) == t.template_id.as_deref()
+                }
+                p::ConnectedBlockShape::BlockTypeConnectedBlockShape(t) => t.block_id == block,
+                p::ConnectedBlockShape::TagPatternConnectedBlockShape(_) => false,
+            };
+            if fits {
+                return Some((asset.id.as_str(), name.as_str(), shape));
+            }
+        }
+        None
+    }
+
+    fn face(&self, offset: [i32; 3], dir: [i32; 3], tags: &[String]) -> bool {
+        let look = [offset[0] + dir[0], offset[1] + dir[1], offset[2] + dir[2]];
+        let Some((block, rot)) = self.at(look) else {
+            return false;
+        };
+        let Some((_, _, shape)) = self.shape_of(block) else {
+            return false;
+        };
+        let Some(theirs) = shape_tags(shape) else {
+            return false;
+        };
+        let back = undo(shape_turn(shape), undo(rot, [-dir[0], -dir[1], -dir[2]]));
+        let have = tags_on(theirs, back);
+        !tags.is_empty() && tags.iter().all(|t| have.is_some_and(|h| h.contains(t)))
+    }
+
+    fn check(&self, rule: &p::ConnectedBlockRule) -> bool {
+        use p::ConnectedBlockRule as R;
+        match rule {
+            R::AndConnectedBlockRule(a) => a.rules.iter().flatten().all(|r| self.check(r)),
+            R::OrConnectedBlockRule(o) => o.rules.iter().flatten().any(|r| self.check(r)),
+            R::NotConnectedBlockRule(n) => !self.check(&n.rule),
+            R::ShapeConnectedBlockRule(s) => {
+                let off = [
+                    s.position_offset.x,
+                    s.position_offset.y,
+                    s.position_offset.z,
+                ];
+                let Some((block, rot)) = self.at(off) else {
+                    return false;
+                };
+                let Some((asset, name, shape)) = self.shape_of(block) else {
+                    return false;
+                };
+                if asset != self.asset.id || name != s.shape_id {
+                    return false;
+                }
+                match &s.allowed_rotations {
+                    Some(allowed) => allowed.contains(&compose(rot, shape_turn(shape))),
+                    None => true,
+                }
+            }
+            R::FaceTagConnectedBlockRule(f) => {
+                let off = [
+                    f.position_offset.x,
+                    f.position_offset.y,
+                    f.position_offset.z,
+                ];
+                let dirs = f.face_tags.as_ref().map(tag_dirs).unwrap_or_default();
+                let any = f.match_type == p::ConnectedBlockMatchType::ANY;
+                let mut all = true;
+                for (dir, tags) in dirs {
+                    let ok = self.face(off, dir, tags);
+                    if ok && any {
+                        return true;
+                    }
+                    all &= ok;
+                }
+                !any && all
+            }
+        }
+    }
+}
+
+/// What a block of a patterned rule set wants to be: the first pattern
+/// whose rule holds in one of its rotations gives its output shape,
+/// turned by that rotation and the shape's own.
+fn patterned(
+    w: &dyn Cells,
+    set: &p::PatternedConnectedBlockRuleSet,
+    at: Pos,
+    block: i32,
+    rot: i32,
+) -> Option<Want> {
+    let asset = w.rule_set(&set.rule_set_id)?;
+    let own = shape_in_map(set, block)?;
+    asset.shapes.iter().flatten().find(|(n, _)| n == own)?;
+    let output = |shape_id: &str, rot: i32| -> Option<Want> {
+        let block = set
+            .shape_name_to_block_id
+            .iter()
+            .flatten()
+            .find(|(n, _)| n == shape_id)?
+            .1;
+        let shape = &asset
+            .shapes
+            .iter()
+            .flatten()
+            .find(|(n, _)| n == shape_id)?
+            .1;
+        Some(Want {
+            block,
+            rot: compose(rot, shape_turn(shape)),
+            extra: Vec::new(),
+        })
+    };
+    for pattern in asset.patterns.iter().flatten() {
+        let Some(rule) = &pattern.rule else {
+            return output(&pattern.output_shape_id, rot);
+        };
+        let turns = pattern
+            .rotations
+            .clone()
+            .filter(|r| !r.is_empty())
+            .unwrap_or(vec![0]);
+        for t in turns {
+            let composed = if pattern.transform_rules_with_orientation {
+                compose(rot, t)
+            } else {
+                t
+            };
+            let ctx = Context {
+                w,
+                set,
+                asset,
+                origin: at,
+                rot: composed,
+            };
+            if ctx.check(rule) {
+                return output(&pattern.output_shape_id, composed);
+            }
+        }
+    }
+    None
+}
+
+/// A patterned rule set's update mode, for its block.
+pub fn update_mode(w: &dyn Cells, block: i32) -> p::ConnectedBlockUpdateMode {
+    match w.rules(block) {
+        Some(RuleSet::PatternedConnectedBlockRuleSet(s)) => w
+            .rule_set(&s.rule_set_id)
+            .map_or(p::ConnectedBlockUpdateMode::PLACE_UPDATE, |a| a.update_mode),
+        _ => p::ConnectedBlockUpdateMode::PLACE_UPDATE,
+    }
 }
 
 /// The changes the cells around `origin` want (spec 23): every

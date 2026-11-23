@@ -171,6 +171,51 @@ Against the block found (turned back as above):
 Blocks that are an interaction state of another block use that block's
 template, shape map and flip type.
 
+## Patterned rule sets
+
+Pipes use a third kind: a block names a *rule set* (an asset of its own,
+sent to clients with the connected block registry) and gives, for each
+shape name, the block that is that shape. The rule set has shapes (each
+with face tags, a rotation of its own, and what makes a block that
+shape: here, being listed under a name in the block's map), patterns,
+and an update mode.
+
+A block asks only when its own shape is one of the rule set's. Then
+each pattern in order: one without a rule answers its output shape
+with the block's rotation. Otherwise each of its allowed rotations
+(none listed means no turn), composed after the block's rotation when
+the pattern turns with the block, becomes the rotation the rule is
+read in; the first rotation where the rule holds answers. The answer
+is the output shape's block, with that rotation composed with the
+shape's own.
+
+Rotations compose as 3×3 matrices of quarter turns (yaw about y, pitch
+about x, roll about z); a composed matrix is read back as pitch from
+its middle row, then yaw and roll (yaw alone when the pitch is a
+quarter turn either way).
+
+Inside the rule, a position is turned by the reading rotation (roll,
+then pitch, then yaw) and added to the cell; a part cell reads as
+nothing. The rotation found there is seen from inside the reading
+rotation (its matrix transposed, times the found one). A block's shape
+comes from its own patterned rule set when it has one, else from this
+one: the first shape (in the rule set's order) whose name the block is
+listed under.
+
+- *Shape*: the block there is that shape of this rule set; with
+  allowed rotations, its rotation composed with the shape's own is one
+  of them.
+- *Face tags*: for each direction, the block one step further that way
+  must have a shape with face tags; the direction back is undone by the
+  block's rotation and then by its shape's own, and every tag the rule
+  lists must be on that face. *All* needs every direction, *Any* one.
+- *And*, *Or*, *Not* combine rules.
+
+The update mode: *update, place, update* first updates the neighbours
+(without changing the placed block), then asks the placed block, then
+updates the neighbours again; *ignore updates* asks the placed block
+and stops. Neighbours with a patterned rule set are always asked.
+
 ## In Aerie
 
 `connected.rs` answers for a cell through a small view of the world; the
@@ -181,8 +226,7 @@ side's physics table (`CT`, `CB`, `CF` lines).
 
 ## Not done yet
 
-- The *patterned* rule sets (three pipe sets, eight blocks) with their
-  "update, place, update" and "ignore updates" modes.
+- Shapes made by tag patterns (no shipped rule set has one).
 - The face a block was placed on is not passed in yet (rules with
   placement normals see none); no shipped template has such a rule.
 - A shape whose block pattern lists several blocks takes the first one;
@@ -214,3 +258,8 @@ the other: the same cells change to the same pieces after each break.
 The break sound comes before the block's particle on both. (Block
 changes travel on another stream than sounds, so their order against
 sounds is not compared.)
+
+Pipes the same way, standing and lying (the placement chain also turned
+in pitch): a standing pipe turning into a bend when a lying one is put
+against it, rows of lying pipes, a bend pitched half round: the same
+blocks and rotations after every placement.

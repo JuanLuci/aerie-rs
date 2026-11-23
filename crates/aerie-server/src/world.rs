@@ -2031,51 +2031,29 @@ impl Hub {
     /// (spec 23): a placed block takes the shape its rule set gives it,
     /// then the neighbours take theirs, three steps deep.
     fn connect(&self, g: &mut Inner, ground: &Ground, at: Pos, placed: bool, out: &mut Outgoing) {
-        use crate::support::World;
-        struct W<'a> {
-            g: &'a Inner,
-            ground: &'a Ground,
-            rules: &'a crate::support::Rules,
-        }
-        impl crate::connected::Cells for W<'_> {
-            fn at(&self, p: Pos) -> Option<(i32, i32, i32)> {
-                if !(0..crate::support::WORLD_HEIGHT).contains(&p.1) {
-                    return None;
-                }
-                let (id, rot) = View {
-                    g: self.g,
-                    ground: self.ground,
-                    hub_rules: self.rules,
-                }
-                .block(p.0, p.1, p.2);
-                Some((id, rot, self.g.fillers.get(&p).copied().unwrap_or(0)))
-            }
-            fn rules(&self, block: i32) -> Option<&proto::ConnectedBlockRuleSet> {
-                self.rules.block(block)?.connected.as_ref()
-            }
-            fn supports_up(&self, block: i32, rot: i32) -> bool {
-                self.rules.supports_up(block, rot)
-            }
-            fn template_use(&self, block: i32) -> Option<&crate::connected::Use> {
-                self.rules.template_use(block)
-            }
-            fn template(&self, name: &str) -> Option<&crate::connected::Template> {
-                self.rules.template(name)
-            }
-            fn flip(&self, block: i32) -> u8 {
-                self.rules.flip(block)
-            }
-            fn key(&self, block: i32) -> Option<&str> {
-                self.rules.block(block).map(|b| b.key.as_str())
-            }
-        }
         let how = How {
             quiet: true,
             ..Default::default()
         };
+        let mode = {
+            let w = ConnectView {
+                g,
+                ground,
+                rules: &self.rules,
+            };
+            use crate::connected::Cells;
+            w.at(at)
+                .map(|(block, _, _)| crate::connected::update_mode(&w, block))
+                .unwrap_or(proto::ConnectedBlockUpdateMode::PLACE_UPDATE)
+        };
         if placed {
+            // "Update, place, update": the neighbours first, without
+            // touching the placed block (spec 23).
+            if mode == proto::ConnectedBlockUpdateMode::UPDATE_PLACE_UPDATE {
+                self.connect_around(g, ground, at, true, out);
+            }
             let want = {
-                let w = W {
+                let w = ConnectView {
                     g,
                     ground,
                     rules: &self.rules,
@@ -2093,12 +2071,32 @@ impl Hub {
             {
                 self.change(g, ground, at, want.block, want.rot, how, out);
             }
+            if mode == proto::ConnectedBlockUpdateMode::IGNORE_UPDATES {
+                return;
+            }
         }
+        self.connect_around(g, ground, at, false, out);
+    }
+
+    /// The neighbour updates around `at`, three steps deep (spec 23);
+    /// with `skip_start`, a change wanted at `at` itself is not made.
+    fn connect_around(
+        &self,
+        g: &mut Inner,
+        ground: &Ground,
+        at: Pos,
+        skip_start: bool,
+        out: &mut Outgoing,
+    ) {
+        let how = How {
+            quiet: true,
+            ..Default::default()
+        };
         let mut queue = std::collections::VecDeque::from([(at, 0)]);
         let mut seen = std::collections::HashSet::new();
         while let Some((here, depth)) = queue.pop_front() {
             let changes = crate::connected::neighbours(
-                &W {
+                &ConnectView {
                     g,
                     ground,
                     rules: &self.rules,
@@ -2109,7 +2107,9 @@ impl Hub {
                 if !seen.insert(p) || p == here {
                     continue;
                 }
-                self.change(g, ground, p, want.block, want.rot, how, out);
+                if !(skip_start && p == at) {
+                    self.change(g, ground, p, want.block, want.rot, how, out);
+                }
                 for (off, block, rot) in want.extra {
                     let q = (p.0 + off[0], p.1 + off[1], p.2 + off[2]);
                     self.change(g, ground, q, block, rot, how, out);
@@ -5809,6 +5809,49 @@ fn section_of(x: i32, y: i32, z: i32) -> (Pos, i32) {
             z.rem_euclid(32) as usize,
         ) as i32,
     )
+}
+
+/// What connected blocks see of the world (spec 23).
+struct ConnectView<'a> {
+    g: &'a Inner,
+    ground: &'a Ground,
+    rules: &'a crate::support::Rules,
+}
+impl crate::connected::Cells for ConnectView<'_> {
+    fn at(&self, p: Pos) -> Option<(i32, i32, i32)> {
+        use crate::support::World;
+        if !(0..crate::support::WORLD_HEIGHT).contains(&p.1) {
+            return None;
+        }
+        let (id, rot) = View {
+            g: self.g,
+            ground: self.ground,
+            hub_rules: self.rules,
+        }
+        .block(p.0, p.1, p.2);
+        Some((id, rot, self.g.fillers.get(&p).copied().unwrap_or(0)))
+    }
+    fn rules(&self, block: i32) -> Option<&proto::ConnectedBlockRuleSet> {
+        self.rules.block(block)?.connected.as_ref()
+    }
+    fn supports_up(&self, block: i32, rot: i32) -> bool {
+        self.rules.supports_up(block, rot)
+    }
+    fn template_use(&self, block: i32) -> Option<&crate::connected::Use> {
+        self.rules.template_use(block)
+    }
+    fn template(&self, name: &str) -> Option<&crate::connected::Template> {
+        self.rules.template(name)
+    }
+    fn flip(&self, block: i32) -> u8 {
+        self.rules.flip(block)
+    }
+    fn key(&self, block: i32) -> Option<&str> {
+        self.rules.block(block).map(|b| b.key.as_str())
+    }
+    fn rule_set(&self, id: &str) -> Option<&proto::ConnectedBlockRuleSetAsset> {
+        self.rules.rule_set(id)
+    }
 }
 
 fn block_of(sec: Pos, index: i32) -> Pos {

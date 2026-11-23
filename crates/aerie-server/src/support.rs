@@ -274,6 +274,7 @@ pub struct Rules {
     boxes: HashMap<i32, Vec<[f32; 6]>>,
     sound_distance: HashMap<i32, f32>,
     templates: HashMap<String, crate::connected::Template>,
+    rule_sets: HashMap<String, proto::ConnectedBlockRuleSetAsset>,
     lists: HashMap<String, Value>,
     connecting: Vec<Vec<(usize, [i32; 3])>>,
     rotated: Mutex<HashMap<(i32, i32), (Faces<Req>, Faces<Sup>)>>,
@@ -350,6 +351,14 @@ impl Rules {
                                     harvest_sets.insert(i, *e);
                                 }
                             }
+                        }
+                    }
+                }
+                90 => {
+                    // Patterned connected block rule sets (spec 23).
+                    if let Ok((m, _)) = proto::UpdateConnectedBlockRuleSets::decode(payload, 0) {
+                        for (k, a) in m.rule_sets.into_iter().flatten() {
+                            r.rule_sets.insert(k, a);
                         }
                     }
                 }
@@ -602,6 +611,10 @@ impl Rules {
         b.template
             .as_ref()
             .or_else(|| self.base(id)?.template.as_ref())
+    }
+
+    pub fn rule_set(&self, id: &str) -> Option<&proto::ConnectedBlockRuleSetAsset> {
+        self.rule_sets.get(id)
     }
 
     pub fn template(&self, name: &str) -> Option<&crate::connected::Template> {
