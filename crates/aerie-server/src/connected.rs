@@ -13,6 +13,13 @@ pub trait Cells {
     fn rules(&self, block: i32) -> Option<&RuleSet>;
     /// Whether a block, turned so, supports what stands on top of it.
     fn supports_up(&self, block: i32, rot: i32) -> bool;
+    /// The template a block fits itself by, and its shapes' blocks.
+    fn template_use(&self, block: i32) -> Option<&Use>;
+    fn template(&self, name: &str) -> Option<&Template>;
+    /// How a block's yaw mirrors: 0 symmetric, 1 orthogonal, 2 orthogonal
+    /// inverse.
+    fn flip(&self, block: i32) -> u8;
+    fn key(&self, block: i32) -> Option<&str>;
 }
 
 /// What a rule set wants at a cell: a block and rotation, and blocks at
@@ -428,7 +435,418 @@ fn roof(
 
 /// What a rule set wants at a cell. `None`: no opinion (also for the
 /// rule sets not done yet).
-pub fn desired(w: &dyn Cells, at: Pos, block: i32, rot: i32) -> Option<Want> {
+// ---- Templates (spec 23, "Templates") ----
+
+/// Tags of a block's faces, by direction.
+pub type Tags = Vec<([i32; 3], Vec<String>)>;
+
+#[derive(Clone, Debug, Default)]
+pub struct Template {
+    pub default: Option<String>,
+    /// Blocks of other materials count as neighbours.
+    pub others: bool,
+    /// Only asked when the block is placed.
+    pub once: bool,
+    /// In the order they are tried.
+    pub shapes: Vec<Shape>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Shape {
+    pub name: String,
+    pub tags: Tags,
+    pub patterns: Vec<Pattern>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Pattern {
+    /// The rules turn with the block.
+    pub orient: bool,
+    /// Extra yaw of the answer.
+    pub yaw: i32,
+    pub turns: bool,
+    pub mirror_x: bool,
+    pub mirror_z: bool,
+    pub placement: bool,
+    pub update: bool,
+    pub rules: Vec<Rule>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Rule {
+    pub pos: [i32; 3],
+    pub include: bool,
+    pub normals: Option<Vec<[i32; 3]>>,
+    pub tags: Tags,
+    /// (shape, rotation index, filler).
+    pub shapes: Vec<(String, i32, i32)>,
+    pub blocks: Vec<String>,
+}
+
+/// A block's use of a template: which template, and the blocks of each
+/// shape (block id, rotation index).
+#[derive(Clone, Debug, Default)]
+pub struct Use {
+    /// The block that declares it: blocks with the same owner are one
+    /// material.
+    pub owner: String,
+    pub template: String,
+    pub shapes: Vec<(String, Vec<(i32, i32)>)>,
+}
+
+fn vec3(v: Option<&serde_json::Value>) -> [i32; 3] {
+    let n = |i: usize| {
+        v.and_then(|v| v.get(i))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0) as i32
+    };
+    [n(0), n(1), n(2)]
+}
+
+fn tags_of(v: Option<&serde_json::Value>) -> Tags {
+    v.and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(dir, tags)| {
+            let d: Vec<i32> = dir.split(',').filter_map(|x| x.parse().ok()).collect();
+            let [x, y, z] = d[..] else { return None };
+            let tags = tags
+                .as_array()?
+                .iter()
+                .filter_map(|t| t.as_str().map(str::to_owned))
+                .collect();
+            Some(([x, y, z], tags))
+        })
+        .collect()
+}
+
+impl Template {
+    /// From the asset side's table (the physics table's `CT` lines).
+    pub fn from_json(v: &serde_json::Value) -> Self {
+        use serde_json::Value;
+        let flag = |v: &Value, k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
+        let list = |v: &Value, k: &str| -> Vec<Value> {
+            v.get(k)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        };
+        Template {
+            default: v.get("default").and_then(Value::as_str).map(str::to_owned),
+            others: flag(v, "others"),
+            once: flag(v, "once"),
+            shapes: list(v, "shapes")
+                .iter()
+                .map(|s| Shape {
+                    name: s
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    tags: tags_of(s.get("tags")),
+                    patterns: list(s, "patterns")
+                        .iter()
+                        .map(|p| Pattern {
+                            orient: flag(p, "orient"),
+                            yaw: p.get("yaw").and_then(Value::as_i64).unwrap_or(0) as i32,
+                            turns: flag(p, "turns"),
+                            mirror_x: flag(p, "mirror_x"),
+                            mirror_z: flag(p, "mirror_z"),
+                            placement: flag(p, "placement"),
+                            update: flag(p, "update"),
+                            rules: list(p, "rules")
+                                .iter()
+                                .map(|r| Rule {
+                                    pos: vec3(r.get("pos")),
+                                    include: flag(r, "include"),
+                                    normals: r
+                                        .get("normals")
+                                        .and_then(Value::as_array)
+                                        .map(|n| n.iter().map(|x| vec3(Some(x))).collect()),
+                                    tags: tags_of(r.get("tags")),
+                                    shapes: list(r, "shapes")
+                                        .iter()
+                                        .filter_map(|e| {
+                                            Some((
+                                                e.get(0)?.as_str()?.to_owned(),
+                                                e.get(1)?.as_i64()? as i32,
+                                                e.get(2)?.as_i64()? as i32,
+                                            ))
+                                        })
+                                        .collect(),
+                                    blocks: list(r, "blocks")
+                                        .iter()
+                                        .filter_map(|b| b.as_str().map(str::to_owned))
+                                        .collect(),
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// A vector turned a quarter `n` times about x, as pitch turns blocks.
+fn turn_x(n: i32, v: [i32; 3]) -> [i32; 3] {
+    match n.rem_euclid(4) {
+        0 => v,
+        1 => [v[0], -v[2], v[1]],
+        2 => [v[0], -v[1], -v[2]],
+        _ => [v[0], v[2], -v[1]],
+    }
+}
+
+/// The same about z (roll).
+fn turn_z(n: i32, v: [i32; 3]) -> [i32; 3] {
+    match n.rem_euclid(4) {
+        0 => v,
+        1 => [-v[1], v[0], v[2]],
+        2 => [-v[0], -v[1], v[2]],
+        _ => [v[1], -v[0], v[2]],
+    }
+}
+
+fn unpack(filler: i32) -> [i32; 3] {
+    let sign = |n: i32| if n & 16 != 0 { n | -32 } else { n };
+    [
+        sign(filler & 31),
+        sign(filler >> 10 & 31),
+        sign(filler >> 5 & 31),
+    ]
+}
+
+fn pack(v: [i32; 3]) -> i32 {
+    (v[0] & 31) | (v[2] & 31) << 5 | (v[1] & 31) << 10
+}
+
+/// A yaw mirrored across the x axis (`along_z` false) or the z axis, by
+/// the block's flip type.
+fn flip_yaw(flip: u8, yaw: i32, along_z: bool) -> i32 {
+    let odd = yaw.rem_euclid(2) == 1;
+    match flip {
+        1 | 2 => {
+            let mut step = if odd == (flip == 1) { 1 } else { -1 };
+            if along_z {
+                step = -step;
+            }
+            (yaw + step).rem_euclid(4)
+        }
+        _ => {
+            // A yaw lies along z when even, along x when odd.
+            if odd == along_z {
+                yaw
+            } else {
+                (yaw + 2).rem_euclid(4)
+            }
+        }
+    }
+}
+
+/// The shapes of a template use that a block id stands for.
+fn shapes_for(u: &Use, block: i32) -> impl Iterator<Item = &str> {
+    u.shapes
+        .iter()
+        .filter(move |(_, list)| list.iter().any(|(b, _)| *b == block))
+        .map(|(n, _)| n.as_str())
+}
+
+/// One rule against the block found at its place, seen as turned back
+/// (`rot`, `filler`).
+fn rule_holds(
+    w: &dyn Cells,
+    placed: &Use,
+    t: &Template,
+    rule: &Rule,
+    block: i32,
+    rot: i32,
+    filler: i32,
+) -> bool {
+    let same = |other: &Use| t.others || placed.owner == other.owner;
+    if !rule.tags.is_empty() {
+        let Some(u) = w.template_use(block) else {
+            return !rule.include;
+        };
+        let Some(theirs) = w.template(&u.template) else {
+            return !rule.include;
+        };
+        for name in shapes_for(u, block) {
+            if !same(u) {
+                continue;
+            }
+            let Some(shape) = theirs.shapes.iter().find(|s| s.name == name) else {
+                continue;
+            };
+            for (dir, tags) in &rule.tags {
+                let d = turn(-(rot % 4), *dir);
+                let has = |tag: &String| {
+                    shape
+                        .tags
+                        .iter()
+                        .any(|(sd, st)| *sd == d && st.contains(tag))
+                };
+                if tags.iter().any(has) {
+                    return rule.include;
+                }
+            }
+        }
+    }
+    if !rule.shapes.is_empty() {
+        let Some(u) = w.template_use(block) else {
+            return !rule.include;
+        };
+        for name in shapes_for(u, block) {
+            if same(u)
+                && rule
+                    .shapes
+                    .iter()
+                    .any(|(n, r, f)| n == name && *r == rot && *f == filler)
+            {
+                return rule.include;
+            }
+        }
+    }
+    if !rule.blocks.is_empty()
+        && w.key(block)
+            .is_some_and(|k| rule.blocks.iter().any(|b| b == k))
+    {
+        return rule.include;
+    }
+    !rule.include
+}
+
+/// One pattern at `at` for a block turned `rot`: the answer when its
+/// rules hold in one of its transformations.
+#[allow(clippy::too_many_arguments)]
+fn pattern(
+    w: &dyn Cells,
+    u: &Use,
+    t: &Template,
+    shape: &str,
+    p: &Pattern,
+    at: Pos,
+    rot: i32,
+    normal: [i32; 3],
+    placement: bool,
+) -> Option<Want> {
+    if (placement && p.update) || (!placement && p.placement) {
+        return None;
+    }
+    // Plain, then mirrored in x, then in z; each as it is and, when the
+    // pattern turns, by each quarter.
+    let mut transforms = Vec::new();
+    for (mirror, on) in [(0, true), (1, p.mirror_x), (2, p.mirror_z)] {
+        if on {
+            transforms.push((0, mirror));
+            if p.turns {
+                transforms.extend([(1, mirror), (2, mirror), (3, mirror)]);
+            }
+        }
+    }
+    'transform: for (yaw, mirror) in transforms {
+        let mut total = [yaw, 0, 0];
+        if p.orient {
+            total = [(yaw + rot % 4) % 4, (rot / 4) % 4, (rot / 16) % 4];
+        }
+        for rule in &p.rules {
+            let mut c = rule.pos;
+            match mirror {
+                1 => c[0] = -c[0],
+                2 => c[2] = -c[2],
+                _ => {}
+            }
+            if let Some(normals) = &rule.normals {
+                if normals.contains(&normal) {
+                    continue;
+                }
+                return None;
+            }
+            let c = turn(total[0], turn_x(total[1], turn_z(total[2], c)));
+            let (block, their_rot, mut filler) = w.at(add(at, c))?;
+            let mut back = [
+                (their_rot % 4 - total[0]).rem_euclid(4),
+                ((their_rot / 4) % 4 - total[1]).rem_euclid(4),
+                ((their_rot / 16) % 4 - total[2]).rem_euclid(4),
+            ];
+            filler = pack(turn_x(-total[1], unpack(filler)));
+            filler = pack(turn(-total[0], unpack(filler)));
+            filler = pack(turn_z(-total[2], unpack(filler)));
+            if mirror != 0 {
+                let mirrored = flip_yaw(w.flip(block), back[0], mirror == 2);
+                filler = pack(turn(mirrored - back[0], unpack(filler)));
+                back[0] = mirrored;
+            }
+            let seen = back[2] * 16 + back[1] * 4 + back[0];
+            if !rule_holds(w, u, t, rule, block, seen, filler) {
+                continue 'transform;
+            }
+        }
+        let (block, entry_rot) = *u.shapes.iter().find(|(n, _)| n == shape)?.1.first()?;
+        let flip = w.flip(block);
+        let mut r = [
+            (entry_rot % 4 + p.yaw) % 4,
+            (entry_rot / 4) % 4,
+            (entry_rot / 16) % 4,
+        ];
+        if mirror != 0 {
+            r[0] = flip_yaw(flip, r[0], mirror == 2);
+        }
+        for a in 0..3 {
+            r[a] = (r[a] + total[a]) % 4;
+        }
+        if r[1] == 2 && flip == 1 {
+            r[0] = (r[0] + 3) % 4;
+        }
+        return Some(Want {
+            block,
+            rot: r[2] * 16 + r[1] * 4 + r[0],
+            extra: Vec::new(),
+        });
+    }
+    None
+}
+
+/// What a templated block wants to be: the first shape with a pattern
+/// that holds, else the template's default shape as the block is turned.
+fn templated(
+    w: &dyn Cells,
+    u: &Use,
+    at: Pos,
+    rot: i32,
+    normal: [i32; 3],
+    placement: bool,
+) -> Option<Want> {
+    let t = w.template(&u.template)?;
+    for shape in &t.shapes {
+        for p in &shape.patterns {
+            if let Some(want) = pattern(w, u, t, &shape.name, p, at, rot, normal, placement) {
+                return Some(want);
+            }
+        }
+    }
+    let default = t.default.as_deref()?;
+    let (block, _) = *u.shapes.iter().find(|(n, _)| n == default)?.1.first()?;
+    Some(Want {
+        block,
+        rot,
+        extra: Vec::new(),
+    })
+}
+
+/// What the block at `at` wants to be. `normal` is the face it was
+/// placed on, `placement` whether it is being placed now.
+pub fn desired(
+    w: &dyn Cells,
+    at: Pos,
+    block: i32,
+    rot: i32,
+    normal: [i32; 3],
+    placement: bool,
+) -> Option<Want> {
+    if let Some(u) = w.template_use(block) {
+        return templated(w, u, at, rot, normal, placement);
+    }
     match w.rules(block)? {
         RuleSet::StairConnectedBlockRuleSet(s) => stair(w, s, at, rot).map(|(block, rot)| Want {
             block,
@@ -464,7 +882,11 @@ fn collect(w: &dyn Cells, origin: Pos, found: &mut Vec<(Pos, Want)>) {
                 let Some((block, rot, filler)) = w.at(at) else {
                     continue;
                 };
-                if w.rules(block).is_none_or(only_on_placement) {
+                let once = match w.template_use(block) {
+                    Some(u) => w.template(&u.template).is_none_or(|t| t.once),
+                    None => w.rules(block).is_none_or(only_on_placement),
+                };
+                if once {
                     continue;
                 }
                 if filler != 0 {
@@ -475,7 +897,7 @@ fn collect(w: &dyn Cells, origin: Pos, found: &mut Vec<(Pos, Want)>) {
                         at.2 - sign(filler >> 5 & 31),
                     );
                 }
-                if let Some(want) = desired(w, at, block, rot)
+                if let Some(want) = desired(w, at, block, rot, [0, 0, 0], false)
                     && (want.block, want.rot) != (block, rot)
                     && !found.iter().any(|f| f.0 == at)
                 {
@@ -493,4 +915,35 @@ pub fn neighbours(w: &dyn Cells, at: Pos) -> Vec<(Pos, Want)> {
     let mut found = Vec::new();
     collect(w, at, &mut found);
     found
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+
+    #[test]
+    fn yaws_mirror_by_flip_type() {
+        // Symmetric: half round when the yaw lies along the mirrored axis.
+        assert_eq!(flip_yaw(0, 0, false), 0);
+        assert_eq!(flip_yaw(0, 1, false), 3);
+        assert_eq!(flip_yaw(0, 0, true), 2);
+        assert_eq!(flip_yaw(0, 1, true), 1);
+        // Orthogonal: a quarter forward for odd yaws, back for even ones;
+        // the other way across z.
+        assert_eq!(flip_yaw(1, 1, false), 2);
+        assert_eq!(flip_yaw(1, 0, false), 3);
+        assert_eq!(flip_yaw(1, 0, true), 1);
+        // Orthogonal inverse: the opposite.
+        assert_eq!(flip_yaw(2, 1, false), 0);
+        assert_eq!(flip_yaw(2, 0, false), 1);
+    }
+
+    #[test]
+    fn part_offsets_pack_like_the_world() {
+        for v in [[-1, 0, 0], [0, 1, 0], [2, -3, 1]] {
+            assert_eq!(unpack(pack(v)), v);
+        }
+        assert_eq!(pack([0, 1, 0]), 1024);
+        assert_eq!(pack([0, 0, 1]), 32);
+    }
 }

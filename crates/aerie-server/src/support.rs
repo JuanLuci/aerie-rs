@@ -210,6 +210,12 @@ pub struct Block {
     pub door: Option<bool>,
     /// Its falling block settings, when it has any.
     pub falling: Option<Falling>,
+    /// The template that fits it to its neighbours and its shapes'
+    /// blocks (spec 23), on the block that declares them.
+    pub template: Option<crate::connected::Use>,
+    /// How its yaw mirrors: 0 symmetric, 1 orthogonal, 2 orthogonal
+    /// inverse.
+    pub flip: u8,
     /// A block that holds items (on its default state's block).
     pub container: Option<Container>,
 }
@@ -267,6 +273,7 @@ pub struct Rules {
     /// Hitbox index → its boxes (min, max).
     boxes: HashMap<i32, Vec<[f32; 6]>>,
     sound_distance: HashMap<i32, f32>,
+    templates: HashMap<String, crate::connected::Template>,
     lists: HashMap<String, Value>,
     connecting: Vec<Vec<(usize, [i32; 3])>>,
     rotated: Mutex<HashMap<(i32, i32), (Faces<Req>, Faces<Sup>)>>,
@@ -483,6 +490,52 @@ impl Rules {
                             .push((state.to_owned(), sound.parse().unwrap_or(0)));
                     }
                 }
+                "CT" => {
+                    if let Some((key, json)) = rest.split_once(' ')
+                        && let Ok(v) = serde_json::from_str::<Value>(json)
+                    {
+                        r.templates
+                            .insert(key.to_owned(), crate::connected::Template::from_json(&v));
+                    }
+                }
+                "CB" => {
+                    let w: Vec<&str> = rest.splitn(4, ' ').collect();
+                    if let [key, owner, template, json] = w[..]
+                        && let Ok(Value::Object(map)) = serde_json::from_str::<Value>(json)
+                        && let Some(&i) = by_key.get(key)
+                    {
+                        let shapes = map
+                            .iter()
+                            .map(|(shape, entries)| {
+                                let list = entries
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|e| {
+                                        let id = *by_key.get(e.get(0)?.as_str()?)?;
+                                        Some((id as i32, e.get(1)?.as_i64()? as i32))
+                                    })
+                                    .collect();
+                                (shape.clone(), list)
+                            })
+                            .collect();
+                        if let Some(b) = r.blocks[i].as_mut() {
+                            b.template = Some(crate::connected::Use {
+                                owner: owner.to_owned(),
+                                template: template.to_owned(),
+                                shapes,
+                            });
+                        }
+                    }
+                }
+                "CF" => {
+                    let w: Vec<&str> = rest.split_whitespace().collect();
+                    if let [key, flip] = w[..]
+                        && let Some(b) = by_key.get(key).and_then(|&i| r.blocks[i].as_mut())
+                    {
+                        b.flip = flip.parse().unwrap_or(0);
+                    }
+                }
                 "F" => {
                     let w: Vec<&str> = rest.split_whitespace().collect();
                     if let [key, impact, drops, collision] = w[..]
@@ -541,6 +594,26 @@ impl Rules {
                 .and_then(|(_, i)| self.block(*i))
                 .unwrap_or(b),
         )
+    }
+
+    /// A block's template and shape map, its own or its base block's.
+    pub fn template_use(&self, id: i32) -> Option<&crate::connected::Use> {
+        let b = self.block(id)?;
+        b.template
+            .as_ref()
+            .or_else(|| self.base(id)?.template.as_ref())
+    }
+
+    pub fn template(&self, name: &str) -> Option<&crate::connected::Template> {
+        self.templates.get(name)
+    }
+
+    /// How a block's yaw mirrors (its own flip type or its base block's).
+    pub fn flip(&self, id: i32) -> u8 {
+        match self.block(id).map_or(0, |b| b.flip) {
+            0 => self.base(id).map_or(0, |b| b.flip),
+            f => f,
+        }
     }
 
     /// The name of the interaction state a block is (`default` without).

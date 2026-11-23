@@ -86,17 +86,111 @@ of that material, with these differences:
   hollow shape is used; else the regular one. A wide corner that changes
   side also puts the new block at the cell on its old side.
 
+## Templates
+
+Walls and fences, chests, doors, village walls, bookshelves and rails
+share *templates*. A block names a template and gives, for each of the
+template's shapes, the block that is that shape (a block pattern: a
+block, with an optional rotation). The template has:
+
+- its shapes, each with *face tags* (names on the faces of the shape:
+  where it connects) and a list of *patterns*;
+- a default shape;
+- whether blocks of other materials count as neighbours (when not, only
+  blocks that share the very same shape map do);
+- whether its blocks are only asked when placed.
+
+The shapes are tried in the order a Java hash map of their names lists
+them (not the order of the file), each shape's patterns in file order.
+The first pattern that holds gives the answer. When none does, the
+answer is the default shape's block with the rotation the block has
+(nothing, when the block has no block for that shape).
+
+### A pattern
+
+A pattern is a list of rules, each about the cell at a relative
+position. It has: whether its rules turn with the block (they do unless
+it says otherwise), an extra yaw for the answer, the transformations it
+may be tried in, and whether it is only for placement or only for
+updates (it is skipped in the other case).
+
+The transformations, in order: as written; then, when the pattern may
+be turned, by one, two and three quarter turns of yaw; then the same
+again mirrored in x when it allows that, then mirrored in z.
+
+For one transformation:
+
+1. The total rotation is the transformation's yaw, plus the block's own
+   yaw, pitch and roll when the rules turn with the block.
+2. Each rule in turn: its position is mirrored (x or z negated), then
+   — for a rule with placement normals — the rule holds when the face
+   the block was placed on is one of them, and the whole pattern fails
+   when it is not. Otherwise the position is turned by the total
+   rotation (roll, then pitch, then yaw) and the cell there is read; an
+   unloaded cell fails the pattern.
+3. The block found is seen *turned back*: its rotation minus the total
+   rotation, per axis, and its part offset turned back the same way
+   (pitch, yaw, roll). Under a mirror its yaw is then mirrored by its
+   block's flip type, the part offset following.
+4. The rule is tested (below); the first rule that does not hold ends
+   this transformation and the next one is tried.
+5. When all hold, the answer is the shape's block with: its pattern
+   rotation, plus the pattern's extra yaw, mirrored by the answer
+   block's flip type under a mirror, plus the total rotation per axis;
+   and for a block whose flip type is orthogonal ending pitched half
+   round, a quarter turn of yaw back.
+
+Mirroring a yaw by flip type, across the x or the z axis: *symmetric*
+blocks turn half round when their yaw lies along the mirrored axis
+(even yaws lie along z, odd ones along x) and stay otherwise;
+*orthogonal* blocks step a quarter — forward for odd yaws, back for even
+ones, the other way round across z; *orthogonal inverse* blocks step the
+opposite way.
+
+### A rule
+
+A rule includes or excludes. It names any of: face tags per direction,
+shapes (a shape name with a rotation and a part offset), block types.
+Against the block found (turned back as above):
+
+- With face tags: a block that has no template fails an including rule
+  and passes an excluding one. Otherwise, for each shape the block
+  stands for (the shapes of its own map that list it), if materials may
+  mix or the two blocks share their shape map: each of the rule's
+  directions is turned back by the found block's yaw, and when that
+  shape has one of the rule's tags on that face the rule gives its
+  verdict — an including rule holds, an excluding one fails.
+- With shapes, likewise: when one of the shapes the block stands for is
+  listed with exactly the block's turned-back rotation and part offset,
+  the rule gives its verdict.
+- With block types: when the block is one of them, the rule gives its
+  verdict.
+- When nothing gave the verdict, an including rule fails and an
+  excluding one holds.
+
+Blocks that are an interaction state of another block use that block's
+template, shape map and flip type.
+
 ## In Aerie
 
 `connected.rs` answers for a cell through a small view of the world; the
 world applies the answers after a placement, a break and a harvest.
-Rule sets come with the block types' registry packets.
+Stair and roof rule sets come with the block types' registry packets;
+templates, each block's shape map and flip types come from the asset
+side's physics table (`CT`, `CB`, `CF` lines).
 
 ## Not done yet
 
-The templated pattern rules of walls, fences, doors, chests, rails and
-bookshelves; the "update, place, update" and "ignore updates" modes;
-extra blocks an answer carries.
+- The *patterned* rule sets (three pipe sets, eight blocks) with their
+  "update, place, update" and "ignore updates" modes.
+- The face a block was placed on is not passed in yet (rules with
+  placement normals see none); no shipped template has such a rule.
+- A shape whose block pattern lists several blocks takes the first one;
+  the official server picks by a random number seeded from the
+  position. No shipped pattern can answer with such a shape (only fence
+  gates list several, and no pattern leads to the gate shape).
+- Rules by block type list; no shipped template has one.
+- Extra blocks an answer carries.
 
 ## Checked against the official server
 
@@ -106,3 +200,10 @@ ring of four): the same blocks and rotations after every placement.
 Roofs the same way, on two levels (rows, a ring, a valley, corners on
 the upper level, a top piece over four slopes, a wide roof): the same
 blocks, rotations and batches.
+
+Templates the same way: fences (corners, T pieces, a cross, with the
+pieces placed at different yaws), chests growing into double chests
+along both axes, bookshelves in a row, village walls stacked three high,
+rails (a cross of straight pieces turning into corners and T pieces) and
+doors side by side (the second turns round to make a double door): the
+same blocks, rotations, part cells and batches after every placement.

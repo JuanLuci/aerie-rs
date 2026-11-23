@@ -2046,6 +2046,18 @@ impl Hub {
             fn supports_up(&self, block: i32, rot: i32) -> bool {
                 self.rules.supports_up(block, rot)
             }
+            fn template_use(&self, block: i32) -> Option<&crate::connected::Use> {
+                self.rules.template_use(block)
+            }
+            fn template(&self, name: &str) -> Option<&crate::connected::Template> {
+                self.rules.template(name)
+            }
+            fn flip(&self, block: i32) -> u8 {
+                self.rules.flip(block)
+            }
+            fn key(&self, block: i32) -> Option<&str> {
+                self.rules.block(block).map(|b| b.key.as_str())
+            }
         }
         let how = How {
             quiet: true,
@@ -2060,7 +2072,10 @@ impl Hub {
                 };
                 use crate::connected::Cells;
                 w.at(at).filter(|c| c.2 == 0).and_then(|(block, rot, _)| {
-                    Some((crate::connected::desired(&w, at, block, rot)?, (block, rot)))
+                    Some((
+                        crate::connected::desired(&w, at, block, rot, [0, 0, 0], true)?,
+                        (block, rot),
+                    ))
                 })
             };
             if let Some((want, have)) = want
