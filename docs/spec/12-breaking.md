@@ -104,11 +104,47 @@ themselves.
 
 ## Not done yet
 
+Break shapes are not compared with the official server yet: it needs a
+recording of pickaxe swings (the hatchet's recorded swings run another
+chain, and both servers refuse them with a pickaxe in hand).
+
 Break shapes (tools that break several blocks, with per-block or
 per-swing wear); wear from weapons and armour. A hit lands when its chain
 starts; the official server lands it when the chain reaches its break
 operation, so with fast clicking a late chain can land after the next
 one's first hits.
+
+## Break shapes
+
+A tool can name a *break shape*: a box or a cylinder, `width` across,
+`height` up and `depth` into the view (each 1 to 32, at most 1024
+cells), centred or not, moved by an offset (rounded, in the shape's own
+axes), turned by the look or by the face hit, and a wear mode (once per
+swing, the default, or once per block).
+
+The shape's axes: *View* takes the main axis of the look direction as
+"in" (ties go to y, then x); looking mostly up or down, "up" is the
+main horizontal axis of the look (away from it when looking down), and
+"up" is the world's up otherwise. *Surface* takes as "in" the axis
+whose face of the aimed block the look ray enters last, the same way
+for "up". "Across" is up × in.
+
+Its cells, in the order they are hit: for each depth step, for each
+column across, each row up — from the low bound (−(size − 1) / 2 when
+centred, else 0). A cylinder keeps the cells whose distance from the
+middle, scaled by half the width and half the height, is at most 1.
+Each cell is the aimed block plus the offset plus the cell, along the
+axes; a cell is hit once even when two map to it, and cells outside
+the world's height are skipped.
+
+In creative every cell breaks. Otherwise each cell takes the hit as
+any single block (damage, drops, sounds); with per-block wear the tool
+wears for each cell it damaged (the held stack read again after each),
+with per-swing wear it wears once after all of them, by the block that
+was at the aimed cell before the swing.
+
+Only debug pickaxes ship with shapes: a 3 × 3 box worn per swing and a
+5 × 5 cylinder worn per block.
 
 ## Checked against the official server
 

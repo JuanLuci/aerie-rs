@@ -100,6 +100,8 @@ pub struct Options {
     pub send: Option<String>,
     /// Then walk (teleport) to `x y z`.
     pub goto: Option<String>,
+    /// And look `yaw pitch` (radians).
+    pub look: Option<String>,
     /// Then use the block at `x y z` (a `Use` interaction chain).
     pub use_block: Option<String>,
     /// Packets to send after that: `id:hex;id:hex`.
@@ -368,6 +370,30 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
                 // Chat lines and extra packets once the server has put the
                 // player in the world (it drops them before), one by one.
                 let mut later = Vec::new();
+                // Where it looks (before anything that depends on it).
+                if let Some(l) = &opts.look {
+                    let v: Vec<f32> = l
+                        .split_whitespace()
+                        .filter_map(|x| x.parse().ok())
+                        .collect();
+                    if let [yaw, pitch] = v[..] {
+                        let d = proto::Direction {
+                            yaw,
+                            pitch,
+                            roll: 0.0,
+                        };
+                        let mut payload = Vec::new();
+                        proto::ClientMovement {
+                            look_orientation: Some(d.clone()),
+                            body_orientation: Some(proto::Direction { pitch: 0.0, ..d }),
+                            ..Default::default()
+                        }
+                        .encode(&mut payload)?;
+                        let mut w = Vec::new();
+                        frame::encode(108, &payload, &mut w)?;
+                        later.push(w);
+                    }
+                }
                 // Going somewhere comes first, so that what the lines do
                 // happens around the player.
                 if let Some(g) = &opts.goto {

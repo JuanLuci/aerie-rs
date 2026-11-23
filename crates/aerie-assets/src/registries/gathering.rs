@@ -189,6 +189,34 @@ pub fn table(ctx: &Ctx) -> Result<String> {
             continue;
         }
         let t = tool.cloned().unwrap_or(Value::Null);
+        // A tool that breaks a shape of blocks (spec 12): `Z key kind
+        // width height depth centered ox oy oz surface perBlock` (kind 0
+        // box, 1 cylinder).
+        if let Some(b) = t.obj("BreakShape") {
+            let kind = match b.str_at("Id").or_else(|| b.str_at("Type")).as_deref() {
+                Some("Cylinder") => 1,
+                _ => 0,
+            };
+            let off = |a: &str| {
+                b.obj("Offset")
+                    .and_then(|o| o.get(a))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    .round() as i64
+            };
+            out += &format!(
+                "Z {k} {kind} {} {} {} {} {} {} {} {} {}\n",
+                b.i32_or("Width", 1),
+                b.i32_or("Height", 1),
+                b.i32_or("Depth", 1),
+                b.bool_or("Centered", true) as u8,
+                off("X"),
+                off("Y"),
+                off("Z"),
+                (b.str_at("Orientation").as_deref() == Some("Surface")) as u8,
+                (t.str_at("BreakShapeDurabilityMode").as_deref() == Some("PerBlock")) as u8,
+            );
+        }
         out += &format!(
             "I {k} {} {} {} {} {} {} {}\n",
             weapon as u8,

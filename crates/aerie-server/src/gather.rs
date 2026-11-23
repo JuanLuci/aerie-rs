@@ -56,6 +56,153 @@ pub struct Item {
     pub loss_on_hit: f64,
     /// (loss, block sets, block keys).
     pub loss_for: Vec<(f64, Vec<String>, Vec<String>)>,
+    /// The shape of blocks it breaks at once (spec 12).
+    pub shape: Option<Shape>,
+}
+
+/// A break shape: a box or an upright cylinder, `width` across,
+/// `height` up and `depth` into the view.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Shape {
+    pub cylinder: bool,
+    pub width: i32,
+    pub height: i32,
+    pub depth: i32,
+    pub centered: bool,
+    pub offset: [i32; 3],
+    /// Turned into the face the look hits, not the look's main axis.
+    pub surface: bool,
+    /// The tool wears once per block, not once per swing.
+    pub per_block: bool,
+}
+
+impl Shape {
+    fn low(size: i32, centered: bool) -> i32 {
+        if centered { -((size - 1) / 2) } else { 0 }
+    }
+
+    /// Its cells as (across, up, in), in the order they are hit: depth
+    /// first, then across, then up.
+    pub fn cells(&self) -> Vec<[i32; 3]> {
+        let (ul, vl) = (
+            Self::low(self.width, self.centered),
+            Self::low(self.height, self.centered),
+        );
+        let (uh, vh) = (ul + self.width - 1, vl + self.height - 1);
+        let (ru, rv) = (self.width as f64 / 2.0, self.height as f64 / 2.0);
+        let (cu, cv) = ((ul + uh) as f64 / 2.0, (vl + vh) as f64 / 2.0);
+        let mut out = Vec::new();
+        for w in 0..self.depth {
+            for u in ul..=uh {
+                for v in vl..=vh {
+                    if self.cylinder {
+                        let nu = if ru > 0.0 { (u as f64 - cu) / ru } else { 0.0 };
+                        let nv = if rv > 0.0 { (v as f64 - cv) / rv } else { 0.0 };
+                        if nu * nu + nv * nv > 1.0 {
+                            continue;
+                        }
+                    }
+                    out.push([u, v, w]);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The view's axes (forward, up, right) for a look direction: the
+/// main axis of the look; looking up or down, "up" is the main
+/// horizontal axis of the look, away from it when looking down.
+pub fn view_basis(d: [f64; 3]) -> ([i32; 3], [i32; 3], [i32; 3]) {
+    let (ax, ay, az) = (d[0].abs(), d[1].abs(), d[2].abs());
+    let (forward, up) = if ay >= ax && ay >= az {
+        let f = [0, if d[1] >= 0.0 { 1 } else { -1 }, 0];
+        (f, vertical_up(d[0], d[2], f[1]))
+    } else if ax >= az {
+        ([if d[0] >= 0.0 { 1 } else { -1 }, 0, 0], [0, 1, 0])
+    } else {
+        ([0, 0, if d[2] >= 0.0 { 1 } else { -1 }], [0, 1, 0])
+    };
+    (forward, up, cross(up, forward))
+}
+
+fn vertical_up(dx: f64, dz: f64, forward_y: i32) -> [i32; 3] {
+    let sign = if forward_y > 0 { -1 } else { 1 };
+    if dx.abs() >= dz.abs() {
+        [if dx >= 0.0 { sign } else { -sign }, 0, 0]
+    } else {
+        [0, 0, if dz >= 0.0 { sign } else { -sign }]
+    }
+}
+
+fn cross(a: [i32; 3], b: [i32; 3]) -> [i32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// The surface basis: forward is the axis whose face of the anchor
+/// block the look ray enters last (the face it hits).
+pub fn surface_basis(
+    eye: [f64; 3],
+    d: [f64; 3],
+    anchor: [i32; 3],
+) -> ([i32; 3], [i32; 3], [i32; 3]) {
+    let entry = |o: f64, dir: f64, lo: i32| {
+        if dir > 0.0 {
+            (lo as f64 - o) / dir
+        } else if dir < 0.0 {
+            (lo as f64 + 1.0 - o) / dir
+        } else {
+            f64::NEG_INFINITY
+        }
+    };
+    let (tx, ty, tz) = (
+        entry(eye[0], d[0], anchor[0]),
+        entry(eye[1], d[1], anchor[1]),
+        entry(eye[2], d[2], anchor[2]),
+    );
+    let sign = |v: f64| if v >= 0.0 { 1 } else { -1 };
+    let forward = if ty >= tx && ty >= tz {
+        [0, sign(d[1]), 0]
+    } else if tx >= tz {
+        [sign(d[0]), 0, 0]
+    } else {
+        [0, 0, sign(d[2])]
+    };
+    let up = if forward[1] != 0 {
+        vertical_up(d[0], d[2], forward[1])
+    } else {
+        [0, 1, 0]
+    };
+    (forward, up, cross(up, forward))
+}
+
+/// The cells a shape breaks around `anchor`, in order, each once.
+pub fn shape_cells(
+    s: &Shape,
+    anchor: [i32; 3],
+    basis: ([i32; 3], [i32; 3], [i32; 3]),
+) -> Vec<[i32; 3]> {
+    let (f, up, r) = basis;
+    let at = |u: i32, v: i32, w: i32, base: [i32; 3]| {
+        [
+            base[0] + r[0] * u + up[0] * v + f[0] * w,
+            base[1] + r[1] * u + up[1] * v + f[1] * w,
+            base[2] + r[2] * u + up[2] * v + f[2] * w,
+        ]
+    };
+    let base = at(s.offset[0], s.offset[1], s.offset[2], anchor);
+    let mut out: Vec<[i32; 3]> = Vec::new();
+    for [u, v, w] in s.cells() {
+        let c = at(u, v, w, base);
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// A gathering effect (particle system, sound).
@@ -178,6 +325,32 @@ impl Table {
                     it.incorrect_sound = incorrect.parse().unwrap_or(0);
                     it.max_durability = max.parse().unwrap_or(0.0);
                     it.loss_on_hit = loss.parse().unwrap_or(0.0);
+                }
+                [
+                    "Z",
+                    key,
+                    kind,
+                    w,
+                    h,
+                    d,
+                    centered,
+                    ox,
+                    oy,
+                    oz,
+                    surface,
+                    per_block,
+                ] => {
+                    let n = |v: &str| v.parse().unwrap_or(0);
+                    t.items.entry(key.to_owned()).or_default().shape = Some(Shape {
+                        cylinder: kind == "1",
+                        width: n(w).max(1),
+                        height: n(h).max(1),
+                        depth: n(d).max(1),
+                        centered: centered == "1",
+                        offset: [n(ox), n(oy), n(oz)],
+                        surface: surface == "1",
+                        per_block: per_block == "1",
+                    });
                 }
                 ["T", key, gather, power, quality, incorrect, hit] => {
                     t.items.entry(key.to_owned()).or_default().specs.push(Spec {
@@ -354,6 +527,35 @@ impl Table {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn break_shapes() {
+        let b = Shape {
+            width: 3,
+            height: 3,
+            depth: 1,
+            centered: true,
+            ..Default::default()
+        };
+        assert_eq!(b.cells().len(), 9);
+        assert_eq!(b.cells()[0], [-1, -1, 0]);
+        let c = Shape {
+            cylinder: true,
+            width: 5,
+            height: 5,
+            depth: 1,
+            centered: true,
+            ..Default::default()
+        };
+        // The corners of the 5 x 5 square fall outside.
+        assert_eq!(c.cells().len(), 21);
+        // Looking down, a little towards -z: in is down, up is -z.
+        let (f, up, r) = view_basis([0.0, -0.9, -0.3]);
+        assert_eq!((f, up, r), ([0, -1, 0], [0, 0, -1], [-1, 0, 0]));
+        let cells = shape_cells(&b, [5, 10, 5], (f, up, r));
+        assert!(cells.iter().all(|c| c[1] == 10));
+        assert_eq!(cells.len(), 9);
+    }
 
     const T: &str = "B Wood_Oak_Trunk Woods 0 Wood_Oak_Trunk - 1 0 - - 1 0 - - 1\n\
                      B Rock_Stone Rocks 0 Rock_Stone_Cobble - 1 0 - - 1 0 - - 0\n\

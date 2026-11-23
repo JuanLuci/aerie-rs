@@ -80,6 +80,7 @@ async fn main() -> Result<()> {
             send: arg(&args, "--send"),
             goto: arg(&args, "--goto"),
             uuid: arg(&args, "--uuid"),
+            look: arg(&args, "--look"),
             use_block: arg(&args, "--use-block"),
             after: match arg(&args, "--sprint").and_then(|s| s.parse().ok()) {
                 Some(steps) => Some(probe::sprint_steps(steps, arg(&args, "--after"))?),

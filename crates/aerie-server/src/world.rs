@@ -551,9 +551,93 @@ impl Hub {
         ground: &Ground,
         out: &mut Outgoing,
         player: i32,
+        at: Pos,
+        slot: i32,
+        tool: Option<(Option<String>, bool)>,
+    ) {
+        // A tool with a break shape hits every block of the shape around
+        // the one aimed at (spec 12, "Break shapes").
+        let shape = g
+            .players
+            .get(&player)
+            .and_then(|e| e.inv.get(inventory::HOTBAR, slot))
+            .and_then(|st| self.gather.item(&st.item).and_then(|i| i.shape));
+        let Some(shape) = shape else {
+            self.hit_one(g, ground, out, player, at, slot, tool, true);
+            return;
+        };
+        let Some(e) = g.players.get(&player) else {
+            return;
+        };
+        let (yaw, pitch) = e
+            .look
+            .as_ref()
+            .map_or((0.0, -90f32.to_radians()), |l| (l.yaw, l.pitch));
+        let dir = {
+            let len = pitch.cos();
+            [
+                (len * -yaw.sin()) as f64,
+                pitch.sin() as f64,
+                (len * -yaw.cos()) as f64,
+            ]
+        };
+        let anchor = [at.0, at.1, at.2];
+        let basis = match (&e.position, shape.surface) {
+            (Some(p), true) => {
+                crate::gather::surface_basis([p.x, p.y + self.eye_height, p.z], dir, anchor)
+            }
+            _ => crate::gather::view_basis(dir),
+        };
+        let creative = e.creative;
+        let stack = e.inv.get(inventory::HOTBAR, slot);
+        let anchor_block = {
+            use crate::support::World;
+            View {
+                g,
+                ground,
+                hub_rules: &self.rules,
+            }
+            .block(at.0, at.1, at.2)
+            .0
+        };
+        for c in crate::gather::shape_cells(&shape, anchor, basis) {
+            if !(0..crate::support::WORLD_HEIGHT).contains(&c[1]) {
+                continue;
+            }
+            self.hit_one(
+                g,
+                ground,
+                out,
+                player,
+                (c[0], c[1], c[2]),
+                slot,
+                tool.clone(),
+                shape.per_block,
+            );
+        }
+        // Once per swing: the wear of the block first aimed at.
+        if !creative
+            && !shape.per_block
+            && let Some(st) = stack.filter(|s| !s.unbreakable())
+            && let Some(key) = self.keys_by_id.get(&anchor_block).cloned()
+        {
+            self.wear_held(g, player, slot, &st, &key, anchor_block, out);
+        }
+    }
+
+    /// One block taking a hit (spec 12); `wear` whether the held tool
+    /// wears for it.
+    #[allow(clippy::too_many_arguments)]
+    fn hit_one(
+        &self,
+        g: &mut Inner,
+        ground: &Ground,
+        out: &mut Outgoing,
+        player: i32,
         (x, y, z): Pos,
         slot: i32,
         tool: Option<(Option<String>, bool)>,
+        wear: bool,
     ) {
         let hub = self;
         {
@@ -660,7 +744,7 @@ impl Hub {
                     if spec.as_ref().is_some_and(|s| s.incorrect) {
                         hub.effect(g, &hub.gather.incorrect.clone(), center, out);
                     }
-                    if let Some(st) = stack.filter(|s| !s.unbreakable()) {
+                    if wear && let Some(st) = stack.filter(|s| !s.unbreakable()) {
                         hub.wear_held(g, player, slot, &st, &key, block, out);
                     }
                 }
