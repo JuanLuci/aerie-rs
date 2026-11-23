@@ -207,3 +207,10 @@ along both axes, bookshelves in a row, village walls stacked three high,
 rails (a cross of straight pieces turning into corners and T pieces) and
 doors side by side (the second turns round to make a double door): the
 same blocks, rotations, part cells and batches after every placement.
+
+Removal the same way: a column of three village walls (bottom, middle,
+top) broken from the top with recorded hatchet swings, one piece after
+the other: the same cells change to the same pieces after each break.
+The break sound comes before the block's particle on both. (Block
+changes travel on another stream than sounds, so their order against
+sounds is not compared.)

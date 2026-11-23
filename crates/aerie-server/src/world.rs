@@ -780,7 +780,7 @@ impl Hub {
         if let Some(b) = self.rules.block(block)
             && b.break_sound > 0
         {
-            self.sound_near(g, b.break_sound, center, out);
+            self.sound_at(g, b.break_sound, center, true, out);
         }
         let how = How {
             physics: area,
@@ -872,6 +872,12 @@ impl Hub {
 
     /// A sound at a point for the players within its reach (SFX).
     fn sound_near(&self, g: &Inner, index: i32, at: [f64; 3], out: &mut Outgoing) {
+        self.sound_at(g, index, at, false, out);
+    }
+
+    /// The same, `placed`: kept where it was made among the packets for
+    /// everyone (a block's break sound comes before its particle).
+    fn sound_at(&self, g: &Inner, index: i32, at: [f64; 3], placed: bool, out: &mut Outgoing) {
         let reach = self.rules.sound_distance(index) as f64;
         let Ok(p) = sound_3d_packet(index, proto::SoundCategory::SFX, at) else {
             return;
@@ -880,7 +886,11 @@ impl Hub {
             if let Some(q) = &e.position
                 && dist2([q.x, q.y, q.z], at) <= reach * reach
             {
-                out.to.push((pid, p.clone()));
+                if placed {
+                    out.placed.push((out.all.len(), pid, p.clone()));
+                } else {
+                    out.to.push((pid, p.clone()));
+                }
             }
         }
     }
