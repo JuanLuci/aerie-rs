@@ -1,0 +1,30 @@
+name: Checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Nothing that must stay out of the repository
+        if: github.event_name == 'pull_request'
+        run: tools/ci/guard.sh origin/${{ github.base_ref }}
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Build
+        run: cargo build --workspace --all-targets
+      - name: Tests (no game files here: tests that need them are ignored)
+        run: cargo test --workspace
