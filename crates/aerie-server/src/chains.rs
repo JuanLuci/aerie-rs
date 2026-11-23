@@ -2051,6 +2051,7 @@ impl Manager {
         };
         let held = host.item_at(section, slot);
         let Some(root_index) = book.held_root(held.as_deref(), ty) else {
+            tracing::debug!("chain {index}: no root for {held:?} in slot {section}/{slot}");
             return cancel(host);
         };
         let Some(root) = book.root(root_index) else {
@@ -3111,9 +3112,11 @@ impl Manager {
             return fail(chain);
         };
         if !host.in_reach(chain.ctx.held.as_deref(), target) {
+            tracing::debug!("chain {}: {target:?} out of reach", chain.id);
             return fail(chain);
         }
         let Some(block) = host.block(target).filter(|&b| b != 0 && b != 1) else {
+            tracing::debug!("chain {}: no block at {target:?}", chain.id);
             return fail(chain);
         };
         match &x.kind {

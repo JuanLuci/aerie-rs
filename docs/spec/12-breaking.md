@@ -104,10 +104,6 @@ themselves.
 
 ## Not done yet
 
-Break shapes are not compared with the official server yet: it needs a
-recording of pickaxe swings (the hatchet's recorded swings run another
-chain, and both servers refuse them with a pickaxe in hand).
-
 Break shapes (tools that break several blocks, with per-block or
 per-swing wear); wear from weapons and armour. A hit lands when its chain
 starts; the official server lands it when the chain reaches its break
@@ -156,6 +152,14 @@ the same damage per hit, health, hit sounds, wear (0.25 a hit, stone being
 in the hatchet's sets), healing after 5 s and damage packets, but for the
 one late chain above. (The official server had cancelled earlier replays
 because the two servers number root interactions differently.)
+
+Break shapes: two recorded swings of each debug pickaxe replayed on a
+5 × 5 layer of stone, looking down at an angle (`probe --look`): the
+3 × 3 box and the 21-cell cylinder break the same cells on both, with
+the same hit and break sounds in the same order, and the tool wears the
+same (0.25 a swing for the box, 0.25 a block for the cylinder). The
+probe confirms the server's teleport as a client does: until then the
+official server ignores its look.
 
 ## Picking a block up by using it
 

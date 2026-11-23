@@ -391,6 +391,9 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
                         .encode(&mut payload)?;
                         let mut w = Vec::new();
                         frame::encode(108, &payload, &mut w)?;
+                        // After the client said it is ready for gameplay:
+                        // a server ignores movement before that.
+                        later.extend([Vec::new(), Vec::new(), Vec::new()]);
                         later.push(w);
                     }
                 }
@@ -500,6 +503,24 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
                             tokio::time::sleep(Duration::from_millis(700)).await;
                         }
                     });
+                }
+            }
+            109 => {
+                // Confirm a teleport, as a client does: until then a
+                // server ignores the player's movement and look.
+                if let Ok((t, _)) = proto::ClientTeleport::decode(&f.payload, 0) {
+                    let mut payload = Vec::new();
+                    proto::ClientMovement {
+                        teleport_ack: Some(proto::TeleportAck {
+                            teleport_id: t.teleport_id,
+                        }),
+                        absolute_position: t.model_transform.position.clone(),
+                        ..Default::default()
+                    }
+                    .encode(&mut payload)?;
+                    let mut w = Vec::new();
+                    frame::encode(108, &payload, &mut w)?;
+                    let _ = out_tx.send(w);
                 }
             }
             100 => {
