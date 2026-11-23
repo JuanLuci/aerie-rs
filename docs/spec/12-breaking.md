@@ -104,8 +104,7 @@ themselves.
 
 ## Not done yet
 
-Break shapes (tools that break several blocks, with per-block or
-per-swing wear); wear from weapons and armour. A hit lands when its chain
+Wear from weapons and armour. A hit lands when its chain
 starts; the official server lands it when the chain reaches its break
 operation, so with fast clicking a late chain can land after the next
 one's first hits.
