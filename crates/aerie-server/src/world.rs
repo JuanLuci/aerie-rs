@@ -6510,6 +6510,11 @@ impl Hub {
         for (_, to, q) in placed {
             self.send(to, q);
         }
+        // A bench or container a chain opened: its window goes out during
+        // the chain's step, before the chain's own answer (spec 21).
+        for (pid, (x, y, z)) in out.uses {
+            let _ = self.open_bench(pid, x, y, z);
+        }
         for (to, p) in out.to {
             self.send(to, p);
         }
@@ -6522,9 +6527,6 @@ impl Hub {
         }
         for (pid, st) in out.throws {
             self.throw_item(pid, st, 1.0);
-        }
-        for (pid, (x, y, z)) in out.uses {
-            let _ = self.open_bench(pid, x, y, z);
         }
         r
     }

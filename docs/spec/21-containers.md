@@ -52,6 +52,10 @@ first opening; a container replaced by another one keeping its items; a
 container carried as an item; windows of a player who leaves; the slots
 over a block's new, smaller capacity dropping.
 
+Opening is a step of the use chain: the page and the window go out while
+the chain runs, so they come before the chain's own answer in the same
+tick (in Aerie too, since #65).
+
 ## Checked against the official server
 
 A small chest placed, opened with a recorded use chain, two stones moved
