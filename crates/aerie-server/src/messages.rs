@@ -5,6 +5,11 @@
 //! by the value's type, and the client formats each kind its own way), then
 //! `packet()`.
 //!
+//! The official server keeps a message's parameters in two Java hash maps
+//! (plain values, and values that are messages), so they go out in that
+//! map's iteration order, not in the order they were added; setting a name
+//! twice keeps the last value. `Msg` does the same when it is finished.
+//!
 //! ```ignore
 //! Msg::key("server.commands.block.set.success")
 //!     .int("x", x).int("y", y).int("z", z)
@@ -42,10 +47,7 @@ impl Msg {
     }
 
     fn param(mut self, name: &str, v: proto::ParamValue) -> Self {
-        self.0
-            .params
-            .get_or_insert_with(Vec::new)
-            .push((name.to_owned(), v));
+        put(self.0.params.get_or_insert_with(Vec::new), name, v);
         self
     }
 
@@ -84,10 +86,8 @@ impl Msg {
     /// A parameter that is itself a message (translated on its own, such as
     /// an item's name).
     pub fn msg(mut self, name: &str, m: Msg) -> Self {
-        self.0
-            .message_params
-            .get_or_insert_with(Vec::new)
-            .push((name.to_owned(), m.0));
+        let m = m.into_inner();
+        put(self.0.message_params.get_or_insert_with(Vec::new), name, m);
         self
     }
 
@@ -99,11 +99,19 @@ impl Msg {
 
     /// Appends a message shown after this one.
     pub fn child(mut self, m: Msg) -> Self {
-        self.0.children.get_or_insert_with(Vec::new).push(m.0);
+        let m = m.into_inner();
+        self.0.children.get_or_insert_with(Vec::new).push(m);
         self
     }
 
-    pub fn into_inner(self) -> proto::FormattedMessage {
+    /// The finished message, its parameters in the official order.
+    pub fn into_inner(mut self) -> proto::FormattedMessage {
+        if let Some(p) = &mut self.0.params {
+            hash_map_order(p);
+        }
+        if let Some(p) = &mut self.0.message_params {
+            hash_map_order(p);
+        }
         self.0
     }
 
@@ -113,10 +121,35 @@ impl Msg {
             SERVER_MESSAGE,
             &proto::ServerMessage {
                 r#type: proto::ChatType::CHAT,
-                message: Some(self.0),
+                message: Some(self.into_inner()),
             },
         )
     }
+}
+
+/// A Java map's `put`: a name already there keeps its place and takes the
+/// new value.
+fn put<T>(list: &mut Vec<(String, T)>, name: &str, v: T) {
+    match list.iter_mut().find(|(k, _)| k == name) {
+        Some(slot) => slot.1 = v,
+        None => list.push((name.to_owned(), v)),
+    }
+}
+
+/// Reorders entries as a Java `HashMap` filled in this order iterates them:
+/// by bucket (`h ^ h >>> 16` of the key's `String.hashCode`, in a table of
+/// 16 that doubles whenever it is more than three quarters full), and in
+/// insertion order inside a bucket (a doubling keeps that order).
+fn hash_map_order<T>(list: &mut [(String, T)]) {
+    let mut table = 16usize;
+    while list.len() * 4 > table * 3 {
+        table *= 2;
+    }
+    let bucket = |k: &str| {
+        let h = aerie_assets::chm::java_hash(k);
+        ((h ^ (h >> 16)) as usize) & (table - 1)
+    };
+    list.sort_by_key(|(k, _)| bucket(k));
 }
 
 #[cfg(test)]
@@ -133,11 +166,32 @@ mod tests {
             .color("#ff5555")
             .into_inner();
         let p = m.params.unwrap();
+        // `x` (bucket 8) comes before `id` (bucket 11).
         assert_eq!(p[0].0, "x");
         assert!(matches!(p[0].1, proto::ParamValue::IntParamValue(_)));
         assert!(matches!(p[1].1, proto::ParamValue::StringParamValue(_)));
         assert_eq!(m.message_params.unwrap()[0].0, "item");
         assert_eq!(m.color.as_deref(), Some("#ff5555"));
+    }
+
+    #[test]
+    fn orders_parameters_as_a_java_hash_map() {
+        // The official chat line lists `message` before `username`.
+        let m = Msg::key("server.chat.playerMessage")
+            .text("username", "Ana")
+            .text("message", "oi")
+            .into_inner();
+        let names: Vec<_> = m.params.unwrap().into_iter().map(|p| p.0).collect();
+        assert_eq!(names, ["message", "username"]);
+        // A name set twice keeps its place and the last value.
+        let m = Msg::key("k")
+            .int("a", 1)
+            .int("b", 2)
+            .int("a", 3)
+            .into_inner();
+        let p = m.params.unwrap();
+        assert_eq!(p.len(), 2);
+        assert!(matches!(&p[0].1, proto::ParamValue::IntParamValue(v) if v.value == 3));
     }
 
     #[test]
