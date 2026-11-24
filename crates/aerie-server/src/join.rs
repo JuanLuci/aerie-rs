@@ -106,6 +106,7 @@ pub(crate) mod settings_id {
     pub const UPDATE_MOVEMENT_SETTINGS: u32 = 110;
     pub const SET_UPDATE_RATE: u32 = 29;
     pub const SET_TIME_DILATION: u32 = 30;
+    pub const SERVER_TAGS: u32 = 34;
     pub const UPDATE_FEATURES: u32 = 31;
     pub const SET_MOVEMENT_STATES: u32 = 102;
     pub const UPDATE_TIME_SETTINGS: u32 = 145;
@@ -223,6 +224,19 @@ fn world_settings(parts: &PlayerParts) -> Result<Vec<Out>> {
         },
     )?);
     Ok(v)
+}
+
+/// The client tags the server announces before `JoinWorld`. The movement
+/// abilities (crouch slide, mantling, safety roll) each register
+/// "Allows=Movement"; as the first tag ever registered it has index 0. The
+/// five client features themselves go out later, in `world_settings`.
+fn client_tags() -> Result<Vec<Out>> {
+    Ok(vec![Out::new(
+        settings_id::SERVER_TAGS,
+        &proto::ServerTags {
+            tags: Some(vec![("Allows=Movement".to_string(), 0)]),
+        },
+    )?])
 }
 
 /// After the player: the HUD, known recipes, time settings and the time
@@ -653,6 +667,7 @@ fn built(
     opaque: &dyn Fn(i32) -> bool,
     damage: &dyn Fn(i32, i32) -> Vec<(u32, Vec<u8>)>,
     creative: bool,
+    view_radius: i32,
 ) -> Result<World> {
     let (ccx, ccz) = column_of(start);
     let join = Out::new(
@@ -697,11 +712,13 @@ fn built(
             p.extend(extras);
             (before, p)
         }
-        None => (Vec::new(), own()?),
+        None => (client_tags()?, own()?),
     };
     let mut after = vec![Out::new(
         id::VIEW_RADIUS,
-        &proto::ViewRadius { value: 1024 },
+        &proto::ViewRadius {
+            value: view_radius * 32,
+        },
     )?];
     // The columns around where the player starts, nearest first.
     let mut area: Vec<(i32, i32)> = (ccx - BUILT_RADIUS..=ccx + BUILT_RADIUS)
@@ -974,6 +991,7 @@ async fn in_world(
                     &|b| hub.opaque(b),
                     &|x, z| hub.damage_packets(x, z),
                     hub.default_creative(),
+                    settings.max_view_radius,
                 )?,
                 false,
             )
@@ -1243,6 +1261,7 @@ mod tests {
             &|_| true,
             &|_, _| Vec::new(),
             false,
+            32,
         )
         .unwrap();
         let solid = w
