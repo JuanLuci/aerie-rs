@@ -1824,41 +1824,17 @@ impl Hub {
         match packet_id {
             self::id::MOVE_ITEM_STACK => {
                 let (m, _) = proto::MoveItemStack::decode(payload, 0)?;
-                if self.swap_move(id, &m) {
-                    return Ok(());
-                }
-                self.inventory_move(id, |inv, items, _, _| {
-                    inv.move_to_slot(
-                        items,
-                        (m.from_section_id, m.from_slot_id),
-                        m.quantity,
-                        (m.to_section_id, m.to_slot_id),
-                    );
-                });
-                // Moved into the utility section: that slot becomes the
-                // active one, and the client is told.
-                if m.to_section_id != m.from_section_id && m.to_section_id == inventory::UTILITY {
-                    let changed = {
-                        let mut g = self.inner.lock().unwrap();
-                        g.players.get_mut(&id).is_some_and(|e| {
-                            let c = e.utility_slot != m.to_slot_id;
-                            e.utility_slot = m.to_slot_id;
-                            c
-                        })
-                    };
-                    if changed {
-                        self.send(
-                            id,
-                            packet(
-                                self::id::SET_ACTIVE_SLOT,
-                                &proto::SetActiveSlot {
-                                    inventory_section_id: inventory::UTILITY,
-                                    active_slot: m.to_slot_id,
-                                },
-                            )?,
+                if !self.swap_move(id, &m) {
+                    self.inventory_move(id, |inv, items, _, _| {
+                        inv.move_to_slot(
+                            items,
+                            (m.from_section_id, m.from_slot_id),
+                            m.quantity,
+                            (m.to_section_id, m.to_slot_id),
                         );
-                    }
+                    });
                 }
+                self.utility_follows(id, &m)?;
             }
             self::id::SMART_MOVE_ITEM_STACK => {
                 let (m, _) = proto::SmartMoveItemStack::decode(payload, 0)?;
@@ -2090,17 +2066,18 @@ impl Hub {
     fn swap_move(&self, id: i32, m: &proto::MoveItemStack) -> bool {
         use aerie_protocol::proto::InteractionType as IT;
         let mut g = self.inner.lock().unwrap();
+        // Either end may be an open window's slot (a chest's, say).
+        let from = Self::stack_at(&g, id, m.from_section_id, m.from_slot_id);
+        let to = Self::stack_at(&g, id, m.to_section_id, m.to_slot_id);
         let Some(e) = g.players.get_mut(&id) else {
             return false;
         };
         let active = e.hotbar_slot;
         let to_active = m.to_section_id == inventory::HOTBAR && m.to_slot_id == active;
         let from_active = m.from_section_id == inventory::HOTBAR && m.from_slot_id == active;
-        if !(to_active || from_active) || m.from_section_id >= 0 || m.to_section_id >= 0 {
+        if !(to_active || from_active) {
             return false;
         }
-        let from = e.inv.get(m.from_section_id, m.from_slot_id);
-        let to = e.inv.get(m.to_section_id, m.to_slot_id);
         let (Some(from), Some(to)) = (from, to) else {
             return false;
         };
@@ -2137,6 +2114,64 @@ impl Hub {
         e.chains
             .start_server(&self.chains, IT::SWAP_FROM, ctx, root, data);
         true
+    }
+
+    /// What a slot holds, for a player's own sections and the slots of the
+    /// window it has open (container, processing bench, structural bench),
+    /// without changing anything.
+    fn stack_at(g: &Inner, id: i32, section: i32, slot: i32) -> Option<Stack> {
+        let e = g.players.get(&id)?;
+        if section < 0 {
+            return e.inv.get(section, slot);
+        }
+        let w = e.window.as_ref().filter(|w| w.id == section)?;
+        let i = usize::try_from(slot).ok()?;
+        match w.kind {
+            crate::crafting::Kind::Container => {
+                g.containers.get(&w.block.as_ref()?.1)?.get(i)?.clone()
+            }
+            crate::crafting::Kind::Processing => g
+                .processing
+                .get(&w.block.as_ref()?.1)?
+                .slots()
+                .get(i)?
+                .clone(),
+            crate::crafting::Kind::Structural => match i {
+                0 => w.input.clone(),
+                _ => w.options.get(i - 1).map(|(s, _)| s.clone()),
+            },
+            _ => None,
+        }
+    }
+
+    /// Moved into the utility section from elsewhere: that slot becomes the
+    /// active one at once (even when the move itself waits for a swap
+    /// chain), and the client is told.
+    fn utility_follows(&self, id: i32, m: &proto::MoveItemStack) -> Result<()> {
+        if m.to_section_id == m.from_section_id || m.to_section_id != inventory::UTILITY {
+            return Ok(());
+        }
+        let changed = {
+            let mut g = self.inner.lock().unwrap();
+            g.players.get_mut(&id).is_some_and(|e| {
+                let c = e.utility_slot != m.to_slot_id;
+                e.utility_slot = m.to_slot_id;
+                c
+            })
+        };
+        if changed {
+            self.send(
+                id,
+                packet(
+                    self::id::SET_ACTIVE_SLOT,
+                    &proto::SetActiveSlot {
+                        inventory_section_id: inventory::UTILITY,
+                        active_slot: m.to_slot_id,
+                    },
+                )?,
+            );
+        }
+        Ok(())
     }
 
     /// `SetActiveSlot` (spec 14): the utility or tools slot in use. The
@@ -6492,6 +6527,11 @@ impl Hub {
         for (_, to, q) in placed {
             self.send(to, q);
         }
+        // A bench or container a chain opened: its window goes out during
+        // the chain's step, before the chain's own answer (spec 21).
+        for (pid, (x, y, z)) in out.uses {
+            let _ = self.open_bench(pid, x, y, z);
+        }
         for (to, p) in out.to {
             self.send(to, p);
         }
@@ -6504,9 +6544,6 @@ impl Hub {
         }
         for (pid, st) in out.throws {
             self.throw_item(pid, st, 1.0);
-        }
-        for (pid, (x, y, z)) in out.uses {
-            let _ = self.open_bench(pid, x, y, z);
         }
         r
     }
