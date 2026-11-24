@@ -47,9 +47,7 @@ ones) and gives each interaction state's sound.
 
 ## Not done yet
 
-Double doors are written from the rules above but not yet compared with
-the official server (it needs a door placed turned the other way); the
-"blocked" animation's return to the closed state; doors opened by
+The "blocked" animation's return to the closed state; doors opened by
 creatures.
 
 ## Checked against the official server
@@ -57,3 +55,12 @@ creatures.
 A door and a trapdoor placed, opened and closed with a recorded use
 chain: the same block changes cell by cell (states, parts, cleared
 cells), the same sounds at the same points, the same chain states.
+
+A double door (issue #40): two doors placed side by side with placement
+chains, the second turned half round, then used from the first and from
+the second, open and shut. On both servers: the same placements, both
+doors moving together in one batch of block changes (the same states,
+parts and rotations), the opening and closing sounds between the two
+doors, and the same chain answers. With a solid block where the partner
+swings, the pair opens the other way on both; with both ways blocked,
+both doors switch to their blocked state on both.

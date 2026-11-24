@@ -342,6 +342,17 @@ impl Run {
         }
     }
 
+    /// Chains sent by hand or replayed take their ids: a server refuses a
+    /// new chain whose id is not above the last one, so the probe's own
+    /// chains continue after them.
+    fn saw_chains(&self, m: &proto::SyncInteractionChains) {
+        let top = m.updates.iter().map(|c| c.chain_id).max();
+        if let Some(top) = top {
+            let mut s = self.state.lock().unwrap();
+            s.next_chain = s.next_chain.max(top + 1);
+        }
+    }
+
     /// Waits until the block at `p` is known (its section can come a
     /// moment after the player moved).
     async fn known(&self, p: [i32; 3]) {
@@ -478,6 +489,11 @@ impl Run {
                 Step::Send(list) => {
                     let mut w = Vec::new();
                     for (i, b) in list {
+                        if *i == id::INTERACTION_CHAINS
+                            && let Ok((m, _)) = proto::SyncInteractionChains::decode(b, 0)
+                        {
+                            self.saw_chains(&m);
+                        }
                         frame::encode(*i, b, &mut w)?;
                     }
                     self.send(w)?;
@@ -576,6 +592,7 @@ impl Run {
                     c.active_hotbar_slot = slot;
                 }
             }
+            self.saw_chains(m);
             self.send(packet(id::INTERACTION_CHAINS, &*m)?)?;
             if t.is_none() {
                 tokio::time::sleep(Duration::from_millis(60)).await;
