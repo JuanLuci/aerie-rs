@@ -31,6 +31,7 @@ mod items;
 mod join;
 mod login;
 mod perf;
+mod playerlist;
 mod probe;
 mod processing;
 mod proxy;

@@ -11,7 +11,7 @@
 //!   is not decoded yet, so sections are sent without data (empty).
 
 use std::collections::BTreeMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use aerie_protocol::packets::Outgoing;
 use aerie_protocol::packets::WorldLoadFinished;
@@ -55,8 +55,6 @@ const BUILT_READY_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long to wait for `ClientReady` before sending the world anyway.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The official server pings about every 5 s (spec 05).
-const PING_EVERY: Duration = Duration::from_secs(5);
 
 /// Built world: a square of empty columns around the spawn.
 /// The client waits on joining until the chunks around it arrive (about
@@ -1089,7 +1087,6 @@ async fn in_world(
     }
 
     // In the world: ping, deliver what other players cause, and read the client.
-    let mut ping = tokio::time::interval(PING_EVERY);
     let mut report = tokio::time::interval(Duration::from_secs(10));
     // Columns this client has: the built area at first; more as it moves.
     let mut columns: std::collections::HashSet<(i32, i32)> = if replayed {
@@ -1104,7 +1101,6 @@ async fn in_world(
         .hub
         .columns_sent(client_id, columns.iter().copied());
     let mut stream_tick = tokio::time::interval(Duration::from_millis(500));
-    let mut ping_id = 0i32;
     let mut last_pos = None;
     loop {
         tokio::select! {
@@ -1121,10 +1117,6 @@ async fn in_world(
                     Channel::WorldMap => streams.world_map.write_all(&wire).await?,
                     _ => g.send.write_all(&wire).await?,
                 }
-            }
-            _ = ping.tick() => {
-                ping_id += 1;
-                g.send_raw(id::PING, &ping_packet(ping_id)?).await?;
             }
             _ = stream_tick.tick(), if !replayed => {
                 // Columns around the player that it does not have yet, the
@@ -1214,6 +1206,7 @@ fn client_packet(f: &Frame, hub: &Hub, client_id: i32, ready: &mut Ready, seen: 
             }
             if flags & 2 != 0 && !ready.gameplay {
                 ready.gameplay = true;
+                hub.player_ready(client_id);
                 info!("← ClientReady: ready for gameplay");
             }
         }
@@ -1221,27 +1214,10 @@ fn client_packet(f: &Frame, hub: &Hub, client_id: i32, ready: &mut Ready, seen: 
             info!("← ClientDisconnect");
             return false;
         }
-        id::PONG => debug!("← Pong"),
+        id::PONG => hub.pong(client_id, &f.payload),
         other => seen.add(other),
     }
     true
-}
-
-fn ping_packet(n: i32) -> Result<Vec<u8>> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-    let mut out = Vec::new();
-    proto::Ping {
-        id: n,
-        time: proto::InstantData {
-            seconds: now.as_secs() as i64,
-            nanos: now.subsec_nanos() as i32,
-        },
-        last_ping_value_raw: 0,
-        last_ping_value_direct: 0,
-        last_ping_value_tick: 0,
-    }
-    .encode(&mut out)?;
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -1297,10 +1273,5 @@ mod tests {
         assert_eq!(w.before.iter().map(|p| p.id).collect::<Vec<_>>(), [238]);
         assert_eq!(w.join.payload, [3]);
         assert_eq!(w.after.iter().map(|p| p.id).collect::<Vec<_>>(), [131, 100]);
-    }
-
-    #[test]
-    fn ping_has_its_fixed_size() {
-        assert_eq!(ping_packet(1).unwrap().len(), 28);
     }
 }
