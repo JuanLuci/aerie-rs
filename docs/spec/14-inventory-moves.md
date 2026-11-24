@@ -115,16 +115,32 @@ processing bench or a structural bench).
   non-empty section is sent afterwards, even when the order did not
   change.
 
-The answers are the ones of a move: the changed sections of
-`UpdatePlayerInventory` at the end of the tick, then the window's update.
+The answers are the ones of a move: the sections of
+`UpdatePlayerInventory` that report a change at the end of the tick, then
+the window's update when the window's container changed. Which sections
+report a change is not only which slots changed:
+
+- **Take all**: a stack that goes into an empty slot of the pickup
+  sections reports a change of all of them (the hotbar and the storage,
+  even when only the hotbar changed); a stack that only joins existing
+  stacks reports the sections it changed.
+- **Put all** (a single source, the storage): the storage reports a
+  change when it had no stack to try or any move worked, so a put all
+  with an empty storage still sends the storage (with no window update:
+  the window's container did not change); not when stacks were there but
+  none fitted.
+- **Quick stack** (the hotbar and storage as one source): only the
+  sections a stack was taken from report a change; with nothing to move
+  nothing is sent.
+- **Sort**: the storage and an open window's section are sent even when
+  empty.
 
 ## Not done yet
 
 Moving onto or off the active hotbar slot with a different item runs the
 swap interaction first (the move is the same); core abilities leaving
-their slot take their line's supports along; the three window actions
-(take all, put all, quick stack) are not compared with the official
-server (see below).
+their slot take their line's supports along; nothing else is known to
+differ.
 
 ## Checked against the official server
 
@@ -138,9 +154,11 @@ an empty storage, a storage whose order does not change: the packet is
 sent each time), and the backpack, and the ignored cases (a window that is
 not open, the hotbar or storage as the section of a take, put or stack,
 other action types) give the same
-inventory packets. Opening a container with the probe did not work on
-the official server (its use chain failed), so take all, put all, quick
-stack and a window sort were checked by unit tests only.
+inventory packets. With a small chest open (window 1) the same
+actions give the same inventory packets and window updates on both
+servers, in the same order: quick stack, sort, take all, put all (empty
+storage and moving items), quick stack with nothing matching, take all
+joining stacks and filling empty slots, and sorting an empty chest.
 
 ## Kept between sessions
 

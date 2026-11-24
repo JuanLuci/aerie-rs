@@ -712,7 +712,28 @@ impl Inventory {
                         continue;
                     };
                     let order = prefs.order_for(items.kind(&st.item));
-                    self.move_into(items, (sec, slot), st.n, &order);
+                    // The pickup sections are one combined container: a
+                    // stack that goes into an empty slot reports a change
+                    // of all of them (one that only joins stacks reports
+                    // the sections it changed).
+                    let used = |inv: &Self| -> usize {
+                        order
+                            .iter()
+                            .map(|&o| inv.sections_iter(o).filter(|x| x.is_some()).count())
+                            .sum()
+                    };
+                    let before = used(self);
+                    if self
+                        .move_into(items, (sec, slot), st.n, &order)
+                        .is_some_and(|rest| rest < st.n)
+                        && used(self) > before
+                    {
+                        for s in order {
+                            if self.capacity(s) > 0 {
+                                self.touch(s);
+                            }
+                        }
+                    }
                 }
             }
             PUT_ALL => self.move_all(items, &[STORAGE], sec, false),
@@ -725,7 +746,14 @@ impl Inventory {
     /// Moves every stack of `from` sections, in order, into `to` (all of a
     /// stack, what does not fit stays); with `only_stackable` only stacks
     /// `to` already holds a stack of the same kind of.
+    ///
+    /// A single source container reports a change when it had nothing to
+    /// try or any move worked, and not when stacks were there but none
+    /// moved. Several sources are one combined container: each of its
+    /// sections reports only the moves that took from it.
     fn move_all(&mut self, items: &impl Items, from: &[i32], to: i32, only_stackable: bool) {
+        let mut tried = false;
+        let mut moved: Vec<i32> = Vec::new();
         for &sec in from {
             for slot in 0..self.capacity(sec) as i32 {
                 let Some(st) = self.get(sec, slot) else {
@@ -734,8 +762,38 @@ impl Inventory {
                 if only_stackable && !self.holds_stackable(to, &st) {
                     continue;
                 }
-                self.move_into(items, (sec, slot), st.n, &[to]);
+                tried = true;
+                if self
+                    .move_into(items, (sec, slot), st.n, &[to])
+                    .is_some_and(|rest| rest < st.n)
+                {
+                    moved.push(sec);
+                }
             }
+        }
+        if let [sec] = from {
+            if !tried || !moved.is_empty() {
+                self.touch(*sec);
+            }
+        } else {
+            for sec in moved {
+                self.touch(sec);
+            }
+        }
+    }
+
+    /// A section's slots (none when the section is not there).
+    fn sections_iter(&self, sec: i32) -> impl Iterator<Item = &Slot> {
+        self.sections
+            .iter()
+            .filter(move |(i, _)| *i == sec)
+            .flat_map(|(_, v)| v.iter())
+    }
+
+    /// Notes that a section reported a change.
+    fn touch(&mut self, sec: i32) {
+        if let Some(t) = self.touched.as_mut() {
+            t.push(sec);
         }
     }
 
@@ -831,8 +889,8 @@ impl Inventory {
                 }
             }
         }
-        // The storage is marked changed by its sort even when it is empty.
-        if (set_any || sec == STORAGE)
+        // The storage and a window report their sort even when empty.
+        if (set_any || sec == STORAGE || sec >= 0)
             && let Some(t) = self.touched.as_mut()
         {
             t.push(sec);
