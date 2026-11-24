@@ -54,7 +54,7 @@ client                                  server
 | WorldMap | `ClearWorldMap`, `UpdateWorldMap` ×3 |
 | Game | `SetClientId`, `SetGameMode`, `SetMovementStates`, `UpdateMovementSettings`, `UpdatePlayerInventory` ×2, `SetActiveSlot` ×3, `EntityUpdates` ×5, `SetEntitySeed` ×4, time, weather, sun, post-processing, update rate, time dilation, features, known recipes, memories, HUD, builder tools, `ServerMessage`, `SpawnParticleSystem`, `NetworkTick`, `Ping` |
 
-The server pings about every 5 s; the probe answers with a `Pong` (4) copying
+The server pings once a second (spec 27); the probe answers with a `Pong` (4) copying
 the ping's id and time.
 
 ## Client features and tags

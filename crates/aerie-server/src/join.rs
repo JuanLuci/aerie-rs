@@ -55,7 +55,6 @@ const BUILT_READY_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long to wait for `ClientReady` before sending the world anyway.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-
 /// Built world: a square of empty columns around the spawn.
 /// The client waits on joining until the chunks around it arrive (about
 /// 30 s otherwise): it asks for a view radius of 224 blocks, 7 chunks.

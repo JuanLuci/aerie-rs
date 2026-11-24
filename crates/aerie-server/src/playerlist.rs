@@ -91,7 +91,10 @@ impl Latency {
         }
         let micros = elapsed / 1000;
         let w = &mut self.window[k];
-        while w.front().is_some_and(|(t, _)| now.duration_since(*t) > WINDOW) {
+        while w
+            .front()
+            .is_some_and(|(t, _)| now.duration_since(*t) > WINDOW)
+        {
             w.pop_front();
         }
         w.push_back((now, micros));

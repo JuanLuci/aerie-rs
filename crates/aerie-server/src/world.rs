@@ -1668,7 +1668,11 @@ impl Hub {
             let Some(change) = e.plate.take() else {
                 continue;
             };
-            let view = e.view.as_mut().into_iter().flat_map(|v| v.updates.iter_mut());
+            let view = e
+                .view
+                .as_mut()
+                .into_iter()
+                .flat_map(|v| v.updates.iter_mut());
             for parts in view {
                 parts.retain(|c| !matches!(c, proto::ComponentUpdate::NameplateUpdate(_)));
                 if let Change::Text(t) = &change {
@@ -4816,46 +4820,20 @@ impl Hub {
             .find_map(|a| a.strip_prefix("--entity="))
             .and_then(|u| u.parse::<uuid::Uuid>().ok());
         let text = args.iter().find(|a| !a.starts_with("--"));
-        let key = |k: &str, params: Vec<(String, proto::ParamValue)>| {
-            packet(
-                id::SERVER_MESSAGE,
-                &proto::ServerMessage {
-                    r#type: proto::ChatType::CHAT,
-                    message: Some(proto::FormattedMessage {
-                        message_id: Some(k.to_owned()),
-                        params: (!params.is_empty()).then_some(params),
-                        ..Default::default()
-                    }),
-                },
-            )
-        };
-        let text_param = |name: &str, v: String| {
-            (
-                name.to_owned(),
-                proto::ParamValue::StringParamValue(Box::new(proto::StringParamValue {
-                    value: Some(v),
-                })),
-            )
-        };
         let reply = match uuid {
-            Some(u) if self.set_nameplate(u, text.map(|t| t.trim_matches('"'))) => key(
-                if text.is_some() {
+            Some(u) if self.set_nameplate(u, text.map(|t| t.trim_matches('"'))) => {
+                Msg::key(if text.is_some() {
                     "server.commands.entity.nameplate.updated"
                 } else {
                     "server.commands.entity.nameplate.removed"
-                },
-                Vec::new(),
-            )?,
-            Some(u) => key(
-                "server.commands.errors.targetNotFound",
-                vec![text_param("uuid", u.to_string())],
-            )?,
-            None => key(
-                "server.commands.errors.no_entity_in_view",
-                vec![text_param("option", "entity".into())],
-            )?,
+                })
+            }
+            Some(u) => {
+                Msg::key("server.commands.errors.targetNotFound").text("uuid", &u.to_string())
+            }
+            None => Msg::key("server.commands.errors.no_entity_in_view").text("option", "entity"),
         };
-        self.send(id, reply);
+        self.tell_msg(id, reply);
         Ok(())
     }
 
