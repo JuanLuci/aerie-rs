@@ -55,8 +55,6 @@ pub mod id {
     pub const SEND_WINDOW_ACTION: u32 = 203;
     pub const CLIENT_OPEN_WINDOW: u32 = 204;
     pub const SET_PAGE: u32 = 216;
-    pub const ADD_TO_PLAYER_LIST: u32 = 224;
-    pub const REMOVE_FROM_PLAYER_LIST: u32 = 225;
 }
 
 /// Network ids of dropped items start here, far from players'.
@@ -79,6 +77,12 @@ pub fn packet<T: Wire>(id: u32, p: &T) -> Result<Packet> {
 struct Entry {
     name: String,
     uuid: uuid::Uuid,
+    /// Its connection's latency, its name plate, and where it is in the
+    /// player list's story (spec 27).
+    latency: crate::playerlist::Latency,
+    plate: crate::playerlist::Plate,
+    in_world: bool,
+    list_ready: bool,
     outbox: mpsc::UnboundedSender<Packet>,
     position: Option<proto::Position>,
     /// Id of the last `ClientTeleport` sent; the client acknowledges it in
@@ -359,6 +363,10 @@ pub struct How {
 
 #[derive(Default)]
 struct Inner {
+    /// The player list's schedule (spec 27).
+    playerlist: crate::playerlist::State,
+    /// Players whose name plate was removed this tick.
+    plate_removed: Vec<i32>,
     /// Particles of placements, sent after the tick's block changes and
     /// before its heights (as the official server's command buffer does).
     deferred_particles: Vec<Packet>,
@@ -1487,24 +1495,29 @@ impl Hub {
     /// outbox starts with the player list and the blocks changed so far.
     pub fn join(&self, name: &str, uuid: uuid::Uuid) -> (i32, mpsc::UnboundedReceiver<Packet>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let me = list_entry(name, uuid);
         let id = {
             let mut g = self.inner.lock().unwrap();
             g.next_id += 1;
             let id = g.next_id;
-            for e in g.players.values() {
-                if let Ok(p) = player_list_add(vec![me.clone()]) {
-                    let _ = e.outbox.send(p);
-                }
-            }
-            let everyone: Vec<_> = g
-                .players
-                .values()
-                .map(|e| list_entry(&e.name, e.uuid))
-                .chain([me])
-                .collect();
-            if let Ok(p) = player_list_add(everyone) {
+            // The player list as the connection sees it (spec 27): the
+            // joiner gets everyone, the others get the joiner.
+            let me = crate::playerlist::Info {
+                uuid,
+                name: name.to_owned(),
+                ping: 0,
+                in_world: false,
+            };
+            let mut all = Self::list_infos(&g);
+            all.push(me.clone());
+            g.playerlist.count(all.len());
+            let all = g.playerlist.listing_order(&all);
+            if let Some(p) = crate::playerlist::add(&all, crate::join::WORLD_UUID) {
                 let _ = tx.send(p);
+            }
+            if let Some(p) = crate::playerlist::add(&[me], crate::join::WORLD_UUID) {
+                for e in g.players.values() {
+                    let _ = e.outbox.send(p.clone());
+                }
             }
             let slots = self.saved_slots(uuid).unwrap_or([0, -1, -1]);
             g.players.insert(
@@ -1512,6 +1525,10 @@ impl Hub {
                 Entry {
                     name: name.to_owned(),
                     uuid,
+                    latency: Default::default(),
+                    plate: crate::playerlist::Plate::new(name),
+                    in_world: false,
+                    list_ready: false,
                     outbox: tx,
                     position: None,
                     teleport_id: 0,
@@ -1593,6 +1610,140 @@ impl Hub {
         self.save_states(&mut g);
     }
 
+    /// The players as the list shows them, in join order.
+    fn list_infos(g: &Inner) -> Vec<crate::playerlist::Info> {
+        g.players
+            .values()
+            .map(|e| crate::playerlist::Info {
+                uuid: e.uuid,
+                name: e.name.clone(),
+                ping: e.latency.list_ping(),
+                in_world: e.in_world,
+            })
+            .collect()
+    }
+
+    /// The client answered a ping (spec 27).
+    pub fn pong(&self, id: i32, payload: &[u8]) {
+        let Ok((p, _)) = proto::Pong::decode(payload, 0) else {
+            return;
+        };
+        if let Some(e) = self.inner.lock().unwrap().players.get_mut(&id) {
+            e.latency
+                .pong(p.r#type.0 as usize, p.id, std::time::Instant::now());
+        }
+    }
+
+    /// The client says it is ready for gameplay: the list is sent in full
+    /// again, and the others get its entry, at the next tick (spec 27).
+    pub fn player_ready(&self, id: i32) {
+        if let Some(e) = self.inner.lock().unwrap().players.get_mut(&id) {
+            e.list_ready = true;
+        }
+    }
+
+    /// Sets (or with `None` removes) the name plate of the player with this
+    /// uuid; false when no such player is here.
+    pub fn set_nameplate(&self, uuid: uuid::Uuid, text: Option<&str>) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        let Some(e) = g.players.values_mut().find(|e| e.uuid == uuid) else {
+            return false;
+        };
+        match text {
+            Some(t) => e.plate.set(t),
+            None => e.plate.remove(),
+        }
+        true
+    }
+
+    /// Players whose name plate changed tell everyone, once (spec 27).
+    fn nameplate_step(&self, g: &mut Inner) {
+        use crate::playerlist::Change;
+        let mut updates = Vec::new();
+        let mut removed = Vec::new();
+        for (pid, e) in g.players.iter_mut() {
+            if e.view.is_none() {
+                continue;
+            }
+            let Some(change) = e.plate.take() else {
+                continue;
+            };
+            let view = e
+                .view
+                .as_mut()
+                .into_iter()
+                .flat_map(|v| v.updates.iter_mut());
+            for parts in view {
+                parts.retain(|c| !matches!(c, proto::ComponentUpdate::NameplateUpdate(_)));
+                if let Change::Text(t) = &change {
+                    // New joiners get it right after the model.
+                    let at = parts
+                        .iter()
+                        .position(|c| matches!(c, proto::ComponentUpdate::ModelUpdate(_)))
+                        .map_or(0, |i| i + 1);
+                    parts.insert(at, crate::playerlist::plate_update(t));
+                }
+            }
+            match change {
+                Change::Text(t) => {
+                    updates.push((*pid, Audience::All, crate::playerlist::plate_update(&t)))
+                }
+                Change::Removed => removed.push(*pid),
+            }
+        }
+        g.stat_updates.extend(updates);
+        g.plate_removed.extend(removed);
+    }
+
+    /// The player list's part of a tick (spec 27): the full list for players
+    /// that became ready, the pings the clients are sent, and every tenth
+    /// second everyone's ping to everyone.
+    fn playerlist_step(&self, g: &mut Inner, dt: f32, out: &mut Outgoing) {
+        let now = std::time::Instant::now();
+        let ready: Vec<i32> = g
+            .players
+            .iter()
+            .filter(|(_, e)| e.list_ready)
+            .map(|(id, _)| *id)
+            .collect();
+        for pid in ready {
+            let all = Self::list_infos(g);
+            let all = g.playerlist.listing_order(&all);
+            let Some(e) = g.players.get_mut(&pid) else {
+                continue;
+            };
+            e.list_ready = false;
+            let uuid = e.uuid;
+            if let Some(p) = crate::playerlist::add(&all, crate::join::WORLD_UUID) {
+                out.to.push((pid, p));
+            }
+            if let Some(me) = all.iter().find(|i| i.uuid == uuid)
+                && let Some(p) =
+                    crate::playerlist::add(std::slice::from_ref(me), crate::join::WORLD_UUID)
+            {
+                for other in g.players.keys().filter(|k| **k != pid) {
+                    out.to.push((*other, p.clone()));
+                }
+            }
+        }
+        for (pid, e) in g.players.iter_mut() {
+            if e.in_world
+                && let Some(p) = e.latency.tick(dt, now)
+            {
+                out.to.push((*pid, p));
+            }
+        }
+        if g.playerlist.update_due(now) && !g.players.is_empty() {
+            let all = Self::list_infos(g);
+            let all = g.playerlist.listing_order(&all);
+            if let Some(p) = crate::playerlist::ping_update(&all) {
+                for pid in g.players.keys() {
+                    out.to.push((*pid, p.clone()));
+                }
+            }
+        }
+    }
+
     pub fn leave(&self, id: i32) {
         let gone = self.inner.lock().unwrap().players.remove(&id);
         if let Some(e) = gone {
@@ -1613,12 +1764,7 @@ impl Hub {
                     self.broadcast(&p);
                 }
             }
-            if let Ok(p) = packet(
-                id::REMOVE_FROM_PLAYER_LIST,
-                &proto::RemoveFromServerPlayerList {
-                    players: vec![e.uuid],
-                },
-            ) {
+            if let Some(p) = crate::playerlist::remove(e.uuid) {
                 self.broadcast(&p);
             }
             self.broadcast_msg(world_line("server.general.playerLeftWorld", &e.name));
@@ -4160,6 +4306,9 @@ impl Hub {
                 **s = shared.clone();
             }
         }
+        // The view already shows the name plate.
+        e.plate.take();
+        e.in_world = true;
         e.view = Some(view.clone());
         let mine = packet(
             id::ENTITY_UPDATES,
@@ -4663,6 +4812,31 @@ impl Hub {
         }
     }
 
+    /// `/entity nameplate [TEXT] --entity=UUID`: sets a player's name plate,
+    /// or without a text takes it away (spec 27).
+    fn entity_nameplate(&self, id: i32, args: &[&str]) -> Result<()> {
+        let uuid = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--entity="))
+            .and_then(|u| u.parse::<uuid::Uuid>().ok());
+        let text = args.iter().find(|a| !a.starts_with("--"));
+        let reply = match uuid {
+            Some(u) if self.set_nameplate(u, text.map(|t| t.trim_matches('"'))) => {
+                Msg::key(if text.is_some() {
+                    "server.commands.entity.nameplate.updated"
+                } else {
+                    "server.commands.entity.nameplate.removed"
+                })
+            }
+            Some(u) => {
+                Msg::key("server.commands.errors.targetNotFound").text("uuid", &u.to_string())
+            }
+            None => Msg::key("server.commands.errors.no_entity_in_view").text("option", "entity"),
+        };
+        self.tell_msg(id, reply);
+        Ok(())
+    }
+
     fn command(&self, id: i32, line: &str) -> Result<()> {
         let mut words = line.split_whitespace();
         let name = words.next().unwrap_or("");
@@ -4787,6 +4961,7 @@ impl Hub {
                 };
                 self.send(id, msg.msg("item", name).packet()?);
             }
+            ("entity", ["nameplate", rest @ ..]) => self.entity_nameplate(id, rest)?,
             ("give", [item, rest @ ..]) => {
                 let qty = rest.first().and_then(|q| q.parse().ok()).unwrap_or(100);
                 // Block keys are matched case-insensitively; anything else is
@@ -4965,24 +5140,6 @@ fn block_coords(here: Option<&proto::Position>, words: [&&str; 3]) -> Option<[i3
         out[i] = v.floor() as i32;
     }
     Some(out)
-}
-
-fn list_entry(name: &str, uuid: uuid::Uuid) -> proto::ServerPlayerListPlayer {
-    proto::ServerPlayerListPlayer {
-        uuid,
-        username: Some(name.to_owned()),
-        world_uuid: Some(crate::join::WORLD_UUID),
-        ping: 0,
-        spectating: false,
-        lives_remaining: None,
-    }
-}
-
-fn player_list_add(players: Vec<proto::ServerPlayerListPlayer>) -> Result<Packet> {
-    packet(
-        id::ADD_TO_PLAYER_LIST,
-        &proto::AddToServerPlayerList { players },
-    )
 }
 
 /// A plain chat line.
@@ -6369,9 +6526,11 @@ impl Hub {
             hub.flush(g, ground, out);
             hub.health_step(g, dt, out);
             hub.stats_step(g, dt);
+            hub.nameplate_step(g);
             hub.items_step(g, ground, dt, out);
             hub.crafting_step(g, ground, dt, out);
             hub.send_player_updates(g, out);
+            hub.playerlist_step(g, dt, out);
             g.in_tick = false;
             g.tick += 1;
             if g.tick % 150 == 0 {
@@ -6888,6 +7047,14 @@ impl Hub {
         use crate::items;
         let tick = g.tick;
         let mut updates: Vec<proto::EntityUpdate> = Vec::new();
+        // Name plates taken away this tick.
+        for pid in std::mem::take(&mut g.plate_removed) {
+            updates.push(proto::EntityUpdate {
+                network_id: pid,
+                removed: Some(vec![proto::ComponentUpdateType::NAMEPLATE]),
+                updates: None,
+            });
+        }
         let mut moved: Vec<i32> = Vec::new();
         // Physics.
         let ids: Vec<i32> = g.items.keys().copied().collect();
