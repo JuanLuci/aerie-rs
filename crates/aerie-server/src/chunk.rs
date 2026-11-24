@@ -245,6 +245,27 @@ mod tests {
         assert_eq!(s.blocks[index(4, 4, 9)], 0);
         assert!(flat(1, &layers).is_empty());
     }
+
+    #[test]
+    fn reads_the_short_palette() {
+        // Blocks: 300 values (i16 indices); fillers and rotations empty.
+        let mut d = vec![SHORT];
+        d.extend_from_slice(&300i16.to_le_bytes());
+        for i in 0..300u16 {
+            d.extend_from_slice(&i.to_le_bytes());
+            d.extend_from_slice(&(1000 + i as i32).to_le_bytes());
+            d.extend_from_slice(&1i16.to_le_bytes());
+        }
+        for n in 0..VOLUME {
+            d.extend_from_slice(&((n % 300) as u16).to_le_bytes());
+        }
+        d.extend_from_slice(&[EMPTY, EMPTY]);
+        let s = Section::decode(&d).unwrap();
+        assert_eq!(s.blocks[0], 1000);
+        assert_eq!(s.blocks[299], 1299);
+        assert_eq!(s.blocks[300], 1000);
+        assert!(s.fillers.iter().all(|&v| v == 0));
+    }
 }
 
 /// Checks the decoder on captured chunks: `AERIE_CHUNKS=<dir of *-131-*.bin>`
@@ -273,25 +294,4 @@ fn captured() {
     }
     assert!(n > 0);
     eprintln!("{n} captured sections decode and re-encode");
-
-    #[test]
-    fn reads_the_short_palette() {
-        // Blocks: 300 values (i16 indices); fillers and rotations empty.
-        let mut d = vec![SHORT];
-        d.extend_from_slice(&300i16.to_le_bytes());
-        for i in 0..300u16 {
-            d.extend_from_slice(&i.to_le_bytes());
-            d.extend_from_slice(&(1000 + i as i32).to_le_bytes());
-            d.extend_from_slice(&1i16.to_le_bytes());
-        }
-        for n in 0..VOLUME {
-            d.extend_from_slice(&((n % 300) as u16).to_le_bytes());
-        }
-        d.extend_from_slice(&[EMPTY, EMPTY]);
-        let s = Section::decode(&d).unwrap();
-        assert_eq!(s.blocks[0], 1000);
-        assert_eq!(s.blocks[299], 1299);
-        assert_eq!(s.blocks[300], 1000);
-        assert!(s.fillers.iter().all(|&v| v == 0));
-    }
 }

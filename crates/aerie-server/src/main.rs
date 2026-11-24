@@ -30,6 +30,7 @@ mod inventory;
 mod items;
 mod join;
 mod login;
+mod messages;
 mod perf;
 mod playerlist;
 mod probe;
