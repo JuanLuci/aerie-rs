@@ -102,7 +102,28 @@ and the entry's drops fall. In the game: a pickaxe on gravel drops its
 `Soil_Gravel_Pickaxe` list, shears give leaves, webs and the like back as
 themselves.
 
+## When the world forbids it
+
+The world's gameplay configuration has flags for breaking and for
+gathering (picking up by using). A break operation on a block of a world
+that forbids breaking fails its chain at once: no damage, no wear, no
+effects. The same for a pick-up when gathering is forbidden. The
+configuration can name a tag whose blocks may still be broken; Aerie does
+not know block tags yet, so it treats every block as not having it.
+
+An environment that forbids changing blocks stops damage from being
+applied (the block is resent) in any game mode, but no shipped environment
+forbids changes and Aerie's chunks share one environment, so it has no
+effect yet.
+
+In Aerie the flags come from the same server table as spec 15's
+(`W` lines); the chain host refuses before the hit runs.
+
 ## Not done yet
+
+The bypass tag of the world's breaking flag; the environment rule (above);
+the pick-up refusal was written from the reference but not compared, for
+lack of a recording.
 
 Wear from weapons and armour. A hit lands when its chain
 starts; the official server lands it when the chain reaches its break
@@ -159,6 +180,12 @@ the same hit and break sounds in the same order, and the tool wears the
 same (0.25 a swing for the box, 0.25 a block for the cylinder). The
 probe confirms the server's teleport as a client does: until then the
 official server ignores its look.
+
+With the world set to a configuration that forbids breaking (three recorded
+hatchet swings on a log, adventure): the same chain answers, no block change,
+no sounds and no wear on both servers. Compared without the rule, those
+swings differ on the first fork's last steps between the servers (the
+official one runs the "break failed" root); that is outside this rule.
 
 ## Picking a block up by using it
 

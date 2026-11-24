@@ -676,6 +676,18 @@ mod tests {
     }
 
     #[test]
+    fn world_rules() {
+        let t = Table::parse("W Default 1 1 1 -\nW Hub 0 0 0 Dungeon_Breakable\nW Part 1 0 1 -\n");
+        assert_eq!(
+            t.clone().for_gameplay("default").world,
+            WorldRules::default()
+        );
+        let hub = t.clone().for_gameplay("Hub").world;
+        assert!(!hub.breaking && !hub.gathering && !hub.placement);
+        assert!(!t.for_gameplay("Part").world.gathering);
+    }
+
+    #[test]
     fn wear_and_broken_tools() {
         let t = Table::parse(T);
         let h = "Tool_Hatchet_Crude";
