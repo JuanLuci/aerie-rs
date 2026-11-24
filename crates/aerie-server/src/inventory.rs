@@ -56,6 +56,16 @@ pub trait Items {
     fn window_remove(&self, _slot: i32) -> bool {
         false
     }
+    /// What an item sorts by: its kind (0 weapon, 1 armor, 2 tool, 3 plain,
+    /// 4 builder tool), then its name key.
+    fn sort_key(&self, item: &str) -> (u8, String) {
+        (3, format!("server.items.{item}.name"))
+    }
+    /// The open window's first slot "take all" empties: 0, but a
+    /// processing bench only gives its output slots.
+    fn output_start(&self) -> i32 {
+        0
+    }
 }
 
 /// An item's ability: a core, or a support with the keywords it needs of
@@ -154,6 +164,12 @@ impl Preferences {
 pub const EQUIP_OR_MERGE: i32 = 0;
 pub const PUT_IN_HOTBAR_OR_WINDOW: i32 = 1;
 pub const PUT_IN_HOTBAR_OR_BACKPACK: i32 = 2;
+
+/// `InventoryAction`'s kinds.
+pub const TAKE_ALL: i32 = 0;
+pub const PUT_ALL: i32 = 1;
+pub const QUICK_STACK: i32 = 2;
+pub const SORT: i32 = 3;
 
 /// One slot's content: an item, how many, and its durability (the
 /// official `ItemStack`: a new stack starts at the item's
@@ -666,6 +682,155 @@ impl Inventory {
         }
     }
 
+    /// `InventoryAction` as the official server (spec 14). `section` is
+    /// the packet's section id: the open window's id, or the backpack; sort
+    /// also takes 0 for the storage. Anything else does nothing.
+    pub fn action(
+        &mut self,
+        items: &impl Items,
+        prefs: &Preferences,
+        window: Option<i32>,
+        section: i32,
+        kind: i32,
+    ) {
+        let sec = match section {
+            BACKPACK => BACKPACK,
+            0 if kind == SORT => STORAGE,
+            s if s >= 0 && window == Some(s) => s,
+            _ => return,
+        };
+        match kind {
+            TAKE_ALL => {
+                let first = if sec >= 0 { items.output_start() } else { 0 };
+                for slot in first..self.capacity(sec) as i32 {
+                    let Some(st) = self.get(sec, slot) else {
+                        continue;
+                    };
+                    let order = prefs.order_for(items.kind(&st.item));
+                    self.move_into(items, (sec, slot), st.n, &order);
+                }
+            }
+            PUT_ALL => self.move_all(items, &[STORAGE], sec, false),
+            QUICK_STACK => self.move_all(items, &[HOTBAR, STORAGE], sec, true),
+            SORT => self.sort(items, sec),
+            _ => {}
+        }
+    }
+
+    /// Moves every stack of `from` sections, in order, into `to` (all of a
+    /// stack, what does not fit stays); with `only_stackable` only stacks
+    /// `to` already holds a stack of the same kind of.
+    fn move_all(&mut self, items: &impl Items, from: &[i32], to: i32, only_stackable: bool) {
+        for &sec in from {
+            for slot in 0..self.capacity(sec) as i32 {
+                let Some(st) = self.get(sec, slot) else {
+                    continue;
+                };
+                if only_stackable && !self.holds_stackable(to, &st) {
+                    continue;
+                }
+                self.move_into(items, (sec, slot), st.n, &[to]);
+            }
+        }
+    }
+
+    /// Whether the section holds a stack `st` stacks with.
+    fn holds_stackable(&self, sec: i32, st: &Stack) -> bool {
+        self.sections
+            .iter()
+            .find(|(i, _)| *i == sec)
+            .is_some_and(|(_, v)| v.iter().flatten().any(|x| st.stacks_with(x)))
+    }
+
+    /// Sorting a section as the official server does: stacks of the same
+    /// kind are first merged (in slot order, each up to its max), the
+    /// stacks sorted by kind then name key (ties keep their order, empty
+    /// last) and laid out from the first slot, skipping slots that cannot
+    /// give or take.
+    fn sort(&mut self, items: &impl Items, sec: i32) {
+        let cap = self.capacity(sec);
+        let removable: Vec<bool> = (0..cap as i32)
+            .map(|i| self.can_remove(items, sec, i))
+            .collect();
+        let mut stacks: Vec<Slot> = vec![None; cap];
+        let mut n = 0;
+        for i in 0..cap {
+            if !removable[i] {
+                continue;
+            }
+            let Some(mut st) = self.section(sec).and_then(|v| v[i].take()) else {
+                continue;
+            };
+            let max = items.max_stack(&st.item);
+            if max > 1 {
+                for g in stacks[..n].iter_mut().flatten() {
+                    if st.n > 0 && st.stacks_with(g) && g.n < max {
+                        let k = st.n.min(max - g.n);
+                        st.n -= k;
+                        g.n += k;
+                    }
+                }
+            }
+            if st.n > 0 {
+                stacks[n] = Some(st);
+                n += 1;
+            }
+        }
+        let mut keyed: Vec<(Option<(u8, String)>, Slot)> = stacks
+            .into_iter()
+            .map(|s| (s.as_ref().map(|s| items.sort_key(&s.item)), s))
+            .collect();
+        keyed.sort_by(|a, b| match (&a.0, &b.0) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, _) => std::cmp::Ordering::Greater,
+            (_, None) => std::cmp::Ordering::Less,
+            (Some(x), Some(y)) => {
+                x.0.cmp(&y.0)
+                    .then_with(|| x.1.encode_utf16().cmp(y.1.encode_utf16()))
+            }
+        });
+        let stacks: Vec<Slot> = keyed.into_iter().map(|k| k.1).collect();
+        let mut off = 0;
+        let mut set_any = false;
+        for i in 0..cap {
+            if !removable[i] {
+                continue;
+            }
+            let repl = stacks[off].clone();
+            if repl
+                .as_ref()
+                .is_some_and(|r| !self.can_add(items, sec, i as i32, r))
+            {
+                continue;
+            }
+            off += 1;
+            if repl.is_some() {
+                set_any = true;
+                if let Some(v) = self.section(sec) {
+                    v[i] = repl;
+                }
+            }
+        }
+        for i in 0..cap {
+            if off >= cap {
+                break;
+            }
+            let Some(left) = stacks[off].clone() else {
+                break;
+            };
+            if removable[i] && self.get(sec, i as i32).is_none() {
+                off += 1;
+                set_any = true;
+                if let Some(v) = self.section(sec) {
+                    v[i] = Some(left);
+                }
+            }
+        }
+        if set_any && let Some(t) = self.touched.as_mut() {
+            t.push(sec);
+        }
+    }
+
     /// Every stack, section by section.
     pub fn all(&self) -> Vec<(String, i32)> {
         self.sections
@@ -774,6 +939,20 @@ mod tests {
         }
     }
 
+    /// Like `T`, with an open chest-like window: every slot takes and gives.
+    struct W;
+    impl Items for W {
+        fn max_stack(&self, item: &str) -> i32 {
+            T.max_stack(item)
+        }
+        fn window_add(&self, _slot: i32, _item: &str) -> bool {
+            true
+        }
+        fn window_remove(&self, _slot: i32) -> bool {
+            true
+        }
+    }
+
     fn s(item: &str, n: i32) -> Slot {
         Some(Stack::new(item, n, 0.0))
     }
@@ -848,6 +1027,53 @@ mod tests {
         inv.set(HOTBAR, 1, s("Helmet", 1));
         inv.smart_move(&T, &p, None, (HOTBAR, 1), 1, PUT_IN_HOTBAR_OR_WINDOW);
         assert_eq!(inv.get(ARMOR, 0), s("Helmet", 1));
+    }
+
+    #[test]
+    fn actions_take_put_stack_and_sort() {
+        let p = Preferences::default();
+        let mut inv = Inventory::default();
+        // A window of 4 slots as section 7.
+        inv.attach(7, vec![None; 4]);
+        inv.set(HOTBAR, 0, s("Wood", 5));
+        inv.set(STORAGE, 3, s("Wood", 7));
+        inv.set(STORAGE, 4, s("Stone", 2));
+        // Quick stack: only what the window holds a kind of.
+        inv.set(7, 2, s("Wood", 1));
+        inv.action(&W, &p, Some(7), 7, QUICK_STACK);
+        assert_eq!(inv.get(7, 2), s("Wood", 13));
+        assert_eq!(inv.get(7, 0), None);
+        assert_eq!(inv.get(STORAGE, 4), s("Stone", 2));
+        // Put all: the storage only, into the first free slots.
+        inv.set(HOTBAR, 1, s("Axe", 1));
+        inv.action(&W, &p, Some(7), 7, PUT_ALL);
+        assert_eq!(inv.get(7, 0), s("Stone", 2));
+        assert_eq!(inv.get(HOTBAR, 1), s("Axe", 1));
+        // Take all: back to the hotbar first.
+        inv.action(&W, &p, Some(7), 7, TAKE_ALL);
+        assert_eq!(inv.get(HOTBAR, 0), s("Stone", 2));
+        assert_eq!(inv.get(HOTBAR, 2), s("Wood", 13));
+        assert_eq!(inv.get(7, 2), None);
+        // A window that is not the open one does nothing.
+        inv.set(7, 1, s("Wood", 1));
+        inv.action(&W, &p, Some(7), 8, TAKE_ALL);
+        assert_eq!(inv.get(7, 1), s("Wood", 1));
+    }
+
+    #[test]
+    fn sort_merges_then_orders() {
+        let mut inv = Inventory::default();
+        inv.set(STORAGE, 0, s("Wood", 60));
+        inv.set(STORAGE, 5, s("Axe", 1));
+        inv.set(STORAGE, 9, s("Wood", 60));
+        inv.set(STORAGE, 11, s("Stone", 3));
+        inv.action(&T, &Preferences::default(), None, 0, SORT);
+        // Same kind: by name key (A < S < W); the wood merged to 100 + 20.
+        assert_eq!(inv.get(STORAGE, 0), s("Axe", 1));
+        assert_eq!(inv.get(STORAGE, 1), s("Stone", 3));
+        assert_eq!(inv.get(STORAGE, 2), s("Wood", 100));
+        assert_eq!(inv.get(STORAGE, 3), s("Wood", 20));
+        assert_eq!(inv.get(STORAGE, 4), None);
     }
 
     #[test]

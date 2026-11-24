@@ -82,12 +82,50 @@ Every section a successful move set is sent at the end of the tick, even
 when its content did not change (a slot moved onto itself, a stack that
 went back where it was).
 
+## Inventory actions (`InventoryAction`)
+
+One packet: a section id, an action (take all, put all, quick stack,
+sort) and a data byte the official server ignores. Only section ids of 0
+or more (an open window's id; 0 is the storage, and only for sort) or the
+backpack are looked at; the others do nothing. A window action does
+nothing unless that window is open and holds items (a container, a
+processing bench or a structural bench).
+
+- **Take all**: every stack of the section, slot by slot from the first,
+  goes to the pickup sections of its kind (hotbar, storage, backpack in the
+  order the player's preferences give), as a move of the whole quantity:
+  onto stacks it stacks with first, then empty slots; what does not fit
+  stays where it was. A processing bench only gives its output slots (not
+  fuel or input); other windows give every slot that may give.
+- **Put all**: every stack of the storage (not the hotbar), slot by slot,
+  goes into the section, with the section's filters; what does not fit
+  stays.
+- **Quick stack**: every stack of the hotbar, then of the storage, slot by
+  slot, goes into the section, but only a stack of a kind the section
+  already holds (the check is made slot by slot, as the section fills);
+  it goes onto stacks it stacks with first, then into empty slots of the
+  section.
+- **Sort** (storage, backpack or an open window's section): stacks of the
+  same kind are first merged, in slot order, each up to its max stack
+  (items with a max of 1 never merge); the stacks are then ordered by
+  kind (weapon, armor, tool, plain item, builder tool), then by the item's
+  name key compared as text (character code units); stacks tied keep
+  their order. They are laid out from the first slot; slots that cannot
+  give their stack, or cannot take the next one, are skipped. Any
+  non-empty section is sent afterwards, even when the order did not
+  change.
+
+The answers are the ones of a move: the changed sections of
+`UpdatePlayerInventory` at the end of the tick, then the window's update.
+
 ## Not done yet
 
 Moving onto or off the active hotbar slot with a different item runs the
 swap interaction first (the move is the same); core abilities leaving
-their slot take their line's supports along; `InventoryAction` (sort, take
-all, put all, quick stack).
+their slot take their line's supports along; sort needs each item's kind
+(weapon, armor, tool, builder tool) in Aerie's item table, and the packet
+needs to reach the handler (both outside the first change); no comparison
+with the official server yet.
 
 ## Checked against the official server
 
