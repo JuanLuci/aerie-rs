@@ -7,6 +7,7 @@
 //! types a short code.
 
 pub mod account;
+pub mod game;
 pub mod jwt;
 pub mod oauth;
 
@@ -43,6 +44,8 @@ pub enum Error {
     BadToken(String),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("the game package is not the one announced: {0}")]
+    BadPackage(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
