@@ -26,6 +26,7 @@ mod crafting;
 mod effects;
 mod falling;
 mod fetch;
+mod gamemode;
 mod gather;
 mod inventory;
 mod items;
@@ -166,6 +167,7 @@ async fn main() -> Result<()> {
             join::WORLD_GAMEPLAY,
             join::TIME_SETTINGS,
             join::MOVEMENT_SETTINGS,
+            gamemode::MOVEMENT_ADVENTURE,
         ] {
             let key = format!("{base}:{name}");
             if let Some(b) = extras
@@ -418,6 +420,18 @@ async fn main() -> Result<()> {
                         .unwrap_or_default(),
                 ))
                 .with_creative(conf.creative)
+                .with_gamemodes({
+                    let get = |n: &str| extras.iter().find(|(k, _)| k == n).map(|(_, b)| b.clone());
+                    gamemode::Types::parse(
+                        &get(gamemode::TABLE)
+                            .map(|b| String::from_utf8_lossy(&b).into_owned())
+                            .unwrap_or_default(),
+                    )
+                    .with_movement(
+                        get(join::MOVEMENT_SETTINGS),
+                        get(gamemode::MOVEMENT_ADVENTURE),
+                    )
+                })
                 .with_book(book)
                 .with_chains(chain_book)
                 .with_effects(effect_book)
@@ -670,6 +684,11 @@ fn build_registries(assets: Option<String>, capture: Option<&[(u32, Vec<u8>)]>) 
         Ok(t) => extras.push((crate::stats::TABLE.to_string(), t.into_bytes())),
         Err(e) => warn!("stats table not built: {e}"),
     }
+    // Game mode types.
+    match registries::game_modes::table(&ctx) {
+        Ok(t) => extras.push((gamemode::TABLE.to_string(), t.into_bytes())),
+        Err(e) => warn!("game mode table not built: {e}"),
+    }
     // Crafting benches.
     match registries::benches::table(&ctx) {
         Ok(t) => extras.push((crate::crafting::BENCHES.to_string(), t.into_bytes())),
@@ -698,6 +717,16 @@ fn build_registries(assets: Option<String>, capture: Option<&[(u32, Vec<u8>)]>) 
                 let mut b = Vec::new();
                 aerie_protocol::wire::Wire::encode(&registries::world_config::time(&g), &mut b)?;
                 extras.push((format!("{}{suffix}", join::TIME_SETTINGS), b));
+                if let Ok(Some(m)) = registries::world_config::movement(&ctx, &g, false) {
+                    let mut b = Vec::new();
+                    aerie_protocol::wire::Wire::encode(
+                        &aerie_protocol::proto::UpdateMovementSettings {
+                            movement_settings: m,
+                        },
+                        &mut b,
+                    )?;
+                    extras.push((format!("{}{suffix}", gamemode::MOVEMENT_ADVENTURE), b));
+                }
                 match registries::world_config::movement(&ctx, &g, true) {
                     Ok(Some(m)) => {
                         let mut b = Vec::new();

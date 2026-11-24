@@ -842,6 +842,14 @@ impl Book {
         self.roots.get(usize::try_from(i).ok()?)?.as_ref()
     }
 
+    /// The root interaction with this name (inline ones are `*Owner_Field`).
+    pub fn root_named(&self, name: &str) -> Option<i32> {
+        self.roots
+            .iter()
+            .position(|r| r.as_ref().is_some_and(|r| r.id == name))
+            .and_then(|i| i32::try_from(i).ok())
+    }
+
     /// The plain layout: the operation, its next branch, a jump over the
     /// failed branch when there is one, the failed branch.
     fn plain(&self, i: i32, next: i32, failed: i32, b: &mut Builder, depth: u32) {
@@ -1591,6 +1599,20 @@ impl Manager {
     ) {
         let mut chain = Chain::new(ty, ctx, data, root);
         chain.requires_client = book.root(root).is_some_and(|r| r.needs_remote);
+        self.starting.push(chain);
+    }
+
+    /// A server chain the client has to confirm too (the game mode swap
+    /// chain): it is sent to the client and waits for its states.
+    pub fn start_server_synced(
+        &mut self,
+        ty: IT,
+        ctx: Ctx,
+        root: i32,
+        data: p::InteractionChainData,
+    ) {
+        let mut chain = Chain::new(ty, ctx, data, root);
+        chain.requires_client = true;
         self.starting.push(chain);
     }
 
