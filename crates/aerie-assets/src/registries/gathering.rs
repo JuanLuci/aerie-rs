@@ -21,7 +21,8 @@
 //! `I item weapon builder tool hitSound incorrectSound maxDurability
 //! lossOnHit`, `L item loss sets types` (comma lists),
 //! `U gather power quality hitSound`, `E kind particle sound`,
-//! `X tool penalty`; a block's `Gathering.Tools` as `G block tool state
+//! `X tool penalty`, `W config breaking gathering placement bypassTag` (what
+//! a gameplay configuration lets players do to the world); a block's `Gathering.Tools` as `G block tool state
 //! item list`; and the break tools an item's interactions reach (spec 12:
 //! the `BreakBlock` interactions under each interaction type, with the
 //! item's `InteractionVars` in place of the defaults they replace) as
@@ -290,6 +291,19 @@ pub fn table(ctx: &Ctx) -> Result<String> {
             a.f32_or("Power", 0.0),
             a.i32_or("Quality", 0),
             sound(ctx, a.str_at("HitSoundLayer"))?,
+        );
+    }
+    // What each gameplay configuration lets players do to the world (specs
+    // 12 and 15): `W name breaking gathering placement bypassTag`.
+    for name in super::world_config::names(ctx).unwrap_or_default() {
+        let g = super::world_config::config_named(ctx, &name)?;
+        let w = g.get("World").unwrap_or(&Value::Null);
+        out += &format!(
+            "W {name} {} {} {} {}\n",
+            u8::from(w.bool_or("AllowBlockBreaking", true)),
+            u8::from(w.bool_or("AllowBlockGathering", true)),
+            u8::from(w.bool_or("AllowBlockPlacement", true)),
+            or_dash(w.str_at("BlockBreakingBypassTag")),
         );
     }
     if let Ok(gameplay) = ctx.store(GAMEPLAY) {

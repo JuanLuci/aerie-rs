@@ -4629,6 +4629,13 @@ impl Hub {
                 hub.tell_key(pid, "server.modules.interaction.failedCheckUnknown", out);
                 return;
             }
+            // The world's gameplay configuration may forbid placing (spec
+            // 15): the item goes back and the block is resent, without a
+            // message.
+            if !hub.gather.world.placement {
+                fail(g, out);
+                return;
+            }
             let cells = hub.rules.cells(block, p.rot);
             // Every cell free: air, a soft (non-solid) block, or an unknown
             // filler.
@@ -5794,6 +5801,16 @@ impl crate::chains::Host for ChainHost<'_> {
         tool: Option<&str>,
         match_tool: bool,
     ) -> bool {
+        // The world's gameplay configuration may forbid gathering and
+        // breaking (spec 12): the chain fails.
+        let world = &self.hub.gather.world;
+        if !(if harvest {
+            world.gathering
+        } else {
+            world.breaking
+        }) {
+            return false;
+        }
         if harvest {
             return self
                 .hub

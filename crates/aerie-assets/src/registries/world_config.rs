@@ -41,6 +41,26 @@ pub fn config(ctx: &Ctx) -> Result<Value> {
     })
 }
 
+/// The names of every gameplay configuration asset, sorted.
+pub fn names(ctx: &Ctx) -> Result<Vec<String>> {
+    let store = ctx.store(PATH)?;
+    let mut keys: Vec<String> = store.own.keys().cloned().collect();
+    keys.sort();
+    Ok(keys)
+}
+
+/// One gameplay configuration by name (a world can be set to any of them),
+/// resolved; `Null` when there is none of that name.
+pub fn config_named(ctx: &Ctx, name: &str) -> Result<Value> {
+    let store = ctx.store(PATH)?;
+    Ok(
+        match store.own.keys().find(|k| k.eq_ignore_ascii_case(name)) {
+            Some(k) => store.resolved(k, "GameplayConfig"),
+            None => Value::Null,
+        },
+    )
+}
+
 fn section<'a>(g: &'a Value, name: &str) -> &'a Value {
     g.get(name).unwrap_or(&Value::Null)
 }

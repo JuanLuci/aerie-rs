@@ -227,6 +227,28 @@ pub struct Table {
     pub broken_tool_penalty: f64,
     /// The gameplay config's broken armor penalty.
     pub broken_armor_penalty: f64,
+    /// What every gameplay configuration lets players do to the world, and
+    /// the one this world uses.
+    worlds: HashMap<String, WorldRules>,
+    pub world: WorldRules,
+}
+
+/// A gameplay configuration's building rules (spec 12, 15).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorldRules {
+    pub breaking: bool,
+    pub gathering: bool,
+    pub placement: bool,
+}
+
+impl Default for WorldRules {
+    fn default() -> Self {
+        Self {
+            breaking: true,
+            gathering: true,
+            placement: true,
+        }
+    }
 }
 
 /// What one hit does (spec 12).
@@ -380,6 +402,16 @@ impl Table {
                         },
                     );
                 }
+                ["W", name, breaking, gathering, placement, _] => {
+                    t.worlds.insert(
+                        name.to_ascii_lowercase(),
+                        WorldRules {
+                            breaking: breaking == "1",
+                            gathering: gathering == "1",
+                            placement: placement == "1",
+                        },
+                    );
+                }
                 ["X", "tool", v] => t.broken_tool_penalty = v.parse().unwrap_or(0.0),
                 ["X", "armor", v] => t.broken_armor_penalty = v.parse().unwrap_or(0.0),
                 ["E", kind, particle, sound] => {
@@ -397,6 +429,17 @@ impl Table {
             }
         }
         t
+    }
+
+    /// The table for a world that uses the named gameplay configuration
+    /// (all allowed when there is none of that name).
+    pub fn for_gameplay(mut self, name: &str) -> Self {
+        self.world = self
+            .worlds
+            .get(&name.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_default();
+        self
     }
 
     /// The break tool a held item's interactions of a type run (none, and
