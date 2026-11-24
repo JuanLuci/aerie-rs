@@ -122,16 +122,25 @@ The answers are the ones of a move: the changed sections of
 
 Moving onto or off the active hotbar slot with a different item runs the
 swap interaction first (the move is the same); core abilities leaving
-their slot take their line's supports along; sort needs each item's kind
-(weapon, armor, tool, builder tool) in Aerie's item table, and the packet
-needs to reach the handler (both outside the first change); no comparison
-with the official server yet.
+their slot take their line's supports along; the three window actions
+(take all, put all, quick stack) are not compared with the official
+server (see below).
 
 ## Checked against the official server
 
 The same moves sent to both servers (stacks split into storage, moved onto
 themselves, double clicks, shift clicks both ways, a move to the backpack)
 give the same inventories and the same inventory packets.
+
+Inventory actions without a window, on both servers with the same items
+and the same packets: sorting the storage (merging, kinds, name order,
+an empty storage, a storage whose order does not change: the packet is
+sent each time), and the backpack, and the ignored cases (a window that is
+not open, the hotbar or storage as the section of a take, put or stack,
+other action types) give the same
+inventory packets. Opening a container with the probe did not work on
+the official server (its use chain failed), so take all, put all, quick
+stack and a window sort were checked by unit tests only.
 
 ## Kept between sessions
 
