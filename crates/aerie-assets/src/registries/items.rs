@@ -491,12 +491,11 @@ fn item_entity(v: Option<&Value>, block: bool) -> p::ItemEntityConfig {
     }
 }
 
-/// An item's entity config after loading: its quality's when it names one,
-/// else its own `ItemEntity`, else its parent's, else the default.
-fn item_entity_of(ctx: &Ctx, store: &Store, k: &str, depth: usize) -> Result<p::ItemEntityConfig> {
+/// An item's entity config as written: its quality's when it names one,
+/// else its own `ItemEntity`, else its parent's; `None` when there is none.
+fn entity_config_of(ctx: &Ctx, store: &Store, k: &str, depth: usize) -> Result<Option<Value>> {
     let own = &store.own[k];
-    let block = block_owner(store, k).is_some();
-    let cfg = if let Some(q) = own.str_at("Quality") {
+    Ok(if let Some(q) = own.str_at("Quality") {
         let i = ctx.index_or(item_qualities::PATH, item_qualities::BUILTIN, Some(&q), 0)?;
         let qs = ctx.store(item_qualities::PATH)?;
         let order = ctx.order(item_qualities::PATH, item_qualities::BUILTIN)?;
@@ -508,16 +507,52 @@ fn item_entity_of(ctx: &Ctx, store: &Store, k: &str, depth: usize) -> Result<p::
                     .get("ItemEntityConfig")
                     .cloned()
             })
-            .map(|v| item_entity(Some(&v), block))
     } else if let Some(e) = own.get("ItemEntity") {
-        Some(item_entity(Some(e), block))
+        Some(e.clone())
     } else {
         match store.parents.get(k).filter(|p| store.own.contains_key(*p)) {
-            Some(p) if depth < 32 => Some(item_entity_of(ctx, store, p, depth + 1)?),
+            Some(p) if depth < 32 => entity_config_of(ctx, store, p, depth + 1)?,
             _ => None,
         }
-    };
-    Ok(cfg.unwrap_or_else(|| item_entity(None, block)))
+    })
+}
+
+/// An item's entity config after loading: the written one, else the
+/// default.
+fn item_entity_of(ctx: &Ctx, store: &Store, k: &str, _depth: usize) -> Result<p::ItemEntityConfig> {
+    let block = block_owner(store, k).is_some();
+    let cfg = entity_config_of(ctx, store, k, 0)?;
+    Ok(item_entity(cfg.as_ref(), block))
+}
+
+/// How long dropped items lie before they disappear, for the server: the
+/// line `LIFE * seconds` is the gameplay configuration's `ItemEntity`
+/// lifetime (absent when it has none: the server then uses 120), and
+/// `LIFE item seconds` an item whose own entity config sets a `Lifetime`.
+pub fn life_table(ctx: &Ctx) -> Result<String> {
+    let mut out = String::new();
+    let g = super::world_config::config(ctx)?;
+    if let Some(t) = g
+        .get("ItemEntity")
+        .and_then(|e| e.get("Lifetime"))
+        .and_then(Value::as_f64)
+    {
+        out.push_str(&format!("LIFE * {t}\n"));
+    }
+    let store = ctx.store(PATH)?;
+    let mut keys: Vec<&String> = store.own.keys().collect();
+    keys.sort();
+    for k in keys {
+        let cfg = entity_config_of(ctx, &store, k, 0)?;
+        if let Some(t) = cfg
+            .as_ref()
+            .and_then(|e| e.get("Lifetime"))
+            .and_then(Value::as_f64)
+        {
+            out.push_str(&format!("LIFE {k} {t}\n"));
+        }
+    }
+    Ok(out)
 }
 
 /// The nearest item in the chain that writes a `BlockType`.

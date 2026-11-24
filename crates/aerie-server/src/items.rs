@@ -20,6 +20,54 @@ const DRAG: f64 = 0.5;
 const AIR_DENSITY: f64 = 0.001225;
 const EPS: f64 = 1.0e-5;
 
+/// Name of the lifetime table among the start-up extras.
+pub const LIFE_TABLE: &str = "life";
+/// Seconds a dropped item lies before it disappears when nothing says
+/// otherwise.
+pub const DEFAULT_LIFE: f32 = 120.0;
+
+/// How long dropped items last: the gameplay configuration's value and the
+/// items whose own entity config sets one (the `LIFE` lines of the
+/// aerie-assets table).
+#[derive(Clone, Debug)]
+pub struct Lifetimes {
+    default: f32,
+    items: std::collections::HashMap<String, f32>,
+}
+
+impl Default for Lifetimes {
+    fn default() -> Self {
+        Self {
+            default: DEFAULT_LIFE,
+            items: Default::default(),
+        }
+    }
+}
+
+impl Lifetimes {
+    /// Reads `LIFE * seconds` and `LIFE item seconds` lines.
+    pub fn parse(text: &str) -> Self {
+        let mut l = Self::default();
+        for line in text.lines() {
+            if let ["LIFE", key, secs] = line.split_whitespace().collect::<Vec<_>>()[..]
+                && let Ok(secs) = secs.parse::<f32>()
+            {
+                if key == "*" {
+                    l.default = secs;
+                } else {
+                    l.items.insert(key.to_owned(), secs);
+                }
+            }
+        }
+        l
+    }
+
+    /// Seconds an item of this kind lies on the ground.
+    pub fn of(&self, item: &str) -> f32 {
+        self.items.get(item).copied().unwrap_or(self.default)
+    }
+}
+
 /// Solid blocks as item physics sees them.
 pub trait Blocks {
     /// The block's hitbox boxes (block-local, rotated) if it is solid.
@@ -410,6 +458,14 @@ mod tests {
     }
 
     /// The official trunk drop of spec 11: positions tick by tick.
+    #[test]
+    fn lifetimes_fall_back_to_the_config_then_to_120() {
+        assert_eq!(Lifetimes::default().of("A"), 120.0);
+        let l = Lifetimes::parse("LIFE * 600\nLIFE Short 5\nLIFE bad x\n");
+        assert_eq!(l.of("A"), 600.0);
+        assert_eq!(l.of("Short"), 5.0);
+    }
+
     #[test]
     fn rises_and_falls_like_the_capture() {
         let w = Ground(129);

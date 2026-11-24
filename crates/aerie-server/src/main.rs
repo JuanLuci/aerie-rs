@@ -271,6 +271,15 @@ async fn main() -> Result<()> {
         .find(|(n, _)| n == "consume")
         .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
         .unwrap_or_default();
+    let lifetimes = extras
+        .iter()
+        .find(|(n, _)| n == items::LIFE_TABLE)
+        .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+        .unwrap_or_default();
+    info!(
+        "item lifetimes: {}",
+        lifetimes.lines().collect::<Vec<_>>().join("; ")
+    );
     info!("{} items used up by interactions", consume.lines().count());
     let physics = extras
         .iter()
@@ -363,6 +372,7 @@ async fn main() -> Result<()> {
                 .with_chains(chain_book)
                 .with_effects(effect_book)
                 .with_consume(&consume)
+                .with_lifetimes(&lifetimes)
                 .with_rules(rules)
                 .with_eye_height(eye_height);
             // Changed blocks are kept on disk (`--world DIR`, default `aerie-world`).
@@ -578,6 +588,11 @@ fn build_registries(assets: Option<String>, capture: Option<&[(u32, Vec<u8>)]>) 
     match registries::consume::table(&ctx) {
         Ok(t) => extras.push(("consume".to_string(), t.into_bytes())),
         Err(e) => warn!("consume table not built: {e}"),
+    }
+    // How long dropped items last.
+    match registries::items::life_table(&ctx) {
+        Ok(t) => extras.push((items::LIFE_TABLE.to_string(), t.into_bytes())),
+        Err(e) => warn!("item lifetime table not built: {e}"),
     }
     // Block support: drop types, physics drops, drop lists.
     match registries::physics::table(&ctx) {

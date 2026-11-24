@@ -8,7 +8,7 @@ official server and from Aerie and compare.
 """
 import subprocess,os,re,sys
 import pathlib
-D=str(pathlib.Path(__file__).resolve().parents[2]/'target'/'release'/'examples'/'dump')
+D=os.environ.get('DUMP') or str(pathlib.Path(__file__).resolve().parents[2]/'target'/'release'/'examples'/'dump')
 d=sys.argv[1]; item=sys.argv[2] if len(sys.argv)>2 else 'Wood_Oak_Trunk'
 rows=[l.split('\t') for l in open(os.path.join(d,'index.tsv'))]
 files={int(f.split('-')[0]):f for f in os.listdir(d) if f.endswith('.bin')}
