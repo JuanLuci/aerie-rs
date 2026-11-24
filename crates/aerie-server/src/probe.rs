@@ -1,7 +1,12 @@
 //! Probe: joins a server in insecure mode as a minimal client, goes through
-//! setup, finishes it, then listens for a while. Every packet the server
-//! sends, on the game stream and on the streams it opens, is saved. Used to
-//! study a server; it never plays.
+//! setup, finishes it, then acts (a script, or the older one-shot options)
+//! and listens. Every packet the server sends, on the game stream and on the
+//! streams it opens, is saved, and what the packets say about the player is
+//! kept up to date (`state`) and written as `state.json` at the end. Used
+//! to compare servers; `docs/probe.md` is its manual.
+
+mod script;
+mod state;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
@@ -90,6 +95,10 @@ pub fn sprint_steps(steps: usize, after: Option<String>) -> Result<String> {
 /// What the probe does besides listening.
 #[derive(Default)]
 pub struct Options {
+    /// A script to run once in the world (`docs/probe.md`).
+    pub script: Option<PathBuf>,
+    /// Script steps given inline, separated by `;` or new lines.
+    pub steps: Option<String>,
     pub name: Option<String>,
     /// The player's id, to come back as the same player (random
     /// otherwise).
@@ -113,12 +122,16 @@ pub struct Options {
     /// Root interaction ids to translate in replayed chains (`from to` per
     /// line): two servers can number root interactions differently.
     pub root_map: Option<PathBuf>,
-    /// Seconds to keep listening once in the world (20 by default).
+    /// Seconds to keep listening once in the world (20 by default), or
+    /// after the script ends (3 by default).
     pub listen: Option<u64>,
 }
 
 /// Translates a chain's root interaction ids (and its forks').
-fn remap_roots(c: &mut proto::SyncInteractionChain, map: &std::collections::HashMap<i32, i32>) {
+pub(crate) fn remap_roots(
+    c: &mut proto::SyncInteractionChain,
+    map: &std::collections::HashMap<i32, i32>,
+) {
     let f = |v: &mut i32| {
         if let Some(n) = map.get(v) {
             *v = *n;
@@ -134,10 +147,9 @@ fn remap_roots(c: &mut proto::SyncInteractionChain, map: &std::collections::Hash
     }
 }
 
-/// The interaction chains of a `--record` folder, in order.
 /// The interaction chains of a recording, in order, with the time each
 /// was received (milliseconds; when the recording has it).
-fn recorded_chains(
+pub(crate) fn recorded_chains(
     dir: &std::path::Path,
 ) -> Result<Vec<(Option<u64>, proto::SyncInteractionChains)>> {
     let mut times: std::collections::HashMap<u32, u64> = Default::default();
@@ -174,7 +186,7 @@ fn recorded_chains(
 }
 
 /// Moves every block position of a chain (and its forks) by `d`.
-fn shift(c: &mut proto::SyncInteractionChain, d: (i32, i32, i32)) {
+pub(crate) fn shift(c: &mut proto::SyncInteractionChain, d: (i32, i32, i32)) {
     let mv = |p: &mut proto::BlockPosition| {
         p.x += d.0;
         p.y += d.1;
@@ -194,7 +206,29 @@ fn shift(c: &mut proto::SyncInteractionChain, d: (i32, i32, i32)) {
 }
 
 pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Result<()> {
+    // The script is read first, so a mistake in it costs no connection.
+    let mut text = match &opts.script {
+        Some(p) => {
+            std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?
+        }
+        None => String::new(),
+    };
+    if let Some(s) = &opts.steps {
+        text += "\n";
+        text += &s.replace(';', "\n");
+    }
+    let mut lines = (opts.script.is_some() || opts.steps.is_some())
+        .then(|| script::parse(&text))
+        .transpose()?;
+    let scripted = lines.is_some();
     tokio::fs::create_dir_all(&capture).await?;
+    let st = Arc::new(std::sync::Mutex::new(state::State::new()));
+    // When to stop listening: set at the end of setup, or when the script
+    // is done.
+    let deadline = Arc::new(std::sync::Mutex::new(None::<tokio::time::Instant>));
+    let outcome = Arc::new(std::sync::Mutex::new(
+        None::<Result<Vec<serde_json::Value>>>,
+    ));
     let rec = Arc::new(Mutex::new(Recorder {
         dir: capture.clone(),
         seq: 0,
@@ -220,12 +254,12 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
 
     // Streams the server opens (Chunks, WorldMap) are recorded as they come.
     {
-        let (conn, rec) = (conn.clone(), rec.clone());
+        let (conn, rec, st) = (conn.clone(), rec.clone(), st.clone());
         tokio::spawn(async move {
             let mut n = 0;
             while let Ok(mut s) = conn.accept_uni().await {
                 n += 1;
-                let (rec, tag) = (rec.clone(), format!("uni{n}"));
+                let (rec, tag, st) = (rec.clone(), format!("uni{n}"), st.clone());
                 tokio::spawn(async move {
                     let mut dec = FrameDecoder::new(false);
                     let mut buf = vec![0u8; 256 * 1024];
@@ -234,6 +268,7 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
                         loop {
                             match dec.next() {
                                 Ok(Some(f)) => {
+                                    st.lock().unwrap().observe(&f);
                                     let _ = Recorder::save(&rec, &tag, &f).await;
                                 }
                                 Ok(None) => break,
@@ -261,7 +296,7 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
 
     let mut dec = FrameDecoder::new(false);
     let mut buf = vec![0u8; 256 * 1024];
-    let mut join_deadline: Option<tokio::time::Instant> = None;
+    let mut heard = tokio::time::Instant::now();
     let mut client_id: Option<i32> = None;
     let mut chains = match &opts.interactions {
         Some(d) => recorded_chains(d)?,
@@ -286,20 +321,27 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
             if let Some(f) = dec.next()? {
                 break Some(f);
             }
-            let wait = match join_deadline {
-                Some(d) => d.saturating_duration_since(tokio::time::Instant::now()),
-                None => Duration::from_secs(120),
-            };
-            match tokio::time::timeout(wait, recv.read(&mut buf)).await {
+            let end = *deadline.lock().unwrap();
+            let now = tokio::time::Instant::now();
+            if end.is_some_and(|d| now >= d) {
+                break None;
+            }
+            // Short reads, so a deadline set by the script is seen soon.
+            match tokio::time::timeout(Duration::from_millis(250), recv.read(&mut buf)).await {
                 Ok(r) => {
-                    let n = r?.context("server closed the stream")?;
+                    let Some(n) = r? else {
+                        warn!("server closed the stream");
+                        break None;
+                    };
                     dec.push(&buf[..n]);
+                    heard = now;
                 }
-                Err(_) if join_deadline.is_some() => break None,
-                Err(_) => bail!("server went quiet"),
+                Err(_) if now - heard > Duration::from_secs(120) => bail!("server went quiet"),
+                Err(_) => {}
             }
         };
         let Some(f) = f else { break };
+        st.lock().unwrap().observe(&f);
         Recorder::save(&rec, "game", &f).await?;
 
         let mut wire = Vec::new();
@@ -322,10 +364,12 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
                 // Finish setup the way the client does: view radius, then SetupFinalize.
                 frame::encode(32, &224i32.to_le_bytes(), &mut wire)?;
                 frame::encode(33, &[], &mut wire)?;
-                join_deadline = Some(
-                    tokio::time::Instant::now()
-                        + opts.listen.map_or(JOIN_LISTEN, Duration::from_secs),
-                );
+                if !scripted {
+                    *deadline.lock().unwrap() = Some(
+                        tokio::time::Instant::now()
+                            + opts.listen.map_or(JOIN_LISTEN, Duration::from_secs),
+                    );
+                }
             }
             3 if f.payload.len() >= 16 => {
                 // Answer pings: same id and time, type Raw, empty queue.
@@ -351,10 +395,36 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
                         }
                     });
                 }
+                if let Some(lines) = lines.take() {
+                    let run = script::Run {
+                        state: st.clone(),
+                        out: out_tx.clone(),
+                        capture: capture.clone(),
+                    };
+                    let (deadline, outcome) = (deadline.clone(), outcome.clone());
+                    let tail = Duration::from_secs(opts.listen.unwrap_or(3));
+                    tokio::spawn(async move {
+                        // In the world for the server: ready for gameplay
+                        // (sent after 1.5 s) and the spawn teleport confirmed.
+                        let start = tokio::time::Instant::now();
+                        while run.state.lock().unwrap().teleports == 0
+                            && start.elapsed() < Duration::from_secs(10)
+                        {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        tokio::time::sleep_until(start + Duration::from_secs(3)).await;
+                        let r = run.run(lines).await;
+                        if let Err(e) = &r {
+                            warn!("script stopped: {e:#}");
+                        }
+                        *outcome.lock().unwrap() = Some(r);
+                        *deadline.lock().unwrap() = Some(tokio::time::Instant::now() + tail);
+                    });
+                }
                 // Unless replaying interactions (which must not move the
-                // probe): a position, then the chat lines, so a server can
-                // be tested past the join.
-                if opts.interactions.is_none() {
+                // probe) or scripted: a position, then the chat lines, so a
+                // server can be tested past the join.
+                if opts.interactions.is_none() && !scripted {
                     let mut payload = Vec::new();
                     proto::ClientMovement {
                         absolute_position: Some(proto::Position {
@@ -529,7 +599,8 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
                     .map(|(c, _)| c.client_id);
                 if !chains.is_empty() {
                     // The interactions take a while: listen longer.
-                    join_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(90));
+                    *deadline.lock().unwrap() =
+                        Some(tokio::time::Instant::now() + Duration::from_secs(90));
                 }
             }
             161 if !chains.is_empty() => {
@@ -611,5 +682,45 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
     let r = rec.lock().await;
     info!("captured {} packets into {}", r.seq, capture.display());
     conn.close(0u32.into(), b"");
-    Ok(())
+    // The report: the player's state, and how the script went.
+    let outcome = outcome.lock().unwrap().take();
+    let s = st.lock().unwrap();
+    let mut report = s.report();
+    let mut failed = 0;
+    if scripted {
+        match &outcome {
+            Some(Ok(checks)) => {
+                failed = checks.iter().filter(|c| c["ok"] == false).count();
+                report["script"] = serde_json::json!({"finished": true, "checks": checks});
+            }
+            Some(Err(e)) => {
+                report["script"] =
+                    serde_json::json!({"finished": false, "error": format!("{e:#}")});
+            }
+            None => {
+                report["script"] =
+                    serde_json::json!({"finished": false, "error": "connection ended first"})
+            }
+        }
+    }
+    std::fs::write(
+        capture.join("state.json"),
+        serde_json::to_string_pretty(&report)?,
+    )?;
+    // This server's root interaction ids by name, for `replay … roots`.
+    let roots: String = s
+        .reg
+        .roots
+        .iter()
+        .map(|(i, n)| format!("{i}\t{n}\n"))
+        .collect();
+    std::fs::write(capture.join("roots.tsv"), roots)?;
+    info!("state written to {}", capture.join("state.json").display());
+    match outcome {
+        _ if !scripted => Ok(()),
+        Some(Ok(_)) if failed == 0 => Ok(()),
+        Some(Ok(_)) => bail!("{failed} script checks failed (state.json has them)"),
+        Some(Err(e)) => Err(e.context("script")),
+        None => bail!("the connection ended before the script did"),
+    }
 }

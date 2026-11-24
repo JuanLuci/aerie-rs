@@ -55,7 +55,6 @@ impl Section {
         Some(out)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn decode(data: &[u8]) -> Result<Self> {
         let mut p = 0;
         let blocks = unpalette(data, &mut p)?;
@@ -76,6 +75,8 @@ impl Section {
 const EMPTY: u8 = 0;
 const HALF_BYTE: u8 = 1;
 const BYTE: u8 = 2;
+/// Over 256 distinct values: i16 palette indices.
+const SHORT: u8 = 3;
 
 /// One paletted array: type byte; then, unless empty, an i16 entry count,
 /// entries (u8 palette index, i32 value, i16 number of uses) and the
@@ -119,7 +120,6 @@ fn paletted(values: &[i32], out: &mut Vec<u8>) {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn unpalette(d: &[u8], p: &mut usize) -> Result<Vec<i32>> {
     let need = |end: usize| -> Result<()> {
         if end > d.len() {
@@ -136,12 +136,19 @@ fn unpalette(d: &[u8], p: &mut usize) -> Result<Vec<i32>> {
     need(*p + 2)?;
     let n = i16::from_le_bytes([d[*p], d[*p + 1]]) as usize;
     *p += 2;
-    let mut palette = [0i32; 256];
+    // The short palette's entries start with an i16 index, the others' with
+    // a byte; then the value (i32) and its number of uses (i16).
+    let key = if kind == SHORT { 2 } else { 1 };
+    let mut palette = vec![0i32; if kind == SHORT { 1 << 16 } else { 256 }];
     for _ in 0..n {
-        need(*p + 7)?;
-        let i = d[*p] as usize;
-        palette[i] = i32::from_le_bytes(d[*p + 1..*p + 5].try_into().unwrap());
-        *p += 7;
+        need(*p + key + 6)?;
+        let i = if kind == SHORT {
+            u16::from_le_bytes([d[*p], d[*p + 1]]) as usize
+        } else {
+            d[*p] as usize
+        };
+        palette[i] = i32::from_le_bytes(d[*p + key..*p + key + 4].try_into().unwrap());
+        *p += key + 6;
     }
     let mut out = Vec::with_capacity(VOLUME);
     match kind {
@@ -157,6 +164,15 @@ fn unpalette(d: &[u8], p: &mut usize) -> Result<Vec<i32>> {
             need(*p + VOLUME)?;
             out.extend(d[*p..*p + VOLUME].iter().map(|&b| palette[b as usize]));
             *p += VOLUME;
+        }
+        SHORT => {
+            need(*p + VOLUME * 2)?;
+            out.extend(
+                d[*p..*p + VOLUME * 2]
+                    .chunks(2)
+                    .map(|b| palette[u16::from_le_bytes([b[0], b[1]]) as usize]),
+            );
+            *p += VOLUME * 2;
         }
         k => bail!("palette type {k} not known yet"),
     }
@@ -257,4 +273,25 @@ fn captured() {
     }
     assert!(n > 0);
     eprintln!("{n} captured sections decode and re-encode");
+
+    #[test]
+    fn reads_the_short_palette() {
+        // Blocks: 300 values (i16 indices); fillers and rotations empty.
+        let mut d = vec![SHORT];
+        d.extend_from_slice(&300i16.to_le_bytes());
+        for i in 0..300u16 {
+            d.extend_from_slice(&i.to_le_bytes());
+            d.extend_from_slice(&(1000 + i as i32).to_le_bytes());
+            d.extend_from_slice(&1i16.to_le_bytes());
+        }
+        for n in 0..VOLUME {
+            d.extend_from_slice(&((n % 300) as u16).to_le_bytes());
+        }
+        d.extend_from_slice(&[EMPTY, EMPTY]);
+        let s = Section::decode(&d).unwrap();
+        assert_eq!(s.blocks[0], 1000);
+        assert_eq!(s.blocks[299], 1299);
+        assert_eq!(s.blocks[300], 1000);
+        assert!(s.fillers.iter().all(|&v| v == 0));
+    }
 }

@@ -28,8 +28,9 @@ one place, so you do not have to work them out from the code.
 - A module that needs the world reads it through a small trait it
   defines (`connected::Cells`, `chains::Host`, `items::Blocks`), and
   `world.rs` implements it. Pure logic stays testable without a world.
-- `probe.rs`: a scripted client used to compare servers. Changes to it
-  go in a pull request of their own.
+- `probe.rs` and `probe/` (`state.rs`: what the server told it, `script.rs`:
+  the script steps): a scripted client used to compare servers, described
+  in `docs/probe.md`. Changes to it go in a pull request of their own.
 
 ## Server tables
 
@@ -51,7 +52,10 @@ them by itself.
   the `dump` example once per capture) and print what is compared, so
   the outputs of both servers can be diffed: `cells.py` (block changes
   and sounds), `chains.py` (chain answers; `--final` ignores tick
-  alignment), `effects.py`, `stats.py`, `items.py`, `falling.py`.
+  alignment), `effects.py`, `stats.py`, `items.py`, `falling.py`, and
+  `state.py` (the player states the probe reports).
+- Agents: `.claude/skills/aerie-probe/SKILL.md` is how a comparison is
+  done, step by step.
 
 ## Conventions
 
