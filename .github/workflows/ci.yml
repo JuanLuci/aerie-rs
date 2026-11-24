@@ -18,13 +18,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - uses: Swatinem/rust-cache@v2
       - name: Nothing that must stay out of the repository
         if: github.event_name == 'pull_request'
         run: tools/ci/guard.sh origin/${{ github.base_ref }}
       - name: Formatting
         run: cargo fmt --check
-      - name: Build
-        run: cargo build --workspace --all-targets
-      - name: "Tests (no game files here: tests that need them are ignored)"
-        run: cargo test --workspace
+      - name: Python tools compile
+        run: python3 -m py_compile tools/diff/*.py
+      # No build or tests here: building needs the tables generated from a
+      # copy of the game (gen/), which this repository must not hold. Build
+      # and test locally (cargo test) before every push.
