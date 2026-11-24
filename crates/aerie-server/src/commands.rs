@@ -823,6 +823,47 @@ fn tree() -> &'static Vec<Node> {
                     .req("player", Ty::Player, "server.commands.argtype.player.desc"),
             );
 
+        let recipe_arg =
+            |n: Node| n.req("item", Ty::Item, "server.commands.recipe.learn.item.desc");
+        let recipe = Node::new("recipe", "server.commands.recipe.desc")
+            .perm("hytale.command.recipe")
+            .group()
+            .sub(
+                recipe_arg(Node::new("learn", "server.commands.recipe.learn.desc"))
+                    .perm("hytale.command.recipe.learn")
+                    .done()
+                    .variant(
+                        recipe_arg(Node::new("", "server.commands.recipe.learn.other.desc"))
+                            .req("player", Ty::Player, "server.commands.argtype.player.desc")
+                            .perm("hytale.command.recipe.learn.other")
+                            .done(),
+                    ),
+            )
+            .sub(
+                Node::new("forget", "server.commands.recipe.forget.desc")
+                    .req("item", Ty::Item, "server.commands.recipe.forget.item.desc")
+                    .perm("hytale.command.recipe.forget")
+                    .done()
+                    .variant(
+                        Node::new("", "server.commands.recipe.forget.other.desc")
+                            .req("item", Ty::Item, "server.commands.recipe.forget.item.desc")
+                            .req("player", Ty::Player, "server.commands.argtype.player.desc")
+                            .perm("hytale.command.recipe.forget.other")
+                            .done(),
+                    ),
+            )
+            .sub(
+                Node::new("list", "server.commands.recipe.list.desc")
+                    .perm("hytale.command.recipe.list")
+                    .done()
+                    .variant(
+                        Node::new("", "server.commands.recipe.list.other.desc")
+                            .req("player", Ty::Player, "server.commands.argtype.player.desc")
+                            .perm("hytale.command.recipe.list.other")
+                            .done(),
+                    ),
+            );
+
         let stat = |n: &'static str, d: &'static str| Node::new(n, d);
         let stats = Node::new("stats", "server.commands.player.stats.desc")
             .aliases(&["stat"])
@@ -950,7 +991,7 @@ fn tree() -> &'static Vec<Node> {
         let who_cmd = Node::new("who", "server.commands.who.desc")
             .perm("hytale.system.command.who")
             .done();
-        vec![block, gamemode, give, help, player, who_cmd]
+        vec![block, gamemode, give, help, player, recipe, who_cmd]
     })
 }
 

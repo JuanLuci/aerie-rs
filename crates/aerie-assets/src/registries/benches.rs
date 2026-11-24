@@ -15,7 +15,9 @@
 //! resource filterValid`, per fuel slot `PF block icon resource`, `PX block
 //! perFuelItems outputs ignored` (comma lists, outputs as `item:qty`) for
 //! `ExtraOutput`, and per tier `PT block extraInput extraOutput reduction`;
-//! items whose `FuelQuality` is not 1 give `Q item quality`.
+//! items whose `FuelQuality` is not 1 give `Q item quality`. An item whose
+//! interactions have a `LearnRecipe` step that names an item gives `L item
+//! learned` (spec 09, known recipes).
 
 use aerie_protocol::proto::BenchType;
 use serde_json::Value;
@@ -171,6 +173,12 @@ pub fn table(ctx: &Ctx) -> Result<String> {
             out += &format!("Q {k} {q}\n");
         }
     }
+    for k in items.own.keys() {
+        let a = items.resolved(k, "Item");
+        if let Some(learned) = a.get("Interactions").and_then(learned_item) {
+            out += &format!("L {k} {learned}\n");
+        }
+    }
     for name in SOUNDS {
         let i = super::sound_events::index(ctx, Some(name))?;
         if i > 0 {
@@ -178,6 +186,26 @@ pub fn table(ctx: &Ctx) -> Result<String> {
         }
     }
     Ok(out)
+}
+
+/// The item a `LearnRecipe` interaction names, looked for anywhere in an
+/// item's interactions (it can sit inside other steps).
+fn learned_item(v: &Value) -> Option<String> {
+    match v {
+        Value::Object(m) => {
+            if m.get("Type").and_then(Value::as_str) == Some("LearnRecipe")
+                && let Some(id) = m.get("ItemId").and_then(Value::as_str)
+                && !id.contains(char::is_whitespace)
+            {
+                return Some(id.to_owned());
+            }
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            keys.into_iter().find_map(|k| learned_item(&m[k]))
+        }
+        Value::Array(a) => a.iter().find_map(learned_item),
+        _ => None,
+    }
 }
 
 /// Sounds the official crafting plays outside bench assets.

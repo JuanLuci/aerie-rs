@@ -126,6 +126,8 @@ pub struct PlayerParts {
     gameplay: Option<Vec<u8>>,
     time: Option<Vec<u8>>,
     movement: Option<Vec<u8>>,
+    /// Encoded `UpdateKnownRecipes` of this player, when it knows any.
+    known: Option<Vec<u8>>,
 }
 
 impl PlayerParts {
@@ -174,6 +176,7 @@ impl PlayerParts {
             gameplay: extra(WORLD_GAMEPLAY),
             time: extra(TIME_SETTINGS),
             movement: extra(MOVEMENT_SETTINGS),
+            known: None,
         }
     }
 }
@@ -255,20 +258,24 @@ fn hud_and_time(parts: &PlayerParts) -> Result<Vec<Out>> {
             payload: b.clone(),
         });
     }
-    v.extend([
-        Out::new(
-            settings_id::UPDATE_VISIBLE_HUD,
-            &proto::UpdateVisibleHudComponents {
-                visible_components: Some(visible),
-            },
-        )?,
-        Out::new(
+    v.extend([Out::new(
+        settings_id::UPDATE_VISIBLE_HUD,
+        &proto::UpdateVisibleHudComponents {
+            visible_components: Some(visible),
+        },
+    )?]);
+    v.push(match &parts.known {
+        Some(b) => Out {
+            id: settings_id::UPDATE_KNOWN_RECIPES,
+            payload: b.clone(),
+        },
+        None => Out::new(
             settings_id::UPDATE_KNOWN_RECIPES,
             &proto::UpdateKnownRecipes {
                 known: Some(Vec::new()),
             },
         )?,
-    ]);
+    });
     if let Some(b) = &parts.time {
         v.push(Out {
             id: settings_id::UPDATE_TIME_SETTINGS,
@@ -980,6 +987,7 @@ async fn in_world(
                         if let Some(s) = hub.stat_values(client_id) {
                             p.stats = s;
                         }
+                        p.known = hub.known_recipes_payload(client_id);
                         p
                     },
                     captured,

@@ -120,6 +120,8 @@ struct Entry {
     tools_slot: i32,
     /// The inventory and active slots as last written to the save.
     saved_carry: Option<(String, [i32; 3])>,
+    /// The recipes it has learned (spec 09).
+    known: crate::crafting::Known,
     /// Its stats (spec 17) and what regeneration asks about it.
     stats: crate::stats::StatMap,
     /// Its item modifiers must be worked out again (equipment changed).
@@ -1181,6 +1183,86 @@ impl Hub {
         )
     }
 
+    fn known_file(&self, uuid: uuid::Uuid) -> Option<std::path::PathBuf> {
+        Some(
+            self.save
+                .as_ref()?
+                .with_file_name("recipes")
+                .join(format!("{uuid}.txt")),
+        )
+    }
+
+    fn saved_known(&self, uuid: uuid::Uuid) -> crate::crafting::Known {
+        self.known_file(uuid)
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .map(|t| crate::crafting::Known::parse(&t))
+            .unwrap_or_default()
+    }
+
+    fn save_known(&self, uuid: uuid::Uuid, known: &crate::crafting::Known) {
+        let Some(f) = self.known_file(uuid) else {
+            return;
+        };
+        let r = std::fs::create_dir_all(f.parent().unwrap())
+            .and_then(|_| std::fs::write(&f, known.text()));
+        if let Err(e) = r {
+            tracing::warn!("saving known recipes failed: {e}");
+        }
+    }
+
+    /// The `UpdateKnownRecipes` payload a joining player gets (spec 09).
+    pub fn known_recipes_payload(&self, id: i32) -> Option<Vec<u8>> {
+        let g = self.inner.lock().unwrap();
+        let e = g.players.get(&id)?;
+        let mut b = Vec::new();
+        proto::UpdateKnownRecipes {
+            known: Some(self.book.known_recipes(&e.known)),
+        }
+        .encode(&mut b)
+        .ok()?;
+        Some(b)
+    }
+
+    /// `/recipe learn|forget|list` (spec 09): the crafting module words the
+    /// replies; a change sends the target its recipes before the reply.
+    fn recipe_command(&self, id: i32, sub: &str, args: &[&str]) -> Result<()> {
+        let (item, target) = match sub {
+            "list" => ("", args.first()),
+            _ => (args.first().copied().unwrap_or(""), args.get(1)),
+        };
+        let reply = {
+            let mut g = self.inner.lock().unwrap();
+            let tid = match target {
+                Some(n) => g
+                    .players
+                    .iter()
+                    .find(|(_, e)| e.name.eq_ignore_ascii_case(n))
+                    .map(|(p, _)| *p),
+                None => Some(id),
+            };
+            let Some(e) = tid.and_then(|t| g.players.get_mut(&t)) else {
+                return Ok(());
+            };
+            let name = e.name.clone();
+            let other = target.map(|_| name.as_str());
+            let (msg, changed) =
+                crate::crafting::recipe_reply(&self.book, &mut e.known, sub, item, other);
+            if changed {
+                self.save_known(e.uuid, &e.known);
+                let p = packet(
+                    crate::join::settings_id::UPDATE_KNOWN_RECIPES,
+                    &proto::UpdateKnownRecipes {
+                        known: Some(self.book.known_recipes(&e.known)),
+                    },
+                )?;
+                let _ = e.outbox.send(p);
+            }
+            msg
+        };
+        self.tell_msg(id, reply);
+        Ok(())
+    }
+
     fn saved_stats(&self, uuid: uuid::Uuid) -> Option<String> {
         std::fs::read_to_string(self.stats_file(uuid)?).ok()
     }
@@ -1553,6 +1635,7 @@ impl Hub {
                     utility_slot: slots[1],
                     tools_slot: slots[2],
                     saved_carry: None,
+                    known: self.saved_known(uuid),
                     stats: {
                         let mut m = crate::stats::StatMap::new(&self.stat_types);
                         if let Some(t) = self.saved_stats(uuid) {
@@ -3460,7 +3543,7 @@ impl Hub {
         if quantity < 1
             || self
                 .book
-                .allowed(recipe, w.bench.kind, &w.bench.id)
+                .allowed(recipe, w.bench.kind, &w.bench.id, &e.known)
                 .is_err()
         {
             return false;
@@ -3504,7 +3587,7 @@ impl Hub {
     ) -> bool {
         if self
             .book
-            .allowed(recipe, w.bench.kind, &w.bench.id)
+            .allowed(recipe, w.bench.kind, &w.bench.id, &e.known)
             .is_err()
         {
             return false;
@@ -5079,6 +5162,7 @@ impl Hub {
                 }
             }
             ("player", ["stats", rest @ ..]) => self.stats_command(id, rest)?,
+            ("recipe", [sub, rest @ ..]) => self.recipe_command(id, sub, rest)?,
             ("gamemode", [mode]) => {
                 let m = match mode.to_ascii_lowercase().as_str() {
                     "creative" | "c" | "1" => Some(proto::GameMode::CREATIVE),
@@ -5731,6 +5815,31 @@ impl ChainHost<'_> {
     fn player(&self) -> Option<&Entry> {
         self.g.players.get(&self.pid)
     }
+
+    /// A `LearnRecipe` step (spec 09): learns what the held item teaches
+    /// and tells the player, as `/recipe learn` does.
+    fn learn_recipe(&mut self, ctx: &crate::chains::Ctx) {
+        let hub = self.hub;
+        let Some(e) = self.g.players.get_mut(&self.pid) else {
+            return;
+        };
+        let learned = ctx.held.as_deref().and_then(|h| hub.book.learns(h));
+        let (msg, changed) = crate::crafting::learn_reply(&hub.book, &mut e.known, learned);
+        if changed {
+            hub.save_known(e.uuid, &e.known);
+            if let Ok(p) = packet(
+                crate::join::settings_id::UPDATE_KNOWN_RECIPES,
+                &proto::UpdateKnownRecipes {
+                    known: Some(hub.book.known_recipes(&e.known)),
+                },
+            ) {
+                let _ = e.outbox.send(p);
+            }
+        }
+        if let Ok(p) = msg.packet() {
+            let _ = e.outbox.send(p);
+        }
+    }
 }
 
 impl crate::chains::Host for ChainHost<'_> {
@@ -5886,6 +5995,10 @@ impl crate::chains::Host for ChainHost<'_> {
     }
 
     fn other(&mut self, ty: &str, ctx: &crate::chains::Ctx) {
+        if ty == "LearnRecipe" {
+            self.learn_recipe(ctx);
+            return;
+        }
         // A block's own interaction that opens something: benches.
         if ty.starts_with("Open")
             && let Some(at) = ctx.target_block

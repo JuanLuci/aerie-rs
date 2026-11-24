@@ -138,8 +138,13 @@ back) and, if there was one, the bench's `FailedSoundEventId` plays; the
 close sound plays; a structural input goes back to the inventory (or
 drops).
 
-Processing benches (furnace, campfire), diagram benches, tier upgrades,
-chests near benches and known recipes are not done yet.
+Nothing stays in a crafting bench between uses: its window is rebuilt
+each time it opens, the queue is cancelled on closing and a structural
+input goes back to the player. The only state a crafting bench block
+keeps is its tier and the items spent on upgrading it (tier upgrades are
+not done yet; processing benches keep their contents, spec 20).
+
+Diagram benches, tier upgrades and chests near benches are not done yet.
 
 ## Items used up by an interaction
 
@@ -155,3 +160,123 @@ at least the branch's key (2.5 s for most food).
 Aerie follows each such chain by id from its first sync (held item and
 hotbar slot) and changes the stack once. The effects (`ApplyEffect`, e.g.
 `Food_Instant_Heal_T1`) are not applied yet.
+
+## Known recipes
+
+A recipe with `KnowledgeRequired` can only be crafted by a player who
+has learned it. What a player learned is a set of item ids (the id of the
+recipe's primary output, not the recipe's own id), kept with the player
+and saved with it. Learning needs no recipe to exist: any item id can be
+learned, and one that makes nothing simply never shows up for the client.
+
+### How a recipe is learned
+
+- `/recipe learn ITEM` (an item, by its key) and `/recipe learn ITEM
+  PLAYER` for someone else; `/recipe forget ITEM [PLAYER]` and `/recipe
+  list [PLAYER]` do the opposite and print the set. All three are
+  sub-commands of `recipe` (spec 28).
+- An item whose root interaction has a `LearnRecipe` step (the recipe
+  pages and scrolls; most name the item to learn, the plain page reads it
+  from the held stack's metadata). The step learns the item and sends the
+  same two replies as the command; when it was known already the step
+  fails. The chain's next step then takes the held item away.
+
+Replies (chat lines, spec 29): learning answers
+`server.modules.learnrecipe.success` (parameter `name`, a message: the
+item's name key; green `#00ff00` when it comes from the command, none
+from the interaction), or `server.modules.learnrecipe.alreadyKnown`
+(`name`; red from the command). Forgetting answers
+`server.commands.recipe.forgotten` or `server.commands.recipe.alreadyNotKnown`
+(`id`, the item key as text; green and red). Listing answers
+`server.commands.recipe.knownRecipes` (`list`, the set printed as
+`[a, b, c]`). The forms naming another player use the `….other` keys
+(`server.commands.recipe.learn.success.other`, `learn.alreadyKnown.other`,
+`forgotten.other`, `alreadyNotKnown.other`, `knownRecipes.other`) with a
+`username` parameter first. The player who changed a set gets the
+known-recipes packet first, then the reply.
+
+### The known-recipes packet
+
+`UpdateKnownRecipes` holds a map from item id to a crafting recipe. It is
+sent once when a player joins (right after the HUD components, with the
+set the player saved) and again, whole, after every learn or forget that
+changed something. For each learned item that exists, the entry is the
+recipe that makes the item, with its `id` set to the item's id (not the
+recipe's own); an item no bench makes has no entry. The entries come in
+the order of a hash map (an open addressing table: the entry's slot is
+the mixed Java hash of the item id, the table holds 32 slots and grows
+at 24 entries; the map is read from its last slot down).
+
+Which recipe makes an item is not always one: salvaging benches list many
+recipes that give the same ingredient. The server keeps, for each bench
+id, a registry of the recipes naming that bench, by category (or none),
+and for each item the registry's set of recipes that output it. To pick
+the entry it goes through every registry (in the order of the registries'
+own table) and every recipe listed for the item (in the order of that
+set's table) and the last one found wins. All those sets and maps are
+open addressing tables of 32 slots by default, so the order depends only
+on the hashes of the ids, except when two ids fall on the same slot, where
+the order they were added in decides.
+
+The same sets give the order of `craftableRecipes` in a bench window's
+categories.
+
+### The order of the learned set
+
+`/recipe list` prints the set in the order the official server's set
+keeps. A set grown by learning is a copy into a new Java hash set (its
+table sized for the copy: at least 16 slots, doubled when the new size
+passes 3/4; buckets by the hash with its high half folded in; inside a
+bucket the older first), so each learn rebuilds the order from the one
+before. Forgetting copies into an open addressing set made for that many
+entries, removes the id (moving later entries of its run back) and keeps
+that set's order, read from the last slot down. A set read back from the
+save has no meaningful order on the official server (it is an immutable
+set that iterates in an order that changes from run to run), so only the
+first list after joining can differ.
+
+### What is saved
+
+The set is part of the player's save: written when the player is saved
+(leaving, and periodically) and read when it joins, before the
+known-recipes packet goes out. A rejoin gets the same set.
+
+### Crafting with knowledge
+
+A recipe with `KnowledgeRequired` is only crafted when the set holds its
+primary output's item id; otherwise the request is dropped without any
+reply, as for a recipe the bench does not make. Bench windows list such
+recipes whether or not they are known.
+
+## In Aerie (known recipes)
+
+`crafting::Known` holds the set in the official order (a list rebuilt on
+each learn or forget by the rules above, kept in the saved text, one item
+id per line, in `<world>/recipes/<uuid>.txt`, written on every change).
+`Book::known_recipes` builds the packet. The registries (recipes by bench
+id, category and output item) are built once from the recipe registry,
+with the recipes added in the order of their ids. `/recipe` is in the
+command tree (spec 28); the replies are built in `crafting::recipe_reply`.
+The join sequence takes the packet from the hub (`known_recipes_payload`)
+instead of an empty one. `Book::allowed` takes the player's set.
+
+## Not done yet (known recipes)
+
+- The `LearnRecipe` interaction (see the status below).
+- Which recipe wins when several of the same registry make an item
+  depends on the order the official server loaded the recipes in, which
+  Aerie takes as the order of their ids; two ids on the same slot can come
+  out swapped (not seen in the items compared below).
+- A learned set read back after a restart lists in the saved order, where
+  the official server lists it in a different order every run.
+- Permissions: every player may run every `/recipe` form.
+
+## Checked against the official server (known recipes)
+
+Probe scripts on both servers, same item lists, decoded and diffed:
+`/recipe learn`, `forget` and `list` for 71 items in a row (every one of
+the 55 items that several recipes make, plus 16 others), all the chat
+lines and all the known-recipes packets (145 packets, the last with 71
+entries) are the same; so is the list order after each step. Crafting
+`Food_Pie_Apple` at a cooking bench (needs knowledge) does nothing before
+`/recipe learn` and queues after it, with the same inventory.

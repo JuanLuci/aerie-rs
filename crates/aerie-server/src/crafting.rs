@@ -15,6 +15,7 @@ use aerie_protocol::proto;
 use aerie_protocol::wire::Wire;
 
 use crate::inventory::Inventory;
+use crate::messages::Msg;
 
 pub const BENCHES: &str = "benches";
 /// The pocket window's bench id.
@@ -324,6 +325,14 @@ pub struct Book {
     groups: Vec<Vec<String>>,
     /// Items whose `FuelQuality` is not 1.
     fuel_quality: HashMap<String, f64>,
+    /// Item → the recipe the official server finds for it when it tells a
+    /// client the item is known (see `incoming_recipes`).
+    incoming: HashMap<String, String>,
+    /// (bench id, category) → its recipes in the order the official
+    /// registry's set lists them (what a bench window shows).
+    in_category: HashMap<(String, String), Vec<String>>,
+    /// Item → the item its `LearnRecipe` interaction teaches.
+    learns: HashMap<String, String>,
 }
 
 /// Why a craft did not happen.
@@ -528,6 +537,9 @@ impl Book {
                         b.always_hints = hints == "1";
                     }
                 }
+                ["L", item, learned] => {
+                    book.learns.insert(item.to_owned(), learned.to_owned());
+                }
                 ["Q", item, q] => {
                     book.fuel_quality
                         .insert(item.to_owned(), q.parse().unwrap_or(1.0));
@@ -540,7 +552,137 @@ impl Book {
                 b.processing = crate::processing::parse(benches, block);
             }
         }
+        (book.incoming, book.in_category) = book.registries();
         book
+    }
+
+    /// The recipe the official server finds for each item a client learns
+    /// it knows. Each bench id has a registry of the recipes that name it,
+    /// by category (or none); for each item the registry lists the recipes
+    /// that make it. The server goes through every registry (in its map's
+    /// order) and every recipe listed for the item (in its set's order),
+    /// and the last one stays. All those sets and maps are open addressing
+    /// tables, so their order is the order of their hashes, and the order
+    /// the recipes were added in settles ties (taken here as the recipes'
+    /// names in order).
+    #[allow(clippy::type_complexity)]
+    fn registries(
+        &self,
+    ) -> (
+        HashMap<String, String>,
+        HashMap<(String, String), Vec<String>>,
+    ) {
+        struct Registry {
+            categories: Open,
+            by_category: HashMap<String, Open>,
+            loose: Open,
+        }
+        let mut ids: Vec<&String> = self.recipes.keys().collect();
+        ids.sort_by(|a, b| b.cmp(a));
+        let mut benches = Open::made_for(16);
+        let mut registries: HashMap<String, Registry> = HashMap::new();
+        for id in ids {
+            for req in self.recipes[id].bench_requirement.iter().flatten() {
+                benches.add(&req.id);
+                let reg = registries
+                    .entry(req.id.clone())
+                    .or_insert_with(|| Registry {
+                        categories: Open::made_for(16),
+                        by_category: HashMap::new(),
+                        loose: Open::made_for(16),
+                    });
+                match req.categories.as_deref() {
+                    Some(c) if !c.is_empty() => {
+                        for c in c {
+                            reg.categories.add(c);
+                            reg.by_category
+                                .entry(c.clone())
+                                .or_insert_with(|| Open::made_for(16))
+                                .add(id);
+                        }
+                    }
+                    _ => reg.loose.add(id),
+                }
+            }
+        }
+        let mut found = HashMap::new();
+        let mut listed_in = HashMap::new();
+        for bench in benches.order() {
+            let reg = &registries[&bench];
+            let mut listed: HashMap<&str, Open> = HashMap::new();
+            for (c, set) in &reg.by_category {
+                listed_in.insert((bench.clone(), c.clone()), set.order());
+            }
+            let in_order = reg
+                .categories
+                .order()
+                .into_iter()
+                .flat_map(|c| reg.by_category[&c].order())
+                .chain(reg.loose.order());
+            for id in in_order {
+                for item in self.recipes[&id]
+                    .outputs
+                    .iter()
+                    .flatten()
+                    .filter_map(|o| o.item_id.as_deref())
+                {
+                    listed
+                        .entry(item)
+                        .or_insert_with(|| Open::made_for(16))
+                        .add(&id);
+                }
+            }
+            for (item, set) in listed {
+                if let Some(last) = set.order().pop() {
+                    found.insert(item.to_owned(), last);
+                }
+            }
+        }
+        (found, listed_in)
+    }
+
+    /// What the client is told it knows (`UpdateKnownRecipes`): for each
+    /// learned item that exists and that some bench makes, the recipe
+    /// that makes it, under the item's id. The official server fills a
+    /// hash map with them, so the entries come in that table's order.
+    pub fn known_recipes(&self, known: &Known) -> Vec<(String, proto::CraftingRecipe)> {
+        let mut table = Open::made_for(16);
+        let mut found: HashMap<&str, proto::CraftingRecipe> = HashMap::new();
+        for item in known.ids() {
+            if !self.items.contains_key(item) {
+                continue;
+            }
+            let Some(recipe) = self.incoming.get(item).and_then(|r| self.recipes.get(r)) else {
+                continue;
+            };
+            let mut recipe = recipe.clone();
+            recipe.id = Some(item.clone());
+            found.insert(item, recipe);
+            table.add(item);
+        }
+        table
+            .order()
+            .into_iter()
+            .filter_map(|k| found.remove(k.as_str()).map(|r| (k, r)))
+            .collect()
+    }
+
+    /// The item that using `item` teaches (its `LearnRecipe` step).
+    pub fn learns(&self, item: &str) -> Option<&str> {
+        self.learns.get(item).map(String::as_str)
+    }
+
+    /// Whether the player may craft `recipe`: known when it needs
+    /// knowledge, by its primary output's item.
+    pub fn knows(&self, known: &Known, recipe: &str) -> bool {
+        let Some(r) = self.recipes.get(recipe) else {
+            return false;
+        };
+        !r.knowledge_required
+            || r.primary_output
+                .as_ref()
+                .and_then(|p| p.item_id.as_deref())
+                .is_some_and(|i| known.contains(i))
     }
 
     pub fn counts(&self) -> (usize, usize, usize) {
@@ -644,19 +786,10 @@ impl Book {
 
     /// Recipes made at bench `id` in category `cat`, sorted.
     fn recipes_for(&self, id: &str, cat: &str) -> Vec<&str> {
-        let mut v: Vec<&str> = self
-            .recipes
-            .iter()
-            .filter(|(_, r)| {
-                r.bench_requirement
-                    .iter()
-                    .flatten()
-                    .any(|b| b.id == id && b.categories.iter().flatten().any(|c| c == cat))
-            })
-            .map(|(k, _)| k.as_str())
-            .collect();
-        v.sort();
-        v
+        self.in_category
+            .get(&(id.to_owned(), cat.to_owned()))
+            .map(|v| v.iter().map(String::as_str).collect())
+            .unwrap_or_default()
     }
 
     /// A bench window as the official server opens it (spec 09): its data
@@ -961,7 +1094,7 @@ impl Book {
     }
 
     /// Whether recipe `id` can be made at bench (`kind`, `bench`) (spec 09).
-    pub fn allowed(&self, id: &str, kind: i32, bench: &str) -> Result<(), Refused> {
+    pub fn allowed(&self, id: &str, kind: i32, bench: &str, known: &Known) -> Result<(), Refused> {
         let r = self.recipes.get(id).ok_or(Refused::Unknown)?;
         let at_bench = r.bench_requirement.iter().flatten().any(|b| {
             b.r#type.0 == kind
@@ -971,7 +1104,7 @@ impl Book {
                     .as_ref()
                     .is_none_or(|t| t.is_empty())
         });
-        if !at_bench || r.knowledge_required || r.required_memories_level > MEMORIES_LEVEL {
+        if !at_bench || !self.knows(known, id) || r.required_memories_level > MEMORIES_LEVEL {
             return Err(Refused::WrongBench);
         }
         Ok(())
@@ -1109,6 +1242,289 @@ fn diff(before: &Inventory, after: &Inventory) -> Vec<(String, i32)> {
     count.into_iter().filter(|(_, n)| *n > 0).collect()
 }
 
+// ---------------------------------------------------------------------
+// Known recipes (spec 09)
+
+/// `String.hashCode` over UTF-16 code units.
+fn java_hash(s: &str) -> u32 {
+    s.encode_utf16()
+        .fold(0u32, |h, c| h.wrapping_mul(31).wrapping_add(c as u32))
+}
+
+/// The open addressing table the official server keeps its sets and maps
+/// in (mixed hash, linear probing, growing at 3/4). Only the order it
+/// reads its keys in matters here: from the last slot down.
+struct Open {
+    keys: Vec<Option<String>>,
+    size: usize,
+    /// The size it was made with: it never shrinks below it.
+    least: usize,
+}
+
+impl Open {
+    fn table_size(expected: usize) -> usize {
+        let need = (expected as f64 / 0.75).ceil() as usize;
+        need.next_power_of_two().max(2)
+    }
+
+    fn made_for(expected: usize) -> Self {
+        let n = Self::table_size(expected);
+        Open {
+            keys: vec![None; n],
+            size: 0,
+            least: n,
+        }
+    }
+
+    fn slot(&self, key: &str) -> usize {
+        let h = java_hash(key).wrapping_mul(0x9E37_79B9);
+        ((h ^ (h >> 16)) as usize) & (self.keys.len() - 1)
+    }
+
+    fn max_fill(n: usize) -> usize {
+        ((n as f64 * 0.75).ceil() as usize).min(n - 1)
+    }
+
+    fn rehash(&mut self, n: usize) {
+        let old = std::mem::replace(&mut self.keys, vec![None; n]);
+        for k in old.into_iter().rev().flatten() {
+            let mut pos = self.slot(&k);
+            while self.keys[pos].is_some() {
+                pos = (pos + 1) & (n - 1);
+            }
+            self.keys[pos] = Some(k);
+        }
+    }
+
+    fn add(&mut self, key: &str) {
+        let mask = self.keys.len() - 1;
+        let mut pos = self.slot(key);
+        while let Some(k) = &self.keys[pos] {
+            if k == key {
+                return;
+            }
+            pos = (pos + 1) & mask;
+        }
+        self.keys[pos] = Some(key.to_owned());
+        if self.size >= Self::max_fill(self.keys.len()) {
+            self.size += 1;
+            self.rehash(Self::table_size(self.size + 1));
+        } else {
+            self.size += 1;
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        let n = self.keys.len();
+        let mask = n - 1;
+        let mut pos = self.slot(key);
+        loop {
+            match &self.keys[pos] {
+                None => return,
+                Some(k) if k == key => break,
+                _ => pos = (pos + 1) & mask,
+            }
+        }
+        // Close the gap: later keys of the run move back when their
+        // home slot allows it.
+        loop {
+            let last = pos;
+            pos = (last + 1) & mask;
+            loop {
+                let Some(k) = &self.keys[pos] else {
+                    self.keys[last] = None;
+                    self.size -= 1;
+                    if n > self.least && self.size < Self::max_fill(n) / 4 && n > 16 {
+                        self.rehash(n / 2);
+                    }
+                    return;
+                };
+                let home = self.slot(k);
+                let stays = if last <= pos {
+                    last >= home || home > pos
+                } else {
+                    last >= home && home > pos
+                };
+                if stays {
+                    break;
+                }
+                pos = (pos + 1) & mask;
+            }
+            self.keys[last] = self.keys[pos].take();
+        }
+    }
+
+    fn order(&self) -> Vec<String> {
+        self.keys.iter().rev().flatten().cloned().collect()
+    }
+}
+
+/// The order a Java `HashSet` iterates `prev` copied into a new set that
+/// then gets `add`: a table made for the copy, buckets of `h ^ h >>> 16`,
+/// insertion order inside a bucket (a resize keeps it).
+fn hash_set_order(prev: &[String], add: &str) -> Vec<String> {
+    let mut cap = (((prev.len() as f32 / 0.75) as usize) + 1)
+        .max(16)
+        .next_power_of_two();
+    if prev.len() + 1 > (cap as f32 * 0.75) as usize {
+        cap *= 2;
+    }
+    let mut v: Vec<(usize, usize, &str)> = prev
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(add))
+        .enumerate()
+        .map(|(i, s)| {
+            let h = java_hash(s);
+            (((h ^ (h >> 16)) as usize) & (cap - 1), i, s)
+        })
+        .collect();
+    v.sort();
+    v.into_iter().map(|(_, _, s)| s.to_owned()).collect()
+}
+
+/// The recipes a player has learned (spec 09), kept in the order the
+/// official server's set lists them: `/recipe list` prints that order.
+/// A set made by learning is a hash set, one made by forgetting is an
+/// open addressing set, and what was saved comes back in the saved order.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Known {
+    ids: Vec<String>,
+}
+
+impl Known {
+    /// From the saved text: one item id per line.
+    pub fn parse(text: &str) -> Self {
+        let mut ids: Vec<String> = Vec::new();
+        for l in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if !ids.iter().any(|i| i == l) {
+                ids.push(l.to_owned());
+            }
+        }
+        Known { ids }
+    }
+
+    pub fn text(&self) -> String {
+        self.ids.iter().map(|i| format!("{i}\n")).collect()
+    }
+
+    pub fn ids(&self) -> &[String] {
+        &self.ids
+    }
+
+    pub fn contains(&self, item: &str) -> bool {
+        self.ids.iter().any(|i| i == item)
+    }
+
+    /// Learns `item`; false when it was known already.
+    pub fn learn(&mut self, item: &str) -> bool {
+        if self.contains(item) {
+            return false;
+        }
+        self.ids = hash_set_order(&self.ids, item);
+        true
+    }
+
+    /// Forgets `item`; false when it was not known.
+    pub fn forget(&mut self, item: &str) -> bool {
+        if !self.contains(item) {
+            return false;
+        }
+        let mut set = Open::made_for(self.ids.len());
+        for i in &self.ids {
+            set.add(i);
+        }
+        set.remove(item);
+        self.ids = set.order();
+        true
+    }
+
+    /// What `/recipe list` prints: the ids in brackets.
+    pub fn list(&self) -> String {
+        format!("[{}]", self.ids.join(", "))
+    }
+}
+
+/// What a `LearnRecipe` step answers when the held item teaches `item`
+/// (none: the item names nothing to learn), and whether `known` changed.
+pub fn learn_reply(book: &Book, known: &mut Known, item: Option<&str>) -> (Msg, bool) {
+    let Some(item) = item else {
+        return (Msg::key("server.modules.learnrecipe.noIdSet"), false);
+    };
+    let name = Msg::key(&book.item_name(item));
+    if known.learn(item) {
+        (
+            Msg::key("server.modules.learnrecipe.success").msg("name", name),
+            true,
+        )
+    } else {
+        (
+            Msg::key("server.modules.learnrecipe.alreadyKnown").msg("name", name),
+            false,
+        )
+    }
+}
+
+/// What `/recipe` answers (and whether `known` changed): `sub` is `learn`,
+/// `forget` or `list`, `item` the item key for the first two, `other` the
+/// target's name when the command names another player (the replies then
+/// say who).
+pub fn recipe_reply(
+    book: &Book,
+    known: &mut Known,
+    sub: &str,
+    item: &str,
+    other: Option<&str>,
+) -> (Msg, bool) {
+    const GREEN: &str = "#00ff00";
+    const RED: &str = "#ff0000";
+    let name = || Msg::key(&book.item_name(item));
+    let who = |m: Msg| match other {
+        Some(u) => m.text("username", u),
+        None => m,
+    };
+    let key = |own: &str, others: &str| if other.is_some() { others } else { own }.to_owned();
+    match sub {
+        "learn" => {
+            if known.learn(item) {
+                let k = key(
+                    "server.modules.learnrecipe.success",
+                    "server.commands.recipe.learn.success.other",
+                );
+                (who(Msg::key(&k)).msg("name", name()).color(GREEN), true)
+            } else {
+                let k = key(
+                    "server.modules.learnrecipe.alreadyKnown",
+                    "server.commands.recipe.learn.alreadyKnown.other",
+                );
+                (who(Msg::key(&k)).msg("name", name()).color(RED), false)
+            }
+        }
+        "forget" => {
+            if known.forget(item) {
+                let k = key(
+                    "server.commands.recipe.forgotten",
+                    "server.commands.recipe.forgotten.other",
+                );
+                (who(Msg::key(&k)).text("id", item).color(GREEN), true)
+            } else {
+                let k = key(
+                    "server.commands.recipe.alreadyNotKnown",
+                    "server.commands.recipe.alreadyNotKnown.other",
+                );
+                (who(Msg::key(&k)).text("id", item).color(RED), false)
+            }
+        }
+        _ => {
+            let k = key(
+                "server.commands.recipe.knownRecipes",
+                "server.commands.recipe.knownRecipes.other",
+            );
+            (who(Msg::key(&k)).text("list", &known.list()), false)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1171,10 +1587,13 @@ mod tests {
         );
         assert_eq!(inv.get(-1, 0), Some(Stack::new("Log", 1, 0.0)));
         assert_eq!(
-            b.allowed("Bench_Recipe", 0, "Workbench"),
+            b.allowed("Bench_Recipe", 0, "Workbench", &Known::default()),
             Err(Refused::WrongBench)
         );
-        assert_eq!(b.allowed("Nope", 0, FIELDCRAFT), Err(Refused::Unknown));
+        assert_eq!(
+            b.allowed("Nope", 0, FIELDCRAFT, &Known::default()),
+            Err(Refused::Unknown)
+        );
         assert_eq!(b.outputs("Bench_Recipe", 2), vec![("Bench".into(), 2)]);
     }
 
@@ -1188,6 +1607,7 @@ mod tests {
             .as_mut()
             .unwrap()[0]
             .id = "Workbench".into();
+        (b.incoming, b.in_category) = b.registries();
         let bench = Bench {
             kind: 0,
             id: "Workbench".into(),
@@ -1203,5 +1623,177 @@ mod tests {
         let mut data = w.data.clone();
         data.set("type", "5".into());
         assert!(data.text().starts_with("{\"type\":5,"));
+    }
+
+    #[test]
+    fn known_recipes_list_in_the_official_order() {
+        let mut k = Known::default();
+        assert_eq!(k.list(), "[]");
+        for i in ["Food_Pie_Apple", "Weapon_Sword_Iron", "Rock_Stone"] {
+            assert!(k.learn(i));
+        }
+        assert!(!k.learn("Rock_Stone"));
+        assert!(k.forget("Food_Pie_Apple"));
+        assert!(!k.forget("Food_Pie_Apple"));
+        assert!(k.learn("Food_Pie_Apple"));
+        assert!(k.learn("Tool_Pickaxe_Iron"));
+        assert_eq!(
+            k.list(),
+            "[Tool_Pickaxe_Iron, Food_Pie_Apple, Weapon_Sword_Iron, Rock_Stone]"
+        );
+        // Seventy-one learned in a row (the set grows twice), as the
+        // official server listed them.
+        let learned = [
+            "Container_Bucket",
+            "Deco_Book_Pile_Large",
+            "Deco_Tankard",
+            "Food_Cheese",
+            "Food_Fish_Raw",
+            "Ingredient_Bar_Iron",
+            "Ingredient_Bolt_Cindercloth",
+            "Ingredient_Bolt_Cotton",
+            "Ingredient_Bolt_Linen",
+            "Ingredient_Bolt_Silk",
+            "Ingredient_Bolt_Wool",
+            "Ingredient_Bone_Fragment",
+            "Ingredient_Fabric_Scrap_Cindercloth",
+            "Ingredient_Fabric_Scrap_Linen",
+            "Ingredient_Fabric_Scrap_Shadoweave",
+            "Ingredient_Feathers_Dark",
+            "Ingredient_Fibre",
+            "Ingredient_Gadget_Assembly",
+            "Ingredient_Hide_Heavy",
+            "Ingredient_Hide_Light",
+            "Ingredient_Hide_Medium",
+            "Ingredient_Hide_Storm",
+            "Ingredient_Life_Essence",
+            "Ingredient_Powder_Boom",
+            "Ingredient_Sac_Venom",
+            "Ingredient_Scraps",
+            "Ingredient_Stick",
+            "Ingredient_Tree_Sap",
+            "Ingredient_Void_Essence",
+            "Ore_Adamantite",
+            "Ore_Cobalt",
+            "Ore_Copper",
+            "Ore_Iron",
+            "Ore_Mithril",
+            "Ore_Thorium",
+            "Plant_Petals_Azure",
+            "Plant_Petals_Black",
+            "Plant_Petals_Blood",
+            "Plant_Petals_Blue",
+            "Plant_Petals_Cyan",
+            "Plant_Petals_Green",
+            "Plant_Petals_Orange",
+            "Plant_Petals_Pink",
+            "Plant_Petals_Purple",
+            "Plant_Petals_Red",
+            "Plant_Petals_Storm",
+            "Plant_Petals_White",
+            "Plant_Petals_Yellow",
+            "Potion_Health",
+            "Rock_Stone_Cobble",
+            "Rubble_Aqua",
+            "Rubble_Basalt",
+            "Rubble_Calcite",
+            "Rubble_Lime",
+            "Rubble_Marble",
+            "Food_Pie_Apple",
+            "Weapon_Sword_Iron",
+            "Tool_Pickaxe_Iron",
+            "Rock_Stone",
+            "Plant_Fruit_Apple",
+            "Ingredient_Dough",
+            "Furniture_Crude_Chest_Small",
+            "Bench_WorkBench",
+            "Weapon_Shortbow_Iron",
+            "Armor_Iron_Chest",
+            "Ingredient_Bar_Copper",
+            "Ingredient_Bar_Gold",
+            "Food_Bread",
+            "Potion_Health_Small",
+            "Tool_Hatchet_Iron",
+            "Weapon_Axe_Iron",
+        ];
+        let listed = [
+            "Ingredient_Bolt_Cindercloth",
+            "Ingredient_Hide_Heavy",
+            "Armor_Iron_Chest",
+            "Plant_Petals_Pink",
+            "Ingredient_Hide_Storm",
+            "Rubble_Marble",
+            "Furniture_Crude_Chest_Small",
+            "Rubble_Calcite",
+            "Ingredient_Hide_Medium",
+            "Food_Bread",
+            "Rubble_Aqua",
+            "Ingredient_Fabric_Scrap_Cindercloth",
+            "Deco_Book_Pile_Large",
+            "Ingredient_Fabric_Scrap_Linen",
+            "Ore_Adamantite",
+            "Rubble_Basalt",
+            "Ingredient_Dough",
+            "Bench_WorkBench",
+            "Ingredient_Bar_Copper",
+            "Ingredient_Feathers_Dark",
+            "Ingredient_Void_Essence",
+            "Rubble_Lime",
+            "Ingredient_Life_Essence",
+            "Food_Pie_Apple",
+            "Ingredient_Sac_Venom",
+            "Weapon_Sword_Iron",
+            "Ingredient_Hide_Light",
+            "Plant_Petals_Red",
+            "Container_Bucket",
+            "Tool_Hatchet_Iron",
+            "Plant_Petals_Purple",
+            "Ingredient_Fibre",
+            "Ore_Cobalt",
+            "Potion_Health",
+            "Ore_Mithril",
+            "Ingredient_Scraps",
+            "Potion_Health_Small",
+            "Ore_Thorium",
+            "Ingredient_Bolt_Wool",
+            "Ingredient_Tree_Sap",
+            "Deco_Tankard",
+            "Ingredient_Gadget_Assembly",
+            "Plant_Fruit_Apple",
+            "Rock_Stone_Cobble",
+            "Plant_Petals_Orange",
+            "Ingredient_Fabric_Scrap_Shadoweave",
+            "Ingredient_Bone_Fragment",
+            "Ore_Copper",
+            "Plant_Petals_Azure",
+            "Ingredient_Stick",
+            "Plant_Petals_Cyan",
+            "Food_Fish_Raw",
+            "Ingredient_Bolt_Linen",
+            "Ingredient_Bolt_Silk",
+            "Ingredient_Bar_Gold",
+            "Weapon_Axe_Iron",
+            "Plant_Petals_Blood",
+            "Plant_Petals_Blue",
+            "Plant_Petals_Green",
+            "Plant_Petals_White",
+            "Plant_Petals_Black",
+            "Food_Cheese",
+            "Ingredient_Powder_Boom",
+            "Plant_Petals_Storm",
+            "Ingredient_Bolt_Cotton",
+            "Rock_Stone",
+            "Plant_Petals_Yellow",
+            "Weapon_Shortbow_Iron",
+            "Tool_Pickaxe_Iron",
+            "Ingredient_Bar_Iron",
+            "Ore_Iron",
+        ];
+        let mut k = Known::default();
+        for i in learned {
+            k.learn(i);
+        }
+        assert_eq!(k.ids(), listed);
+        assert_eq!(Known::parse(&k.text()), k);
     }
 }
