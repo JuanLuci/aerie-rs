@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! aerie-server login [--profile NAME] [--account FILE]
+//! aerie-server fetch-game [--out DIR] [--patchline NAME] [--list] [--keep-package] [--account FILE]
 //! aerie-server [--bind 0.0.0.0:5520] [--password PW] [--name NAME] [--account FILE]
 //!              [--config FILE] [--motd TEXT] [--max-players N] [--max-view-radius N]
 //!              [--game-mode adventure|creative]
@@ -23,6 +24,7 @@ mod connected;
 mod crafting;
 mod effects;
 mod falling;
+mod fetch;
 mod gather;
 mod inventory;
 mod items;
@@ -97,6 +99,20 @@ async fn main() -> Result<()> {
             listen: arg(&args, "--listen").and_then(|s| s.parse().ok()),
         };
         return probe::run(upstream, capture, opts).await;
+    }
+
+    // Before the settings file: fetching the game needs none.
+    if args.first().map(String::as_str) == Some("fetch-game") {
+        return fetch::run(fetch::Options {
+            account: PathBuf::from(
+                arg(&args, "--account").unwrap_or_else(|| "aerie-account.json".into()),
+            ),
+            patchline: arg(&args, "--patchline"),
+            out: PathBuf::from(arg(&args, "--out").unwrap_or_else(|| "game".into())),
+            list: args.iter().any(|a| a == "--list"),
+            keep_package: args.iter().any(|a| a == "--keep-package"),
+        })
+        .await;
     }
 
     // The settings file (spec 25), then what the command line overrides.
@@ -280,6 +296,11 @@ async fn main() -> Result<()> {
         "item lifetimes: {}",
         lifetimes.lines().collect::<Vec<_>>().join("; ")
     );
+    let tools = extras
+        .iter()
+        .find(|(n, _)| n == "tools")
+        .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+        .unwrap_or_default();
     info!("{} items used up by interactions", consume.lines().count());
     let physics = extras
         .iter()
@@ -373,6 +394,7 @@ async fn main() -> Result<()> {
                 .with_effects(effect_book)
                 .with_consume(&consume)
                 .with_lifetimes(&lifetimes)
+                .with_tools(&tools)
                 .with_rules(rules)
                 .with_eye_height(eye_height);
             // Changed blocks are kept on disk (`--world DIR`, default `aerie-world`).
@@ -593,6 +615,11 @@ fn build_registries(assets: Option<String>, capture: Option<&[(u32, Vec<u8>)]>) 
     match registries::items::life_table(&ctx) {
         Ok(t) => extras.push((items::LIFE_TABLE.to_string(), t.into_bytes())),
         Err(e) => warn!("item lifetime table not built: {e}"),
+    }
+    // The editor tools players start with.
+    match registries::builder_tools::table(&ctx) {
+        Ok(t) => extras.push(("tools".to_string(), t.into_bytes())),
+        Err(e) => warn!("tools table not built: {e}"),
     }
     // Block support: drop types, physics drops, drop lists.
     match registries::physics::table(&ctx) {
