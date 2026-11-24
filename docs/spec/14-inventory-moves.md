@@ -166,10 +166,8 @@ the next tick sends it.
 If several tools menu assets exist, the official order between assets is
 its hash map order; Aerie sorts by asset name (the stock game has one).
 
-Moving onto or off the active hotbar slot with a different item runs the
-swap interaction first (the move is the same); core abilities leaving
-their slot take their line's supports along; nothing else is known to
-differ.
+Core abilities leaving their slot take their line's supports along;
+nothing else is known to differ.
 
 ## Checked against the official server
 
