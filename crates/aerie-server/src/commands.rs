@@ -835,7 +835,7 @@ fn tree() -> &'static Vec<Node> {
                 )
                 .req(
                     "statAmount",
-                    Ty::Double,
+                    Ty::Int,
                     "server.commands.player.stats.add.arg.statAmount",
                 )
                 .done()))
@@ -854,7 +854,7 @@ fn tree() -> &'static Vec<Node> {
                 )
                 .req(
                     "statValue",
-                    Ty::Double,
+                    Ty::Int,
                     "server.commands.player.stats.set.arg.statValue",
                 )
                 .done()))
