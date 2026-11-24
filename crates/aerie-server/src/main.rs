@@ -33,6 +33,7 @@ mod join;
 mod login;
 mod messages;
 mod perf;
+mod playerlist;
 mod probe;
 mod processing;
 mod proxy;

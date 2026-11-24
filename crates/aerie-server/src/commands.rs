@@ -1960,7 +1960,7 @@ mod tests {
         );
         assert_eq!(
             keys(handle("block set ~ 2 3 rock_stone --world=default", &W)),
-            ["run block set ~ 2 3 Rock_Stone --world=default"]
+            ["run block set ~ 2 3 Rock_Stone"]
         );
         assert_eq!(keys(handle("gm c", &W)), ["run gamemode c"]);
         assert_eq!(
