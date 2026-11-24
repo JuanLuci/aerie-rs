@@ -13,7 +13,7 @@ pub const UTILITY: i32 = -5;
 pub const BACKPACK: i32 = -9;
 pub const ABILITIES: i32 = -11;
 pub const RUNE_BAG: i32 = -12;
-/// Capacity of the tools section.
+/// The tools section (the editor tools, spec 14).
 pub const TOOLS: i32 = -8;
 /// The official `EVERYTHING` order (merging stacks into a slot).
 pub const EVERYTHING: [i32; 5] = [ARMOR, HOTBAR, UTILITY, STORAGE, BACKPACK];
