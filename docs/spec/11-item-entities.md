@@ -82,7 +82,42 @@ In this order, for each item:
    a short-lived copy of the item flies from the item to the player's
    position raised by a fifth of the eye height over 0.15 s (linear),
    then disappears.
-6. Despawn: past its lifetime the item is removed.
+6. Despawn: past its lifetime the item is removed (see "Lifetime").
+
+## Lifetime
+
+Every item entity gets a despawn time when it spawns: now plus its
+lifetime. The lifetime is, in order: the `Lifetime` of the item's own
+entity config (an item takes its quality's entity config when it names a
+quality, else its own `ItemEntity`, else its parent's); else the gameplay
+config's `ItemEntity.Lifetime` (600 s in the default config); else 120 s.
+No item in the game's assets sets its own value, so every dropped item
+lasts 600 s.
+
+A separate system checks the despawn time once per tick, for every entity
+that has one and is not interactable: when the world clock is strictly
+past it, the entity is removed. The clock is the world's game time, which
+advances by each tick's measured length, so the lifetime is counted in
+those lengths, not in a fixed 30 ticks per second.
+
+What restarts the lifetime (the despawn time becomes now plus the lifetime
+again, recomputed from the item's current stack):
+
+- merging: the item that takes others restarts once per stack it takes
+  from (so once per tick it merges in at least once, with the same
+  result); an item that only gives part of its stack away and stays (the
+  taker became full) restarts too;
+- a partial pickup (the player's inventory took some but not all): the
+  item keeps the rest with a fresh lifetime.
+
+Nothing else touches it: a pickup that takes nothing (full inventory), a
+stack changing for another reason, or a player standing next to the item
+does not reset it. A stack taken whole is removed by the pickup, not by
+the despawn.
+
+The removal is the usual one: the item's id in the `removed` list of
+`EntityUpdates`, in the tick the despawn check ran; no other packet is
+sent for it (no sound, no notification, no flying copy).
 
 ## What clients receive
 
@@ -116,3 +151,34 @@ bytes), sound (`PlaySoundEvent3D` 419, UI, at the item) and inventory in
 that order, and the flying copy (five steps of the same size, removed the
 tick after it arrives). Left over: one-tick shifts from the measured tick
 lengths, and network ids (Aerie numbers items from 1,000,000).
+
+### Lifetime, checked
+
+The four trunks of the same tree on both servers, left alone for eleven
+minutes (probe step list generated per server, `tools/diff/items.py`
+on both captures). The merged item (the first trunk, after it took the
+other three) was removed 600.018 s (official) and 600.026 s (Aerie) of
+summed `NetworkTick` lengths after the merge, not after the spawn (which
+would be 1.5 s more): the merge restarted the lifetime on both. The
+removal was one `EntityUpdates` with the item's id in `removed` and
+nothing else about it, in the tick the time ran out; same on both.
+
+## In Aerie
+
+`items.rs` keeps each item's remaining seconds; the world tick counts it
+down after pickup and removes the item at zero (a removal in that tick's
+`EntityUpdates`). The lifetime comes from the `LIFE` lines of a server
+table built from the assets: `LIFE * seconds` for the gameplay config's
+value, `LIFE item seconds` for an item (or its quality or parent) whose
+entity config sets one; without a gameplay value the lifetime is 120 s.
+It restarts on a merge (the taker, and the giver of a partial stack) and
+on a partial pickup, as listed above.
+
+## Not done yet
+
+- The per-item values are read but no shipped asset uses them, so they
+  are untested against the official server.
+- A partial pickup's restart was not run against the official server (it
+  needs a full-minus-one inventory and another eleven-minute run).
+- Entities that are interactable never despawn on the official server;
+  Aerie has no interactable item entities.

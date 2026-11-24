@@ -291,6 +291,8 @@ pub struct Hub {
     /// Items used up by an interaction: (item, interaction type) → (charge
     /// time, quantity change, Adventure only).
     consume: HashMap<(String, i32), (f32, i32, bool)>,
+    /// How long dropped items last (the `life` table).
+    lifetimes: crate::items::Lifetimes,
     /// The ground under the changes: the generator, or flat layers.
     ground: Mutex<Option<(Vec<i32>, Option<crate::terrain::Generator>)>>,
     /// Block support rules and drops (spec 10).
@@ -435,6 +437,12 @@ impl Hub {
 
     pub fn with_book(mut self, b: crate::crafting::Book) -> Self {
         self.book = b;
+        self
+    }
+
+    /// The `life` table (aerie-assets): `LIFE * seconds`, `LIFE item seconds`.
+    pub fn with_lifetimes(mut self, text: &str) -> Self {
+        self.lifetimes = crate::items::Lifetimes::parse(text);
         self
     }
 
@@ -1132,10 +1140,9 @@ impl Hub {
         }
     }
 
-    /// Seconds an item lies before it disappears (the default gameplay
-    /// config's `ItemEntity.Lifetime`).
-    fn item_life(&self, _item: &str) -> f32 {
-        600.0
+    /// Seconds an item lies before it disappears.
+    fn item_life(&self, item: &str) -> f32 {
+        self.lifetimes.of(item)
     }
 
     pub fn with_effects(mut self, b: crate::effects::Book) -> Self {
