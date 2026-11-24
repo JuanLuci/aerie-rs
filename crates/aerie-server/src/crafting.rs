@@ -265,6 +265,9 @@ struct ItemInfo {
     armor_slot: Option<i32>,
     usable: bool,
     weapon_or_tool: bool,
+    /// Where sorting puts it (spec 14): 0 weapon, 1 armor, 2 tool, 3 plain,
+    /// 4 builder tool.
+    sort_rank: u8,
     block_id: i32,
     ability: Option<crate::inventory::Ability>,
     /// `InteractionConfig.UseDistance` (adventure, creative).
@@ -386,6 +389,17 @@ impl Book {
                                     armor_slot: it.armor.as_ref().map(|a| a.armor_slot.0),
                                     usable: it.utility.as_ref().is_some_and(|u| u.usable),
                                     weapon_or_tool: it.weapon.is_some() || it.tool.is_some(),
+                                    sort_rank: if it.weapon.is_some() {
+                                        0
+                                    } else if it.armor.is_some() {
+                                        1
+                                    } else if it.tool.is_some() {
+                                        2
+                                    } else if it.builder_tool_data.is_some() {
+                                        4
+                                    } else {
+                                        3
+                                    },
                                     block_id: it.block_id,
                                     stat_mods: ItemStats {
                                         armor: it
@@ -557,6 +571,11 @@ impl Book {
 
     pub fn usable(&self, item: &str) -> bool {
         self.items.get(item).is_some_and(|i| i.usable)
+    }
+
+    /// Where sorting puts an item (spec 14); 3 for one Aerie does not know.
+    pub fn sort_rank(&self, item: &str) -> u8 {
+        self.items.get(item).map_or(3, |i| i.sort_rank)
     }
 
     pub fn weapon_or_tool(&self, item: &str) -> bool {

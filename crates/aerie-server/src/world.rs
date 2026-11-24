@@ -197,6 +197,9 @@ impl crate::processing::Items for ProcItems<'_> {
 }
 
 impl inventory::Items for ItemsView<'_> {
+    fn sort_key(&self, item: &str) -> (u8, String) {
+        (self.book.sort_rank(item), self.book.item_name(item))
+    }
     fn max_stack(&self, item: &str) -> i32 {
         self.book.max_stack(item)
     }
