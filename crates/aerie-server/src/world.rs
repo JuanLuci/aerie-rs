@@ -307,6 +307,8 @@ pub struct Hub {
     eye_height: f64,
     /// When the last world tick ran.
     last_tick: Mutex<Option<std::time::Instant>>,
+    /// Command lines waiting for the next tick (player, line without `/`).
+    commands: Mutex<Vec<(i32, String)>>,
     /// New players see the performance panel (`--perf-hud`).
     perf_hud: bool,
     /// New players start in creative (`--game-mode creative`; adventure by
@@ -4811,6 +4813,17 @@ impl Hub {
     }
 
     /// A `ChatMessage` from a player: a command, or a line for everyone.
+    /// Runs the command lines that arrived since the last tick, in order;
+    /// called at the start of a tick.
+    pub fn run_commands(&self) {
+        let lines = std::mem::take(&mut *self.commands.lock().unwrap());
+        for (id, line) in lines {
+            if let Err(e) = self.command(id, &line) {
+                warn!("command /{line} failed: {e:#}");
+            }
+        }
+    }
+
     pub fn chat(&self, id: i32, payload: &[u8]) -> Result<()> {
         let (m, _) = proto::ChatMessage::decode(payload, 0)?;
         let text = m.message.unwrap_or_default();
@@ -4827,8 +4840,11 @@ impl Hub {
         };
         match text.strip_prefix('/') {
             Some(cmd) => {
+                // As on the official server, a command runs in the world's
+                // tick: its changes go out with that tick's (spec 28).
                 info!("{name} ran /{cmd}");
-                self.command(id, cmd)
+                self.commands.lock().unwrap().push((id, cmd.to_owned()));
+                Ok(())
             }
             None => {
                 info!("[chat] <{name}> {text}");
@@ -5389,6 +5405,7 @@ mod tests {
         texts(&mut ra);
         texts(&mut rb);
         hub.chat(a, &chat("/who")).unwrap();
+        hub.run_commands();
         assert_eq!(texts(&mut ra).len(), 1);
         assert!(texts(&mut rb).is_empty());
     }
@@ -5398,15 +5415,19 @@ mod tests {
         let hub = Hub::default();
         let (a, mut ra) = hub.join("Ana", uuid::Uuid::from_u128(1));
         hub.chat(a, &chat("/tp ~ 10 ~")).unwrap();
+        hub.run_commands();
         assert_eq!(
             texts(&mut ra).last().unwrap(),
             "Usage: /tp <x> <y> <z> (numbers, or ~ for relative)"
         );
         hub.chat(a, &chat("/tp 1 2 3")).unwrap();
+        hub.run_commands();
         assert_eq!(texts(&mut ra), ["#109", "Teleported to 1.0 2.0 3.0"]);
         hub.chat(a, &chat("/tp ~5 ~ ~-1")).unwrap();
+        hub.run_commands();
         assert_eq!(texts(&mut ra), ["#109", "Teleported to 6.0 2.0 2.0"]);
         hub.chat(a, &chat("/pos")).unwrap();
+        hub.run_commands();
         assert_eq!(texts(&mut ra), ["You are at 6.0 2.0 2.0"]);
     }
 
@@ -5433,14 +5454,17 @@ mod tests {
         let (a, mut ra) = hub.join("Ana", uuid::Uuid::from_u128(1));
         texts(&mut ra);
         hub.chat(a, &chat("/setblock 1 2 3 Rock_Stone")).unwrap();
+        hub.run_commands();
         // The particle at once; the block at the end of the tick.
         assert_eq!(texts(&mut ra), ["#153", "Set 1 2 3 to Rock_Stone"]);
         hub.tick();
         // The block, the column's new height, then the network tick.
         assert_eq!(texts(&mut ra), ["#140", "#183", "#5"]);
         hub.chat(a, &chat("/setblock 1 2 3 Nope")).unwrap();
+        hub.run_commands();
         assert_eq!(texts(&mut ra), ["No block Nope; try /blocks <name>"]);
         hub.chat(a, &chat("/fill 0 0 0 1 1 0 7")).unwrap();
+        hub.run_commands();
         assert_eq!(texts(&mut ra).last().unwrap(), "Filled 4 blocks with 7");
         hub.tick();
         // Four changes in one section and tick: one ServerSetBlocks.
@@ -5448,6 +5472,7 @@ mod tests {
         // Later joiners get them in their chunks.
         assert_eq!(hub.changes_in(0, 0, 0).len(), 5);
         hub.chat(a, &chat("/fill 0 0 0 100 100 100 7")).unwrap();
+        hub.run_commands();
         assert!(texts(&mut ra).last().unwrap().contains("too many"));
     }
 
@@ -6574,6 +6599,7 @@ impl Hub {
     /// before it, then the block and height changes of the tick go out.
     pub fn tick(&self) {
         let now = std::time::Instant::now();
+        self.run_commands();
         let dt = match self.last_tick.lock().unwrap().replace(now) {
             Some(t) => (now - t).as_secs_f32(),
             None => crate::items::DT,

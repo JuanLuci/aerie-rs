@@ -84,6 +84,16 @@ each with tag, type and description) and argument types with examples.
 Buttons carry events (`Command`, `Subcommand`, `Variant`, `NavigateUp`,
 `SendToChat`, `@SearchQuery`) the client sends back to change the page.
 
+## When a command runs
+
+A world command runs on the world's thread during a tick: it makes its
+changes and sends its reply there, and its block changes go out with that
+tick's others, as their own packets. Something that changes the same
+section in a later tick (a door used right after the reply) comes in a
+packet of its own. Aerie queues the command lines it receives and runs
+them at the start of the next tick, then flushes their changes at that
+tick's end (issue #70).
+
 ## In Aerie
 
 `commands.rs` holds the tree for the commands Aerie knows: `block` (all its
