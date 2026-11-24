@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::inventory::{self, Inventory, Stack};
+use crate::messages::Msg;
 
 /// Packet ids used here (gen/packets.tsv).
 pub mod id {
@@ -823,23 +824,11 @@ impl Hub {
     /// An item just broke: the chat line and the sound its owner gets.
     fn tell_broken(&self, player: i32, st: &Stack, out: &mut Outgoing) {
         {
-            let name = proto::FormattedMessage {
-                message_id: Some(self.book.item_name(&st.item)),
-                ..Default::default()
-            };
-            let msg = proto::FormattedMessage {
-                message_id: Some("server.general.repair.itemBroken".into()),
-                message_params: Some(vec![("itemName".into(), name)]),
-                color: Some("#ff5555".into()),
-                ..Default::default()
-            };
-            if let Ok(p) = packet(
-                id::SERVER_MESSAGE,
-                &proto::ServerMessage {
-                    r#type: proto::ChatType::CHAT,
-                    message: Some(msg),
-                },
-            ) {
+            if let Ok(p) = Msg::key("server.general.repair.itemBroken")
+                .msg("itemName", Msg::key(&self.book.item_name(&st.item)))
+                .color("#ff5555")
+                .packet()
+            {
                 out.to.push((player, p));
             }
             let s = self.book.sound("SFX_Item_Break");
@@ -1349,31 +1338,12 @@ impl Hub {
     /// settomax; the reply is the official message.
     fn stats_command(&self, id: i32, args: &[&str]) -> Result<()> {
         let reply = |key: &str, name: &str, value: Option<f32>| -> Result<Packet> {
-            let mut params = vec![(
-                "name".to_owned(),
-                proto::ParamValue::StringParamValue(Box::new(proto::StringParamValue {
-                    value: Some(name.to_owned()),
-                })),
-            )];
-            if let Some(v) = value {
-                params.push((
-                    "value".to_owned(),
-                    proto::ParamValue::DoubleParamValue(Box::new(proto::DoubleParamValue {
-                        value: v as f64,
-                    })),
-                ));
+            let m = Msg::key(key).text("name", name);
+            match value {
+                Some(v) => m.double("value", v as f64),
+                None => m,
             }
-            packet(
-                id::SERVER_MESSAGE,
-                &proto::ServerMessage {
-                    r#type: proto::ChatType::CHAT,
-                    message: Some(proto::FormattedMessage {
-                        message_id: Some(key.to_owned()),
-                        params: Some(params),
-                        ..Default::default()
-                    }),
-                },
-            )
+            .packet()
         };
         let (op, name, amount) = match args {
             [op, name] => (*op, *name, None),
@@ -4379,16 +4349,7 @@ impl Hub {
 
     /// A chat line from a translation key (`server.modules.interaction.*`).
     fn tell_key(&self, pid: i32, key: &str, out: &mut Outgoing) {
-        if let Ok(p) = packet(
-            id::SERVER_MESSAGE,
-            &proto::ServerMessage {
-                r#type: proto::ChatType::CHAT,
-                message: Some(proto::FormattedMessage {
-                    message_id: Some(key.to_owned()),
-                    ..Default::default()
-                }),
-            },
-        ) {
+        if let Ok(p) = Msg::key(key).packet() {
             out.to.push((pid, p));
         }
     }
@@ -4789,48 +4750,15 @@ impl Hub {
                     e.inv_dirty.extend(changed);
                     left
                 };
-                let name = proto::FormattedMessage {
-                    message_id: Some(self.book.item_name(&key)),
-                    ..Default::default()
-                };
-                let int = |v: i32| {
-                    proto::ParamValue::IntParamValue(Box::new(proto::IntParamValue { value: v }))
-                };
+                let name = Msg::key(&self.book.item_name(&key));
                 let msg = if left > 0 {
-                    proto::FormattedMessage {
-                        message_id: Some("server.commands.give.insufficientInvSpace".into()),
-                        params: Some(vec![("quantity".into(), int(qty))]),
-                        message_params: Some(vec![("item".into(), name)]),
-                        ..Default::default()
-                    }
+                    Msg::key("server.commands.give.insufficientInvSpace").int("quantity", qty)
                 } else {
-                    proto::FormattedMessage {
-                        message_id: Some("server.commands.give.gave".into()),
-                        params: Some(vec![
-                            (
-                                "targetUsername".into(),
-                                proto::ParamValue::StringParamValue(Box::new(
-                                    proto::StringParamValue {
-                                        value: Some((*who).to_owned()),
-                                    },
-                                )),
-                            ),
-                            ("quantity".into(), int(qty)),
-                        ]),
-                        message_params: Some(vec![("item".into(), name)]),
-                        ..Default::default()
-                    }
+                    Msg::key("server.commands.give.gave")
+                        .text("targetUsername", who)
+                        .int("quantity", qty)
                 };
-                self.send(
-                    id,
-                    packet(
-                        id::SERVER_MESSAGE,
-                        &proto::ServerMessage {
-                            r#type: proto::ChatType::CHAT,
-                            message: Some(msg),
-                        },
-                    )?,
-                );
+                self.send(id, msg.msg("item", name).packet()?);
             }
             ("give", [item, rest @ ..]) => {
                 let qty = rest.first().and_then(|q| q.parse().ok()).unwrap_or(100);
@@ -5010,16 +4938,7 @@ fn player_list_add(players: Vec<proto::ServerPlayerListPlayer>) -> Result<Packet
 
 /// A plain chat line.
 pub fn server_message(text: &str) -> Result<Packet> {
-    packet(
-        id::SERVER_MESSAGE,
-        &proto::ServerMessage {
-            r#type: proto::ChatType::CHAT,
-            message: Some(proto::FormattedMessage {
-                raw_text: Some(text.to_owned()),
-                ..Default::default()
-            }),
-        },
-    )
+    Msg::raw(text).packet()
 }
 
 /// A dropped item's entity: where it lies and what it is.
