@@ -194,6 +194,13 @@ as the chain data's target slot); when its change-active-slot step runs,
 the move is made, the whole inventory is sent, and the "swap to" fork it
 makes is not predicted.
 
+Either end of the move can be a slot of the window the player has open (a
+chest's, a bench's): taking a different item from a chest straight onto
+the active slot starts the same chain. Only an empty destination, or one
+holding the same kind of item, makes the move at once. A move into the
+utility section from elsewhere makes that slot the active utility slot
+right away, even while the move itself waits for the swap chain.
+
 ## Rules between chains
 
 A new root is compared with every running chain (and their forks when
@@ -418,6 +425,8 @@ on both servers, same answers:
   cancel and slot correction;
 - another kind of item moved onto the active slot: the same server chain
   (id −1), the inventory sent whole before it and the hotbar after.
+- the same from an open chest's slot onto the active slot (issue #38): the
+  same chain, inventories, window update and packet order after it.
 
 At join the three active slots (hotbar, utility, tools) are sent after
 the inventory, as the official server does.
