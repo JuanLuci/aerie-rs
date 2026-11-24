@@ -561,7 +561,12 @@ impl Inventory {
         self.set(from.0, from.1, Some(before.with_n(before.n - n)));
         let rest = self.add_to(items, order, &moved);
         if rest == n {
+            // Nothing went in: put the slot back as it was, unsent.
+            if let Some(v) = self.section(from.0) {
+                v[from.1 as usize] = Some(before);
+            }
             self.unmark(m);
+            return Some(rest);
         }
         if rest > 0 {
             let back = self.get(from.0, from.1).map_or(0, |s| s.n) + rest;
@@ -826,7 +831,10 @@ impl Inventory {
                 }
             }
         }
-        if set_any && let Some(t) = self.touched.as_mut() {
+        // The storage is marked changed by its sort even when it is empty.
+        if (set_any || sec == STORAGE)
+            && let Some(t) = self.touched.as_mut()
+        {
             t.push(sec);
         }
     }
