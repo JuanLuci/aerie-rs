@@ -457,7 +457,6 @@ mod tests {
         }
     }
 
-    /// The official trunk drop of spec 11: positions tick by tick.
     #[test]
     fn lifetimes_fall_back_to_the_config_then_to_120() {
         assert_eq!(Lifetimes::default().of("A"), 120.0);
@@ -466,6 +465,7 @@ mod tests {
         assert_eq!(l.of("Short"), 5.0);
     }
 
+    /// The official trunk drop of spec 11: positions tick by tick.
     #[test]
     fn rises_and_falls_like_the_capture() {
         let w = Ground(129);
