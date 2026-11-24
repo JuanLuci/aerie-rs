@@ -23,6 +23,7 @@ pub mod id {
     pub const SERVER_SET_BLOCK: u32 = 140;
     pub const CHAT_MESSAGE: u32 = 211;
     pub const CUSTOM_HUD: u32 = 217;
+    pub const CUSTOM_PAGE: u32 = 218;
     pub const SYNC_INTERACTION_CHAINS: u32 = 290;
     pub const CANCEL_INTERACTION_CHAIN: u32 = 291;
     pub const PLAY_INTERACTION_FOR: u32 = 292;
@@ -3724,19 +3725,6 @@ impl Hub {
         Ok(())
     }
 
-    /// Block keys containing `part`, sorted.
-    pub fn find_blocks(&self, part: &str) -> Vec<String> {
-        let part = part.to_lowercase();
-        let mut v: Vec<String> = self
-            .blocks
-            .keys()
-            .filter(|k| k.contains(&part))
-            .cloned()
-            .collect();
-        v.sort();
-        v
-    }
-
     /// Changes one block for everyone, now and for later joiners.
     pub fn set_block(&self, x: i32, y: i32, z: i32, block: i32) -> Result<()> {
         self.world_step(|hub, g, ground, out| {
@@ -4664,16 +4652,31 @@ impl Hub {
     }
 
     fn command(&self, id: i32, line: &str) -> Result<()> {
+        // Words, types and counts are checked by `commands`; what reaches
+        // the match below is a valid line (or one of Aerie's own commands).
+        let line = match crate::commands::handle(line, self) {
+            crate::commands::Outcome::Replies(v) => {
+                for m in v {
+                    self.tell_msg(id, m);
+                }
+                return Ok(());
+            }
+            crate::commands::Outcome::Page(p) => {
+                self.send(id, packet(id::CUSTOM_PAGE, &p)?);
+                return Ok(());
+            }
+            crate::commands::Outcome::Unavailable => {
+                self.tell(id, "That form of the command is not available in Aerie yet");
+                return Ok(());
+            }
+            crate::commands::Outcome::Run(l) => l,
+            crate::commands::Outcome::Other => line.to_owned(),
+        };
+        let line = line.as_str();
         let mut words = line.split_whitespace();
         let name = words.next().unwrap_or("");
         let args: Vec<&str> = words.collect();
         match (name, args.as_slice()) {
-            ("help", _) => self.tell(
-                id,
-                "Commands: /help, /list, /pos, /tp <x> <y> <z>, /gamemode <creative|adventure>, \
-                 /setblock <x> <y> <z> <block>, /fill <x1> <y1> <z1> <x2> <y2> <z2> <block>, \
-                 /blocks <part of a name>, /give <item> [amount], /clear, /perf",
-            ),
             ("perf", _) => {
                 let on = self.toggle_perf(id);
                 self.tell(
@@ -4780,50 +4783,14 @@ impl Hub {
                 let name = Msg::key(&self.book.item_name(&key));
                 let msg = if left > 0 {
                     Msg::key("server.commands.give.insufficientInvSpace").int("quantity", qty)
+                } else if own {
+                    Msg::key("server.commands.give.received").int("quantity", qty)
                 } else {
                     Msg::key("server.commands.give.gave")
                         .text("targetUsername", who)
                         .int("quantity", qty)
                 };
                 self.send(id, msg.msg("item", name).packet()?);
-            }
-            ("give", [item, rest @ ..]) => {
-                let qty = rest.first().and_then(|q| q.parse().ok()).unwrap_or(100);
-                // Block keys are matched case-insensitively; anything else is
-                // sent as typed (items that are not blocks).
-                let key = self
-                    .names
-                    .get(&item.to_lowercase())
-                    .cloned()
-                    .unwrap_or_else(|| item.to_string());
-                if !self.book.known(&key) {
-                    self.tell(id, &format!("No item is called {item}"));
-                    return Ok(());
-                }
-                let slot = self.give(id, &key, qty)?;
-                self.tell(id, &format!("Gave {qty} {key} (hotbar slot {})", slot + 1));
-            }
-            ("blocks", [part]) => {
-                let found = self.find_blocks(part);
-                if found.is_empty() {
-                    self.tell(id, &format!("No block matches {part}"));
-                    return Ok(());
-                }
-                let shown: Vec<&str> = found.iter().take(15).map(String::as_str).collect();
-                let more = found.len().saturating_sub(shown.len());
-                self.tell(
-                    id,
-                    &format!(
-                        "{} blocks: {}{}",
-                        found.len(),
-                        shown.join(", "),
-                        if more > 0 {
-                            format!(" and {more} more")
-                        } else {
-                            String::new()
-                        }
-                    ),
-                );
             }
             ("setblock", [x, y, z, block]) => {
                 let here = self.position(id);
@@ -4861,10 +4828,6 @@ impl Hub {
                     (_, _, None) => self.tell(id, &format!("No block {block}; try /blocks <name>")),
                     _ => self.tell(id, "Usage: /fill <x1> <y1> <z1> <x2> <y2> <z2> <block>"),
                 }
-            }
-            ("list", _) => {
-                let names = self.names();
-                self.tell(id, &format!("{} online: {}", names.len(), names.join(", ")));
             }
             ("pos", _) => match self.position(id) {
                 Some(p) => self.tell(id, &format!("You are at {:.1} {:.1} {:.1}", p.x, p.y, p.z)),
@@ -4942,6 +4905,60 @@ impl Hub {
             _ => self.tell(id, &format!("Unknown command /{name}; try /help")),
         }
         Ok(())
+    }
+}
+
+impl crate::commands::Env for Hub {
+    fn players(&self) -> Vec<String> {
+        self.names()
+    }
+
+    fn block_key(&self, name: &str) -> Option<String> {
+        if self.keys_by_id.is_empty() {
+            return Some(name.to_owned());
+        }
+        if name.eq_ignore_ascii_case("empty") {
+            return Some("Empty".to_owned());
+        }
+        self.names.get(&name.to_lowercase()).cloned().or_else(|| {
+            let l = name.to_lowercase();
+            self.blocks.contains_key(&l).then(|| name.to_owned())
+        })
+    }
+
+    fn item_key(&self, name: &str) -> Option<String> {
+        let key = self
+            .names
+            .get(&name.to_lowercase())
+            .cloned()
+            .unwrap_or_else(|| name.to_owned());
+        self.book.known(&key).then_some(key)
+    }
+
+    fn stat_key(&self, name: &str) -> Option<String> {
+        self.stat_types
+            .types
+            .iter()
+            .find(|t| t.key.eq_ignore_ascii_case(name))
+            .map(|t| t.key.clone())
+    }
+
+    fn block_keys(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.keys_by_id.values().cloned().collect();
+        v.sort();
+        v
+    }
+
+    fn item_keys(&self) -> Vec<String> {
+        self.book.item_keys()
+    }
+
+    fn stat_keys(&self) -> Vec<String> {
+        self.stat_types
+            .types
+            .iter()
+            .map(|t| t.key.clone())
+            .collect()
     }
 }
 
@@ -5172,8 +5189,8 @@ mod tests {
         let (_b, mut rb) = hub.join("Bia", uuid::Uuid::from_u128(2));
         texts(&mut ra);
         texts(&mut rb);
-        hub.chat(a, &chat("/list")).unwrap();
-        assert_eq!(texts(&mut ra), ["2 online: Ana, Bia"]);
+        hub.chat(a, &chat("/who")).unwrap();
+        assert_eq!(texts(&mut ra).len(), 1);
         assert!(texts(&mut rb).is_empty());
     }
 
