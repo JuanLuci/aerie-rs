@@ -56,3 +56,42 @@ client                                  server
 
 The server pings about every 5 s; the probe answers with a `Pong` (4) copying
 the ping's id and time.
+
+## Client features and tags
+
+Four built-in movement abilities (crouch slide, mantling, safety roll and
+sprint force) have no settings of their own to send. Each one only switches
+on a client feature when the server starts. Three of them (crouch slide,
+mantling, safety roll) also register the client tag `Allows=Movement`;
+sprint force registers no tag. Registering the same tag again changes
+nothing.
+
+- **Features.** The world keeps one on/off flag per client feature, all on
+  from the start: the five features are split velocity, mantling, sprint
+  force, crouch slide and safety roll, numbered 0 to 4. Every join gets
+  `UpdateFeatures` (31) listing all five as on, in number order. It comes
+  right after `SetTimeDilation` and before `UpdateSunSettings`, after
+  `SetClientId`.
+- **Tags.** Before `JoinWorld`, after the player list and `VoiceConfig` and
+  before `UpdateClientRuleVolumes`, the server sends `ServerTags` (34) with
+  every client tag it knows. There is exactly one, `Allows=Movement`, with
+  index 0 (the first tag registered, before any asset tag).
+- A feature or tag registered while players are online is sent to them at
+  once (a new `UpdateFeatures`, or `ServerTags` with the full list). Nothing
+  does that after start-up, so a normal join never sees it.
+
+### In Aerie
+
+Aerie sends the same `UpdateFeatures` at the same place, and now sends
+`ServerTags` with the one tag before `JoinWorld`. When setup is replayed from
+a capture, the capture's own packets are used instead. Aerie does not yet
+send `CommandTreeSync`, `AddToServerPlayerList`, `VoiceConfig` or
+`UpdateClientRuleVolumes`, so `ServerTags` is the first packet before
+`JoinWorld` instead of the fourth.
+
+### Checked against the official server
+
+A probe joined both servers; `ServerTags` and `UpdateFeatures` are
+byte-identical, and the packets around them (`JoinWorld`, `SetTimeDilation`,
+`UpdateSunSettings`) follow in the same order. Live registration of features
+after start-up is not done and not compared.
