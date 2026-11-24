@@ -5,7 +5,8 @@
 //! aerie-server [--bind 0.0.0.0:5520] [--password PW] [--name NAME] [--account FILE]
 //!              [--config FILE] [--motd TEXT] [--max-players N] [--max-view-radius N]
 //!              [--game-mode adventure|creative]
-//! aerie-server probe --upstream ADDR [--capture DIR] [--name NAME] [--chat "line;/command"]
+//! aerie-server probe --upstream ADDR [--capture DIR] [--name NAME] [--script FILE] [--steps "step;step"]
+//!              [--chat "line;/command"] (docs/probe.md has every option)
 //! aerie-server [...] --replay-setup DIR --captured-registries all|40-60,66|!66
 //! aerie-server check [--assets ZIP] [--replay-setup DIR]   (registries the client would refuse)
 //! aerie-server proxy --bind 0.0.0.0:5520 --upstream 127.0.0.1:5521 [--capture DIR]
@@ -78,6 +79,8 @@ async fn main() -> Result<()> {
             .parse()?;
         let capture = PathBuf::from(arg(&args, "--capture").unwrap_or_else(|| "probe".into()));
         let opts = probe::Options {
+            script: arg(&args, "--script").map(PathBuf::from),
+            steps: arg(&args, "--steps"),
             name: arg(&args, "--name"),
             chat: arg(&args, "--chat"),
             send: arg(&args, "--send"),
