@@ -31,6 +31,7 @@ pub mod id {
     pub const DROP_ITEM_STACK: u32 = 174;
     pub const MOVE_ITEM_STACK: u32 = 175;
     pub const SMART_MOVE_ITEM_STACK: u32 = 176;
+    pub const INVENTORY_ACTION: u32 = 179;
     pub const SET_CREATIVE_ITEM: u32 = 171;
     pub const SMART_GIVE_CREATIVE_ITEM: u32 = 173;
     pub const SET_ACTIVE_SLOT: u32 = 177;
@@ -196,6 +197,9 @@ impl crate::processing::Items for ProcItems<'_> {
 }
 
 impl inventory::Items for ItemsView<'_> {
+    fn sort_key(&self, item: &str) -> (u8, String) {
+        (self.book.sort_rank(item), self.book.item_name(item))
+    }
     fn max_stack(&self, item: &str) -> i32 {
         self.book.max_stack(item)
     }
@@ -259,6 +263,11 @@ impl inventory::Items for ItemsView<'_> {
     }
     fn window_remove(&self, slot: i32) -> bool {
         self.container || self.processing.is_some() || slot == 0
+    }
+    fn output_start(&self) -> i32 {
+        self.processing.map_or(0, |(cfg, _)| {
+            cfg.fuel.as_ref().map_or(0, Vec::len) as i32 + cfg.inputs(1).len() as i32
+        })
     }
 }
 
@@ -1718,6 +1727,18 @@ impl Hub {
                         (m.from_section_id, m.from_slot_id),
                         m.quantity,
                         m.move_type.0,
+                    );
+                });
+            }
+            self::id::INVENTORY_ACTION => {
+                let (m, _) = proto::InventoryAction::decode(payload, 0)?;
+                self.inventory_move(id, |inv, items, prefs, window| {
+                    inv.action(
+                        items,
+                        prefs,
+                        window,
+                        m.inventory_section_id,
+                        m.inventory_action_type.0 as i32,
                     );
                 });
             }

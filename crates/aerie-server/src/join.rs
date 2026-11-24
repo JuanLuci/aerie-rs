@@ -1178,6 +1178,7 @@ fn client_packet(f: &Frame, hub: &Hub, client_id: i32, ready: &mut Ready, seen: 
         world::id::CHAT_MESSAGE => Some(hub.chat(client_id, &f.payload)),
         world::id::MOVE_ITEM_STACK
         | world::id::SMART_MOVE_ITEM_STACK
+        | world::id::INVENTORY_ACTION
         | world::id::DROP_ITEM_STACK
         | world::id::DROP_CREATIVE_ITEM => Some(hub.inventory_action(client_id, f.id, &f.payload)),
         world::id::CLIENT_OPEN_WINDOW => Some(hub.client_open_window(client_id, &f.payload)),

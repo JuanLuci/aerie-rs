@@ -82,18 +82,83 @@ Every section a successful move set is sent at the end of the tick, even
 when its content did not change (a slot moved onto itself, a stack that
 went back where it was).
 
+## Inventory actions (`InventoryAction`)
+
+One packet: a section id, an action (take all, put all, quick stack,
+sort) and a data byte the official server ignores. Only section ids of 0
+or more (an open window's id; 0 is the storage, and only for sort) or the
+backpack are looked at; the others do nothing. A window action does
+nothing unless that window is open and holds items (a container, a
+processing bench or a structural bench).
+
+- **Take all**: every stack of the section, slot by slot from the first,
+  goes to the pickup sections of its kind (hotbar, storage, backpack in the
+  order the player's preferences give), as a move of the whole quantity:
+  onto stacks it stacks with first, then empty slots; what does not fit
+  stays where it was. A processing bench only gives its output slots (not
+  fuel or input); other windows give every slot that may give.
+- **Put all**: every stack of the storage (not the hotbar), slot by slot,
+  goes into the section, with the section's filters; what does not fit
+  stays.
+- **Quick stack**: every stack of the hotbar, then of the storage, slot by
+  slot, goes into the section, but only a stack of a kind the section
+  already holds (the check is made slot by slot, as the section fills);
+  it goes onto stacks it stacks with first, then into empty slots of the
+  section.
+- **Sort** (storage, backpack or an open window's section): stacks of the
+  same kind are first merged, in slot order, each up to its max stack
+  (items with a max of 1 never merge); the stacks are then ordered by
+  kind (weapon, armor, tool, plain item, builder tool), then by the item's
+  name key compared as text (character code units); stacks tied keep
+  their order. They are laid out from the first slot; slots that cannot
+  give their stack, or cannot take the next one, are skipped. Any
+  non-empty section is sent afterwards, even when the order did not
+  change.
+
+The answers are the ones of a move: the sections of
+`UpdatePlayerInventory` that report a change at the end of the tick, then
+the window's update when the window's container changed. Which sections
+report a change is not only which slots changed:
+
+- **Take all**: a stack that goes into an empty slot of the pickup
+  sections reports a change of all of them (the hotbar and the storage,
+  even when only the hotbar changed); a stack that only joins existing
+  stacks reports the sections it changed.
+- **Put all** (a single source, the storage): the storage reports a
+  change when it had no stack to try or any move worked, so a put all
+  with an empty storage still sends the storage (with no window update:
+  the window's container did not change); not when stacks were there but
+  none fitted.
+- **Quick stack** (the hotbar and storage as one source): only the
+  sections a stack was taken from report a change; with nothing to move
+  nothing is sent.
+- **Sort**: the storage and an open window's section are sent even when
+  empty.
+
 ## Not done yet
 
 Moving onto or off the active hotbar slot with a different item runs the
 swap interaction first (the move is the same); core abilities leaving
-their slot take their line's supports along; `InventoryAction` (sort, take
-all, put all, quick stack).
+their slot take their line's supports along; nothing else is known to
+differ.
 
 ## Checked against the official server
 
 The same moves sent to both servers (stacks split into storage, moved onto
 themselves, double clicks, shift clicks both ways, a move to the backpack)
 give the same inventories and the same inventory packets.
+
+Inventory actions without a window, on both servers with the same items
+and the same packets: sorting the storage (merging, kinds, name order,
+an empty storage, a storage whose order does not change: the packet is
+sent each time), and the backpack, and the ignored cases (a window that is
+not open, the hotbar or storage as the section of a take, put or stack,
+other action types) give the same
+inventory packets. With a small chest open (window 1) the same
+actions give the same inventory packets and window updates on both
+servers, in the same order: quick stack, sort, take all, put all (empty
+storage and moving items), quick stack with nothing matching, take all
+joining stacks and filling empty slots, and sorting an empty chest.
 
 ## Kept between sessions
 
