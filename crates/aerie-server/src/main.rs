@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! aerie-server login [--profile NAME] [--account FILE]
+//! aerie-server fetch-game [--out DIR] [--patchline NAME] [--list] [--keep-package] [--account FILE]
 //! aerie-server [--bind 0.0.0.0:5520] [--password PW] [--name NAME] [--account FILE]
 //!              [--config FILE] [--motd TEXT] [--max-players N] [--max-view-radius N]
 //!              [--game-mode adventure|creative]
@@ -23,6 +24,7 @@ mod connected;
 mod crafting;
 mod effects;
 mod falling;
+mod fetch;
 mod gather;
 mod inventory;
 mod items;
@@ -97,6 +99,20 @@ async fn main() -> Result<()> {
             listen: arg(&args, "--listen").and_then(|s| s.parse().ok()),
         };
         return probe::run(upstream, capture, opts).await;
+    }
+
+    // Before the settings file: fetching the game needs none.
+    if args.first().map(String::as_str) == Some("fetch-game") {
+        return fetch::run(fetch::Options {
+            account: PathBuf::from(
+                arg(&args, "--account").unwrap_or_else(|| "aerie-account.json".into()),
+            ),
+            patchline: arg(&args, "--patchline"),
+            out: PathBuf::from(arg(&args, "--out").unwrap_or_else(|| "game".into())),
+            list: args.iter().any(|a| a == "--list"),
+            keep_package: args.iter().any(|a| a == "--keep-package"),
+        })
+        .await;
     }
 
     // The settings file (spec 25), then what the command line overrides.
