@@ -372,11 +372,29 @@ pub async fn run(upstream: SocketAddr, capture: PathBuf, opts: Options) -> Resul
                 }
             }
             3 if f.payload.len() >= 16 => {
-                // Answer pings: same id and time, type Raw, empty queue.
-                let mut pong = f.payload[..16].to_vec();
-                pong.push(0);
-                pong.extend_from_slice(&0i16.to_le_bytes());
-                frame::encode(4, &pong, &mut wire)?;
+                // Answer a ping as a client does, once per kind: raw as it
+                // arrives, direct when the game reads it, tick at the next
+                // game tick (a recorded client: direct 10 to 20 ms after
+                // raw, tick 50 to 140 ms after). A server measures each
+                // kind from its own send time and expects every kind for
+                // every ping, in order.
+                let pong = |kind: u8| -> Result<Vec<u8>> {
+                    let mut p = f.payload[..16].to_vec();
+                    p.push(kind);
+                    p.extend_from_slice(&0i16.to_le_bytes());
+                    let mut w = Vec::new();
+                    frame::encode(4, &p, &mut w)?;
+                    Ok(w)
+                };
+                wire.extend(pong(0)?);
+                let (direct, tick) = (pong(1)?, pong(2)?);
+                let tx = out_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                    let _ = tx.send(direct);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let _ = tx.send(tick);
+                });
             }
             104 => {
                 // JoinWorld: ready for chunks now, ready for gameplay a
