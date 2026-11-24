@@ -155,8 +155,33 @@ async fn main() -> Result<()> {
     let replay = arg(&args, "--replay-setup")
         .map(|d| login::load_capture(std::path::Path::new(&d)))
         .transpose()?;
-    let (mut registries, blocks, block_names, extras) =
+    let (mut registries, blocks, block_names, mut extras) =
         build_registries_cached(arg(&args, "--assets"), replay.as_deref(), use_cache)?;
+    // The world's gameplay configuration (the official world setting
+    // `GameplayConfig`): the default one unless `--gameplay NAME`.
+    let gameplay = arg(&args, "--gameplay");
+    if let Some(name) = &gameplay {
+        let mut found = false;
+        for base in [
+            join::WORLD_GAMEPLAY,
+            join::TIME_SETTINGS,
+            join::MOVEMENT_SETTINGS,
+        ] {
+            let key = format!("{base}:{name}");
+            if let Some(b) = extras
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(&key))
+                .map(|(_, b)| b.clone())
+            {
+                extras.retain(|(n, _)| n != base);
+                extras.push((base.to_string(), b));
+                found = true;
+            }
+        }
+        if !found {
+            anyhow::bail!("--gameplay {name}: no such gameplay configuration");
+        }
+    }
     let player = join::PlayerParts::new(&registries, &extras);
     if let Some(which) = arg(&args, "--captured-registries") {
         let capture = replay
@@ -380,7 +405,8 @@ async fn main() -> Result<()> {
                 .iter()
                 .find(|(n, _)| n == gather::TABLE)
                 .map(|(_, b)| gather::Table::parse(&String::from_utf8_lossy(b)))
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .for_gameplay(gameplay.as_deref().unwrap_or("Default"));
             let hub = world::Hub::with_names(blocks, block_names)
                 .with_gather(gather)
                 .with_perf_hud(args.iter().any(|a| a == "--perf-hud"))
@@ -649,34 +675,50 @@ fn build_registries(assets: Option<String>, capture: Option<&[(u32, Vec<u8>)]>) 
         Ok(t) => extras.push((crate::crafting::BENCHES.to_string(), t.into_bytes())),
         Err(e) => warn!("bench table not built: {e}"),
     }
-    // World settings for the built world, from the gameplay configuration.
-    match registries::world_config::config(&ctx) {
-        Ok(g) => {
-            let mut b = Vec::new();
-            aerie_protocol::wire::Wire::encode(
-                &registries::world_config::gameplay(&ctx, &g),
-                &mut b,
-            )?;
-            extras.push((join::WORLD_GAMEPLAY.to_string(), b));
-            let mut b = Vec::new();
-            aerie_protocol::wire::Wire::encode(&registries::world_config::time(&g), &mut b)?;
-            extras.push((join::TIME_SETTINGS.to_string(), b));
-            match registries::world_config::movement(&ctx, &g, true) {
-                Ok(Some(m)) => {
-                    let mut b = Vec::new();
-                    aerie_protocol::wire::Wire::encode(
-                        &aerie_protocol::proto::UpdateMovementSettings {
-                            movement_settings: m,
-                        },
-                        &mut b,
-                    )?;
-                    extras.push((join::MOVEMENT_SETTINGS.to_string(), b));
+    // World settings for the built world, from the gameplay configuration:
+    // the default one, and each named one (`world_gameplay_config:NAME`,
+    // for a world set to another configuration, `--gameplay NAME`).
+    let mut configs: Vec<(String, Option<String>)> = vec![(String::new(), None)];
+    for n in registries::world_config::names(&ctx).unwrap_or_default() {
+        configs.push((format!(":{n}"), Some(n)));
+    }
+    for (suffix, name) in configs {
+        let g = match &name {
+            None => registries::world_config::config(&ctx),
+            Some(n) => registries::world_config::config_named(&ctx, n),
+        };
+        match g {
+            Ok(g) => {
+                let mut b = Vec::new();
+                aerie_protocol::wire::Wire::encode(
+                    &registries::world_config::gameplay(&ctx, &g),
+                    &mut b,
+                )?;
+                extras.push((format!("{}{suffix}", join::WORLD_GAMEPLAY), b));
+                let mut b = Vec::new();
+                aerie_protocol::wire::Wire::encode(&registries::world_config::time(&g), &mut b)?;
+                extras.push((format!("{}{suffix}", join::TIME_SETTINGS), b));
+                match registries::world_config::movement(&ctx, &g, true) {
+                    Ok(Some(m)) => {
+                        let mut b = Vec::new();
+                        aerie_protocol::wire::Wire::encode(
+                            &aerie_protocol::proto::UpdateMovementSettings {
+                                movement_settings: m,
+                            },
+                            &mut b,
+                        )?;
+                        extras.push((format!("{}{suffix}", join::MOVEMENT_SETTINGS), b));
+                    }
+                    Ok(None) => {
+                        if name.is_none() {
+                            warn!("the player's movement configuration is not an asset")
+                        }
+                    }
+                    Err(e) => warn!("movement settings not built: {e}"),
                 }
-                Ok(None) => warn!("the player's movement configuration is not an asset"),
-                Err(e) => warn!("movement settings not built: {e}"),
             }
+            Err(e) => warn!("gameplay configuration not read: {e}"),
         }
-        Err(e) => warn!("gameplay configuration not read: {e}"),
     }
     info!(
         "built {} registries from {} in {:.1?}",
