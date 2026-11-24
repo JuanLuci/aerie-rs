@@ -1561,7 +1561,7 @@ impl Hub {
             );
             id
         };
-        self.broadcast_text(&format!("{name} joined"));
+        self.broadcast_msg(world_line("server.general.playerJoinedWorld", name));
         (id, rx)
     }
 
@@ -1621,7 +1621,7 @@ impl Hub {
             ) {
                 self.broadcast(&p);
             }
-            self.broadcast_text(&format!("{} left", e.name));
+            self.broadcast_msg(world_line("server.general.playerLeftWorld", &e.name));
         }
     }
 
@@ -3998,10 +3998,16 @@ impl Hub {
         }
     }
 
-    pub fn broadcast_text(&self, text: &str) {
-        info!("[chat] {text}");
-        if let Ok(p) = server_message(text) {
+    /// A chat line to every player.
+    pub fn broadcast_msg(&self, m: Msg) {
+        if let Ok(p) = m.packet() {
             self.broadcast(&p);
+        }
+    }
+
+    fn tell_msg(&self, id: i32, m: Msg) {
+        if let Ok(p) = m.packet() {
+            self.send(id, p);
         }
     }
 
@@ -4646,7 +4652,12 @@ impl Hub {
                 self.command(id, cmd)
             }
             None => {
-                self.broadcast_text(&format!("<{name}> {text}"));
+                info!("[chat] <{name}> {text}");
+                self.broadcast_msg(
+                    Msg::key("server.chat.playerMessage")
+                        .text("username", &name)
+                        .text("message", text),
+                );
                 Ok(())
             }
         }
@@ -4684,7 +4695,17 @@ impl Hub {
                 match (block_coords(here.as_ref(), [x, y, z]), b) {
                     (Some([x, y, z]), Some(b)) => {
                         self.set_block(x, y, z, b)?;
-                        self.tell(id, &format!("Set {x} {y} {z} to {block}"));
+                        // The block's own key, whatever case was typed.
+                        let key = self.keys_by_id.get(&b).cloned();
+                        let key = key.unwrap_or_else(|| block.to_string());
+                        self.tell_msg(
+                            id,
+                            Msg::key("server.commands.block.set.success")
+                                .int("x", x)
+                                .int("y", y)
+                                .int("z", z)
+                                .text("id", &key),
+                        );
                     }
                     _ => self.tell(id, "Usage: /block set <x> <y> <z> <block>"),
                 }
@@ -4694,7 +4715,13 @@ impl Hub {
                 match block_coords(here.as_ref(), [x, y, z]) {
                     Some([x, y, z]) => {
                         self.set_ticking(x, y, z);
-                        self.tell(id, &format!("{x} {y} {z} will be checked"));
+                        self.tell_msg(
+                            id,
+                            Msg::key("server.commands.block.setticking.success")
+                                .int("x", x)
+                                .int("y", y)
+                                .int("z", z),
+                        );
                     }
                     None => self.tell(id, "Usage: /block setticking <x> <y> <z>"),
                 }
@@ -4880,12 +4907,34 @@ impl Hub {
                 };
                 match m {
                     Some(game_mode) => {
-                        self.set_creative(id, game_mode == proto::GameMode::CREATIVE);
+                        let creative = game_mode == proto::GameMode::CREATIVE;
+                        let was = self
+                            .inner
+                            .lock()
+                            .unwrap()
+                            .players
+                            .get(&id)
+                            .map(|e| e.creative);
+                        if was == Some(creative) {
+                            self.tell_msg(
+                                id,
+                                Msg::key("server.commands.gamemode.alreadyInMode.self"),
+                            );
+                            return Ok(());
+                        }
+                        self.set_creative(id, creative);
                         self.send(
                             id,
                             packet(id::SET_GAME_MODE, &proto::SetGameMode { game_mode })?,
                         );
-                        self.tell(id, &format!("Game mode set to {mode}"));
+                        let name = if creative { "creative" } else { "adventure" };
+                        self.tell_msg(
+                            id,
+                            Msg::key("server.commands.gamemode.success.self").msg(
+                                "mode",
+                                Msg::key(&format!("server.general.gamemodes.{name}")),
+                            ),
+                        );
                     }
                     None => self.tell(id, "Usage: /gamemode <creative|adventure>"),
                 }
@@ -4937,6 +4986,14 @@ fn player_list_add(players: Vec<proto::ServerPlayerListPlayer>) -> Result<Packet
 }
 
 /// A plain chat line.
+/// A join or leave line: the player's name and the world's display name
+/// (Aerie has one world, `default`, shown as written).
+fn world_line(key: &str, name: &str) -> Msg {
+    Msg::key(key)
+        .text("username", name)
+        .msg("world", Msg::raw("default"))
+}
+
 pub fn server_message(text: &str) -> Result<Packet> {
     Msg::raw(text).packet()
 }
@@ -5058,12 +5115,36 @@ mod tests {
         .1
     }
 
+    /// A chat line as text: its raw text, or its key with `name=value`
+    /// parameters (message parameters in brackets).
+    fn render(m: &proto::FormattedMessage) -> String {
+        let mut s = m
+            .raw_text
+            .clone()
+            .or_else(|| m.message_id.clone())
+            .unwrap_or_default();
+        for (k, v) in m.params.iter().flatten() {
+            let v = match v {
+                proto::ParamValue::StringParamValue(v) => v.value.clone().unwrap_or_default(),
+                proto::ParamValue::IntParamValue(v) => v.value.to_string(),
+                proto::ParamValue::LongParamValue(v) => v.value.to_string(),
+                proto::ParamValue::DoubleParamValue(v) => v.value.to_string(),
+                proto::ParamValue::BoolParamValue(v) => v.value.to_string(),
+            };
+            s += &format!(" {k}={v}");
+        }
+        for (k, v) in m.message_params.iter().flatten() {
+            s += &format!(" {k}=[{}]", render(v));
+        }
+        s
+    }
+
     fn texts(rx: &mut mpsc::UnboundedReceiver<Packet>) -> Vec<String> {
         let mut out = Vec::new();
         while let Ok((i, p)) = rx.try_recv() {
             if i == id::SERVER_MESSAGE {
                 let (m, _) = proto::ServerMessage::decode(&p, 0).unwrap();
-                out.push(m.message.unwrap().raw_text.unwrap());
+                out.push(render(&m.message.unwrap()));
             } else {
                 out.push(format!("#{i}"));
             }
@@ -5073,14 +5154,15 @@ mod tests {
 
     #[test]
     fn chat_reaches_everyone() {
+        const OI: &str = "server.chat.playerMessage message=oi username=Ana";
         let hub = Hub::default();
         let (a, mut ra) = hub.join("Ana", uuid::Uuid::from_u128(1));
         let (_b, mut rb) = hub.join("Bia", uuid::Uuid::from_u128(2));
         texts(&mut ra);
         texts(&mut rb);
         hub.chat(a, &chat("oi")).unwrap();
-        assert_eq!(texts(&mut ra), ["<Ana> oi"]);
-        assert_eq!(texts(&mut rb), ["<Ana> oi"]);
+        assert_eq!(texts(&mut ra), [OI]);
+        assert_eq!(texts(&mut rb), [OI]);
     }
 
     #[test]
@@ -5160,7 +5242,13 @@ mod tests {
         let (_b, mut rb) = hub.join("Bia", uuid::Uuid::from_u128(2));
         texts(&mut rb);
         hub.leave(a);
-        assert_eq!(texts(&mut rb), ["#225", "Ana left"]);
+        assert_eq!(
+            texts(&mut rb),
+            [
+                "#225",
+                "server.general.playerLeftWorld username=Ana world=[default]"
+            ]
+        );
         assert_eq!(hub.names(), ["Bia"]);
     }
 }
