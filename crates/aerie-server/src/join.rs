@@ -667,6 +667,7 @@ fn built(
     opaque: &dyn Fn(i32) -> bool,
     damage: &dyn Fn(i32, i32) -> Vec<(u32, Vec<u8>)>,
     creative: bool,
+    view_radius: i32,
 ) -> Result<World> {
     let (ccx, ccz) = column_of(start);
     let join = Out::new(
@@ -715,7 +716,9 @@ fn built(
     };
     let mut after = vec![Out::new(
         id::VIEW_RADIUS,
-        &proto::ViewRadius { value: 1024 },
+        &proto::ViewRadius {
+            value: view_radius * 32,
+        },
     )?];
     // The columns around where the player starts, nearest first.
     let mut area: Vec<(i32, i32)> = (ccx - BUILT_RADIUS..=ccx + BUILT_RADIUS)
@@ -988,6 +991,7 @@ async fn in_world(
                     &|b| hub.opaque(b),
                     &|x, z| hub.damage_packets(x, z),
                     hub.default_creative(),
+                    settings.max_view_radius,
                 )?,
                 false,
             )
@@ -1256,6 +1260,7 @@ mod tests {
             &|_| true,
             &|_, _| Vec::new(),
             false,
+            32,
         )
         .unwrap();
         let solid = w

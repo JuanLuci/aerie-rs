@@ -1559,6 +1559,34 @@ impl Hub {
         (id, rx)
     }
 
+    /// How many players are in the world.
+    pub fn player_count(&self) -> usize {
+        self.inner.lock().unwrap().players.len()
+    }
+
+    /// Queues the same packet (a disconnect) for every player.
+    pub fn disconnect_all(&self, (pid, payload): &Packet) {
+        let g = self.inner.lock().unwrap();
+        for e in g.players.values() {
+            let _ = e.outbox.send((*pid, payload.clone()));
+        }
+    }
+
+    /// Saves what players carry and where they are, and the block state,
+    /// with the same code paths as a player leaving (spec 25).
+    pub fn save_all(&self) {
+        let mut g = self.inner.lock().unwrap();
+        for e in g.players.values() {
+            self.save_inventory(e.uuid, &e.inv);
+            self.save_slots(e.uuid, [e.hotbar_slot, e.utility_slot, e.tools_slot]);
+            self.save_stats(e.uuid, &e.stats);
+            if let Some(p) = &e.position {
+                self.save_position(e.uuid, p);
+            }
+        }
+        self.save_states(&mut g);
+    }
+
     pub fn leave(&self, id: i32) {
         let gone = self.inner.lock().unwrap().players.remove(&id);
         if let Some(e) = gone {
