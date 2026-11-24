@@ -66,12 +66,15 @@ Other facts from the reference:
 
 ## A full server
 
-The official server checks the count when a connection reaches its login
-handler, before the player is asked for anything. When the number of players
-already in the world has reached `MaxPlayers`, the connection gets a
-disconnect packet whose message is the translation key
-`client.general.disconnect.serverFull` and is closed. Aerie does the same
-right after the version check, so a full server never starts a login.
+The official server checks the count when a connection reaches its
+*authenticated* login handler, before the player is asked for anything. When
+the number of players already in the world has reached `MaxPlayers`, the
+connection gets a disconnect packet whose message is the translation key
+`client.general.disconnect.serverFull` and is closed. The insecure
+(development) login has no such check: a full server still lets those
+players in. Aerie does the same: the check runs right after the version
+check, only when Aerie has a server login and the client sent an identity
+token.
 
 ## Shutdown
 
@@ -102,6 +105,7 @@ so they need nothing more.
 - The key names, defaults and the sample file written by the official server
   were read from the reference and from a sample file: Aerie started on a
   copy of that file used its values and left it byte for byte as it was.
-- The full-server and shutdown messages are taken from the reference; the
-  real official packets are still to be compared on a separate official
-  server.
+- Checked against the official server: the shutdown disconnect is byte for
+  byte the same; with `MaxPlayers` 1 an insecure second player is let in on
+  both. The refusal on the authenticated path is taken from the reference
+  (comparing it needs an official server with its own login).

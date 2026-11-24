@@ -240,8 +240,14 @@ pub async fn handle(conn: quinn::Connection, settings: &Settings) -> Result<()> 
         return g.kick(&conn, Message::key(key), code).await;
     }
 
-    // ---- server full (spec 25)
-    if settings.max_players > 0 && settings.hub.player_count() >= settings.max_players as usize {
+    // ---- server full (spec 25): only on the authenticated path, as on
+    // the official server; an insecure (development) login is never
+    // refused for it.
+    if settings.account.is_some()
+        && connect.identity_token.is_some()
+        && settings.max_players > 0
+        && settings.hub.player_count() >= settings.max_players as usize
+    {
         info!(
             "refusing a join: {} players, the most allowed",
             settings.max_players
