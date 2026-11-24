@@ -26,5 +26,5 @@ jobs:
         run: cargo fmt --check
       - name: Build
         run: cargo build --workspace --all-targets
-      - name: Tests (no game files here: tests that need them are ignored)
+      - name: "Tests (no game files here: tests that need them are ignored)"
         run: cargo test --workspace
