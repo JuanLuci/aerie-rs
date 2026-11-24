@@ -13,6 +13,8 @@ pub const UTILITY: i32 = -5;
 pub const BACKPACK: i32 = -9;
 pub const ABILITIES: i32 = -11;
 pub const RUNE_BAG: i32 = -12;
+/// Capacity of the tools section.
+pub const TOOLS: i32 = -8;
 /// The official `EVERYTHING` order (merging stacks into a slot).
 pub const EVERYTHING: [i32; 5] = [ARMOR, HOTBAR, UTILITY, STORAGE, BACKPACK];
 /// Ability slots come in lines of a core and its supports.
@@ -897,6 +899,17 @@ impl Inventory {
         }
     }
 
+    /// Replaces the tools section's content with `stacks`, from slot 0 (what
+    /// a player gets on every join); those that do not fit are dropped.
+    pub fn set_tools(&mut self, stacks: &[Stack]) {
+        if let Some(s) = self.section(TOOLS) {
+            s.fill(None);
+            for (slot, st) in s.iter_mut().zip(stacks) {
+                *slot = Some(st.clone());
+            }
+        }
+    }
+
     /// Every stack, section by section.
     pub fn all(&self) -> Vec<(String, i32)> {
         self.sections
@@ -994,6 +1007,17 @@ impl Inventory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tools_are_replaced() {
+        let mut inv = Inventory::default();
+        inv.set(TOOLS, 10, Some(Stack::new("Old", 1, 0.0)));
+        let tools = [Stack::new("A", 1, 0.0), Stack::new("B", 1, 0.0)];
+        inv.set_tools(&tools);
+        assert_eq!(inv.get(TOOLS, 0), Some(tools[0].clone()));
+        assert_eq!(inv.get(TOOLS, 1), Some(tools[1].clone()));
+        assert_eq!(inv.get(TOOLS, 10), None);
+    }
 
     struct T;
     impl Items for T {
