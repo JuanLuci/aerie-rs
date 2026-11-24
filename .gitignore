@@ -13,3 +13,6 @@ aerie-world/
 # Tables generated from your own copy of the game (tools/gen.py).
 /gen/
 __pycache__/
+
+# The server config a test server writes where it starts (spec 25).
+/config.json

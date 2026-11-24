@@ -3,6 +3,8 @@
 //! ```text
 //! aerie-server login [--profile NAME] [--account FILE]
 //! aerie-server [--bind 0.0.0.0:5520] [--password PW] [--name NAME] [--account FILE]
+//!              [--config FILE] [--motd TEXT] [--max-players N] [--max-view-radius N]
+//!              [--game-mode adventure|creative]
 //! aerie-server probe --upstream ADDR [--capture DIR] [--name NAME] [--chat "line;/command"]
 //! aerie-server [...] --replay-setup DIR --captured-registries all|40-60,66|!66
 //! aerie-server check [--assets ZIP] [--replay-setup DIR]   (registries the client would refuse)
@@ -15,6 +17,7 @@ mod chains;
 mod changes;
 mod chunk;
 mod common;
+mod config;
 mod connected;
 mod crafting;
 mod effects;
@@ -93,6 +96,26 @@ async fn main() -> Result<()> {
         return probe::run(upstream, capture, opts).await;
     }
 
+    // The settings file (spec 25), then what the command line overrides.
+    let conf = if args.first().map(String::as_str) == Some("check") {
+        config::Config::default()
+    } else {
+        let path = PathBuf::from(arg(&args, "--config").unwrap_or_else(|| "config.json".into()));
+        config::Config::load(&path)?.with_overrides(config::Overrides {
+            name: arg(&args, "--name"),
+            motd: arg(&args, "--motd"),
+            password: arg(&args, "--password"),
+            max_players: arg(&args, "--max-players")
+                .map(|v| v.parse())
+                .transpose()
+                .context("--max-players")?,
+            max_view_radius: arg(&args, "--max-view-radius")
+                .map(|v| v.parse())
+                .transpose()
+                .context("--max-view-radius")?,
+            game_mode: arg(&args, "--game-mode"),
+        })?
+    };
     let use_cache = !args.iter().any(|a| a == "--no-cache");
     let account_file =
         PathBuf::from(arg(&args, "--account").unwrap_or_else(|| "aerie-account.json".into()));
@@ -308,10 +331,11 @@ async fn main() -> Result<()> {
             .unwrap_or_default()
     };
     let settings = Arc::new(login::Settings {
-        name: arg(&args, "--name").unwrap_or_else(|| "Aerie".into()),
-        motd: arg(&args, "--motd").unwrap_or_else(|| "An Aerie server".into()),
-        max_players: 16,
-        password: arg(&args, "--password"),
+        name: conf.name.clone(),
+        motd: conf.motd.clone(),
+        max_players: conf.max_players,
+        max_view_radius: conf.max_view_radius,
+        password: Some(conf.password.clone()).filter(|p| !p.is_empty()),
         account,
         registries,
         replay,
@@ -331,9 +355,7 @@ async fn main() -> Result<()> {
                         .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
                         .unwrap_or_default(),
                 ))
-                .with_creative(
-                    arg(&args, "--game-mode").is_some_and(|m| m.eq_ignore_ascii_case("creative")),
-                )
+                .with_creative(conf.creative)
                 .with_book(book)
                 .with_chains(chain_book)
                 .with_effects(effect_book)
@@ -405,7 +427,14 @@ async fn main() -> Result<()> {
         "insecure: run `aerie-server login` for release clients"
     };
     info!("Aerie listening on {bind} ({mode})");
-    while let Some(incoming) = endpoint.accept().await {
+    let stop = stop_signal();
+    tokio::pin!(stop);
+    loop {
+        let incoming = tokio::select! {
+            i = endpoint.accept() => i,
+            _ = &mut stop => break,
+        };
+        let Some(incoming) = incoming else { break };
         let settings = settings.clone();
         tokio::spawn(async move {
             match incoming.await {
@@ -418,7 +447,35 @@ async fn main() -> Result<()> {
             }
         });
     }
+    // Ctrl+C or SIGTERM (spec 25): tell every player, then save the world.
+    info!("stopping: disconnecting players");
+    settings.hub.disconnect_all(&login::stopping_message());
+    // The connections' tasks write the packet; give them time, then close.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    settings.hub.save_all();
+    endpoint.close(0u32.into(), b"");
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.wait_idle()).await;
+    info!("stopped");
     Ok(())
+}
+
+/// Resolves when the process is asked to stop (Ctrl+C, or SIGTERM on Unix).
+async fn stop_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+                return;
+            }
+            Err(e) => warn!("SIGTERM handler not installed: {e}"),
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// Registry packets, block ids by lower-cased key, block keys as written,

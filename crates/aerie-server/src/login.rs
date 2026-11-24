@@ -31,6 +31,8 @@ pub struct Settings {
     pub name: String,
     pub motd: String,
     pub max_players: i32,
+    /// Chunks (spec 25); the client is told this times 32 blocks.
+    pub max_view_radius: i32,
     pub password: Option<String>,
     pub account: Option<Arc<ServerAccount>>,
     /// Registry packets built from the player's `Assets.zip` (spec 07).
@@ -158,6 +160,19 @@ impl Game {
     }
 }
 
+/// What every player is told when the server stops (spec 25): the
+/// disconnect packet, ready to be queued.
+pub fn stopping_message() -> (u32, Vec<u8>) {
+    let mut out = Vec::new();
+    ServerDisconnect {
+        reason: Some(Message::key("server.general.disconnect.stoppingServer")),
+        kind: DisconnectType::Disconnect,
+    }
+    .encode(&mut out)
+    .expect("a disconnect packet encodes");
+    (ServerDisconnect::ID, out)
+}
+
 /// Who joined, after either login path.
 pub(crate) struct Player {
     pub uuid: Uuid,
@@ -223,6 +238,21 @@ pub async fn handle(conn: quinn::Connection, settings: &Settings) -> Result<()> 
             connect.protocol_build, connect.protocol_crc
         );
         return g.kick(&conn, Message::key(key), code).await;
+    }
+
+    // ---- server full (spec 25)
+    if settings.max_players > 0 && settings.hub.player_count() >= settings.max_players as usize {
+        info!(
+            "refusing a join: {} players, the most allowed",
+            settings.max_players
+        );
+        return g
+            .kick(
+                &conn,
+                Message::key("client.general.disconnect.serverFull"),
+                close::NO_ERROR,
+            )
+            .await;
     }
 
     // ---- login
