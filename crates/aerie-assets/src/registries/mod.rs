@@ -9,6 +9,7 @@ pub mod block_groups;
 pub mod block_hitboxes;
 pub mod block_sets;
 pub mod blocks;
+pub mod builder_tools;
 pub mod camera;
 pub mod camera_shake;
 pub mod connected_rule_sets;

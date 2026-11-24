@@ -286,6 +286,8 @@ pub struct Hub {
     keys_by_id: HashMap<i32, String>,
     /// Recipes, materials and benches.
     book: crate::crafting::Book,
+    /// The editor tools every player joins with (`BT item` lines).
+    tools: Vec<String>,
     /// Items used up by an interaction: (item, interaction type) → (charge
     /// time, quantity change, Adventure only).
     consume: HashMap<(String, i32), (f32, i32, bool)>,
@@ -434,6 +436,20 @@ impl Hub {
     pub fn with_book(mut self, b: crate::crafting::Book) -> Self {
         self.book = b;
         self
+    }
+
+    /// The `tools` table (aerie-assets): `BT item`, in slot order.
+    pub fn with_tools(mut self, text: &str) -> Self {
+        self.tools = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("BT "))
+            .map(|i| i.trim().to_owned())
+            .collect();
+        self
+    }
+
+    fn tool_stacks(&self) -> Vec<crate::inventory::Stack> {
+        self.tools.iter().map(|i| self.book.stack(i, 1)).collect()
     }
 
     /// The `consume` table (aerie-assets): `F item type charge adjust adventure`.
@@ -1522,7 +1538,11 @@ impl Hub {
                     outbox: tx,
                     position: None,
                     teleport_id: 0,
-                    inv: self.saved_inventory(uuid).unwrap_or_default(),
+                    inv: {
+                        let mut inv = self.saved_inventory(uuid).unwrap_or_default();
+                        inv.set_tools(&self.tool_stacks());
+                        inv
+                    },
                     creative: self.creative,
                     view: None,
                     body: None,
@@ -3683,10 +3703,14 @@ impl Hub {
     /// on the official server), sent at once.
     pub fn send_inventory(&self, id: i32) -> Result<()> {
         let p = {
-            let g = self.inner.lock().unwrap();
-            let Some(e) = g.players.get(&id) else {
+            let mut g = self.inner.lock().unwrap();
+            let Some(e) = g.players.get_mut(&id) else {
                 return Ok(());
             };
+            // The official server fills the tools after it registered the
+            // section's change listener, so the next tick sends the tools
+            // once more (spec 14).
+            e.inv_dirty.insert(inventory::TOOLS);
             packet(id::UPDATE_PLAYER_INVENTORY, &e.inv.packet())?
         };
         self.send(id, p);

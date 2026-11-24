@@ -135,7 +135,36 @@ report a change is not only which slots changed:
 - **Sort**: the storage and an open window's section are sent even when
   empty.
 
+## The tools section (-8)
+
+A player joins with the editor tools in the tools section. Nothing about
+the player decides it: not the game mode, not permissions, not a world or
+server setting. The section has 23 slots; on every join the server empties
+it and fills it from slot 0 with one of each item named by the tools menu
+assets (`Item/PlayerToolsMenuConfig`, field `BuilderToolItems`), asset by
+asset and in list order. The stock assets list six: the paint, sculpt,
+selection, paste, line and layers tools, so slots 0 to 5 hold them with
+quantity 1 and no durability. A saved tools section never survives a join:
+it is replaced. Changing the game mode or permissions does not touch it
+and sends no inventory.
+
+The join sends the whole inventory first (tools included), then, in the
+next tick, the tools section alone once more: the server fills it after
+the section's change tracking started, so the change is reported. That
+second packet lists the slots in the usual map order (0, 2, 4, 1, 3, 5
+for six). The active tools slot is not named at join (only the hotbar and
+utility slots are): it stays -1 until the client sets it, as before.
+`/clear` empties this section too, and nothing refills it until the next
+join. The editor tools' own interactions are not part of this.
+
+In Aerie: `aerie-assets` writes the item names as `BT item` lines of a
+server table; the hub fills the section on join and marks it changed so
+the next tick sends it.
+
 ## Not done yet
+
+If several tools menu assets exist, the official order between assets is
+its hash map order; Aerie sorts by asset name (the stock game has one).
 
 Moving onto or off the active hotbar slot with a different item runs the
 swap interaction first (the move is the same); core abilities leaving
@@ -159,6 +188,12 @@ actions give the same inventory packets and window updates on both
 servers, in the same order: quick stack, sort, take all, put all (empty
 storage and moving items), quick stack with nothing matching, take all
 joining stacks and filling empty slots, and sorting an empty chest.
+
+Joining, on both servers: the join inventory packet is byte for byte the
+same (six tools in slots 0 to 5, capacity 23), the following tools-only
+packet has the same slots in the same order, the active slots are the
+same, and after `/gamemode creative` and `/gamemode adventure` the tools
+section is unchanged and no inventory is sent on either.
 
 ## Kept between sessions
 
