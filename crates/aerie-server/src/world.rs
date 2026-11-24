@@ -319,6 +319,8 @@ pub struct Hub {
     /// Interactions and root interactions as the server runs them.
     chains: crate::chains::Book,
     effects: crate::effects::Book,
+    /// Game mode types (spec 30).
+    gamemodes: crate::gamemode::Types,
 }
 
 /// Who gets a player's component update.
@@ -376,6 +378,11 @@ struct Inner {
     /// This tick's component updates of players: (player, who sees it,
     /// the update).
     stat_updates: Vec<(i32, Audience, proto::ComponentUpdate)>,
+    /// Players whose invulnerable marker was set (true) or taken away
+    /// since the last tick's updates (spec 30).
+    markers: Vec<(i32, bool)>,
+    /// Players that lost the invulnerable marker, for this tick's updates.
+    marker_gone: Vec<i32>,
     /// Processing bench blocks (spec 16), by main cell.
     processing: BTreeMap<Pos, crate::processing::State>,
     /// What blocks that hold items hold (spec 21).
@@ -568,6 +575,29 @@ impl Hub {
                 .copied()
                 .unwrap_or(0),
             None => 0,
+        }
+    }
+
+    /// Starts the chain a game mode change runs for the player: the root
+    /// interaction of the new mode, as a server chain of type `GameModeSwap`
+    /// (spec 30).
+    fn run_swap_chain(&self, id: i32, root: &str) {
+        let Some(root) = self.chains.root_named(root) else {
+            return;
+        };
+        let mut g = self.inner.lock().unwrap();
+        if let Some(e) = g.players.get_mut(&id) {
+            let ctx = crate::chains::Ctx {
+                section: inventory::HOTBAR,
+                slot: e.hotbar_slot,
+                ..Default::default()
+            };
+            e.chains.start_server_synced(
+                proto::InteractionType::GAME_MODE_SWAP,
+                ctx,
+                root,
+                crate::gamemode::chain_data(),
+            );
         }
     }
 
@@ -1147,6 +1177,11 @@ impl Hub {
 
     pub fn with_effects(mut self, b: crate::effects::Book) -> Self {
         self.effects = b;
+        self
+    }
+
+    pub fn with_gamemodes(mut self, t: crate::gamemode::Types) -> Self {
+        self.gamemodes = t;
         self
     }
 
@@ -5123,6 +5158,11 @@ impl Hub {
                             id,
                             packet(id::SET_GAME_MODE, &proto::SetGameMode { game_mode })?,
                         );
+                        let change = self.gamemodes.on_change(creative);
+                        self.inner.lock().unwrap().markers.push((id, creative));
+                        if let Some(m) = change.movement {
+                            self.send(id, crate::gamemode::movement_packet(m));
+                        }
                         let name = if creative { "creative" } else { "adventure" };
                         self.tell_msg(
                             id,
@@ -5131,6 +5171,9 @@ impl Hub {
                                 Msg::key(&format!("server.general.gamemodes.{name}")),
                             ),
                         );
+                        if let Some(root) = change.run {
+                            self.run_swap_chain(id, &root);
+                        }
                     }
                     None => self.tell(id, "Usage: /gamemode <creative|adventure>"),
                 }
@@ -6675,6 +6718,18 @@ impl Hub {
 
     /// The effect changes of the tick, for every viewer.
     fn effects_updates(&self, g: &mut Inner) {
+        // A game mode change's marker goes out with the effect it brings.
+        for (pid, on) in std::mem::take(&mut g.markers) {
+            if on {
+                g.stat_updates.push((
+                    pid,
+                    Audience::All,
+                    proto::ComponentUpdate::InvulnerableUpdate(Box::default()),
+                ));
+            } else {
+                g.marker_gone.push(pid);
+            }
+        }
         let mut updates = Vec::new();
         for (pid, e) in g.players.iter_mut() {
             if let Some(u) = e.effects.take_changes() {
@@ -7423,7 +7478,8 @@ impl Hub {
             out.all.push(p);
         }
         let stat_updates = std::mem::take(&mut g.stat_updates);
-        if stat_updates.is_empty() {
+        let marker_gone = std::mem::take(&mut g.marker_gone);
+        if stat_updates.is_empty() && marker_gone.is_empty() {
             if (!updates.is_empty() || !gone.is_empty())
                 && let Ok(p) = packet(
                     id::ENTITY_UPDATES,
@@ -7447,19 +7503,58 @@ impl Hub {
             .collect();
         for viewer in viewers {
             let mut mine = updates.clone();
+            // A marker joins the next update of its player (spec 30).
+            let mut held: Option<(i32, proto::ComponentUpdate)> = None;
             for (pid, audience, u) in &stat_updates {
                 let sees = match audience {
                     Audience::Own => *pid == viewer,
                     Audience::Others => *pid != viewer,
                     Audience::All => true,
                 };
-                if sees {
-                    mine.push(proto::EntityUpdate {
-                        network_id: *pid,
-                        removed: None,
-                        updates: Some(vec![u.clone()]),
-                    });
+                if !sees {
+                    continue;
                 }
+                let mut parts = vec![u.clone()];
+                if matches!(u, proto::ComponentUpdate::InvulnerableUpdate(_)) {
+                    mine.extend(held.replace((*pid, u.clone())).map(|(p, m)| {
+                        proto::EntityUpdate {
+                            network_id: p,
+                            removed: None,
+                            updates: Some(vec![m]),
+                        }
+                    }));
+                    continue;
+                }
+                if let Some((p, m)) = held.take() {
+                    if p == *pid {
+                        parts.insert(0, m);
+                    } else {
+                        mine.push(proto::EntityUpdate {
+                            network_id: p,
+                            removed: None,
+                            updates: Some(vec![m]),
+                        });
+                    }
+                }
+                mine.push(proto::EntityUpdate {
+                    network_id: *pid,
+                    removed: None,
+                    updates: Some(parts),
+                });
+            }
+            if let Some((p, m)) = held {
+                mine.push(proto::EntityUpdate {
+                    network_id: p,
+                    removed: None,
+                    updates: Some(vec![m]),
+                });
+            }
+            for pid in &marker_gone {
+                mine.push(proto::EntityUpdate {
+                    network_id: *pid,
+                    removed: Some(vec![proto::ComponentUpdateType::INVULNERABLE]),
+                    updates: None,
+                });
             }
             if (!mine.is_empty() || !gone.is_empty())
                 && let Ok(p) = packet(

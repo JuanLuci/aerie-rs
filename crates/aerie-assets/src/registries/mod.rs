@@ -19,6 +19,7 @@ pub mod entity_effects;
 pub mod entity_stat_types;
 pub mod environments;
 pub mod fluids;
+pub mod game_modes;
 pub mod gathering;
 pub mod interactions;
 pub mod item_animations;
