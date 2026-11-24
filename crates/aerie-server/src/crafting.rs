@@ -602,6 +602,13 @@ impl Book {
         self.items.is_empty() || self.items.contains_key(item)
     }
 
+    /// Every item key, sorted.
+    pub fn item_keys(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.items.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
     /// A new stack of `item` at full durability, as the official server
     /// makes one from an item id.
     pub fn stack(&self, item: &str, n: i32) -> crate::inventory::Stack {

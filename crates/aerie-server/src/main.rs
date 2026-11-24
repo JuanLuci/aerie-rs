@@ -18,6 +18,7 @@ mod cache;
 mod chains;
 mod changes;
 mod chunk;
+mod commands;
 mod common;
 mod config;
 mod connected;
