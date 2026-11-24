@@ -39,6 +39,7 @@ mod processing;
 mod proxy;
 mod stats;
 mod support;
+mod teleport;
 mod terrain;
 mod tls;
 mod trig;

@@ -48,7 +48,7 @@ pub enum Outcome {
 }
 
 /// Aerie's own commands, outside the tree (see spec 28, "In Aerie").
-const OTHER: &[&str] = &["pos", "perf", "setblock", "fill", "clear", "tp", "entity"];
+const OTHER: &[&str] = &["pos", "perf", "setblock", "fill", "clear", "entity"];
 
 // ---------------------------------------------------------------------
 // Words
@@ -439,11 +439,23 @@ enum Ty {
     /// A text that must be an entity stat.
     Stat,
     World,
+    /// A decimal coordinate: `5.0`, `~-2.3`, `_` for the ground height.
+    Dbl,
+    /// A rotation in degrees, `~` relative to the current one.
+    Rel,
+    /// Three decimal coordinates.
+    Pos3,
+    /// Three numbers: pitch, yaw, roll.
+    Rot3,
 }
 
 impl Ty {
     fn count(self) -> usize {
-        if self == Ty::Pos { 3 } else { 1 }
+        if matches!(self, Ty::Pos | Ty::Pos3 | Ty::Rot3) {
+            3
+        } else {
+            1
+        }
     }
 
     /// (name key, usage key, examples)
@@ -507,6 +519,26 @@ impl Ty {
                 "server.commands.parsing.argtype.world.name",
                 "server.commands.parsing.argtype.world.usage",
                 &["default"],
+            ),
+            Ty::Dbl => (
+                "server.commands.parsing.argtype.doubleCoordinate.name",
+                "server.commands.parsing.argtype.doubleCoordinate.usage",
+                &["5.0", "~-2.3", "0.0"],
+            ),
+            Ty::Rel => (
+                "server.commands.parsing.argtype.relativeFloat.name",
+                "server.commands.parsing.argtype.relativeFloat.usage",
+                &["90.0", "~-45.5", "~"],
+            ),
+            Ty::Pos3 => (
+                "server.commands.parsing.argtype.relativePosition.name",
+                "server.commands.parsing.argtype.relativePosition.usage",
+                &["124.63 232.27 234.22", "~5.5 ~ ~", "~ ~ ~"],
+            ),
+            Ty::Rot3 => (
+                "server.commands.parsing.argtype.rotation.name",
+                "server.commands.parsing.argtype.rotation.usage",
+                &["124.63 232.27 234.22"],
             ),
         }
     }
@@ -628,11 +660,15 @@ impl Node {
         // An exact name, else the only name it begins, else the only one
         // that contains it.
         let w = word.to_lowercase();
-        if let Some(o) = self.opts.iter().find(|o| o.name == w) {
+        if let Some(o) = self.opts.iter().find(|o| o.name.to_lowercase() == w) {
             return Some(o);
         }
         let by = |f: &dyn Fn(&str) -> bool| {
-            let m: Vec<_> = self.opts.iter().filter(|o| f(o.name)).collect();
+            let m: Vec<_> = self
+                .opts
+                .iter()
+                .filter(|o| f(&o.name.to_lowercase()))
+                .collect();
             if m.len() == 1 { Some(m[0]) } else { None }
         };
         by(&|n| n.starts_with(&w)).or_else(|| by(&|n| n.contains(&w)))
@@ -938,6 +974,159 @@ fn tree() -> &'static Vec<Node> {
             )
             .sub(who(Node::new("zone", "server.commands.player.zone.desc")));
 
+        // Teleport (spec 30). The rotation options are listed in the order
+        // the official usage prints them.
+        let at = |n: Node| {
+            n.req("x", Ty::Dbl, "server.commands.teleport.x.desc")
+                .req("y", Ty::Dbl, "server.commands.teleport.y.desc")
+                .req("z", Ty::Dbl, "server.commands.teleport.z.desc")
+        };
+        let pitch = |n: Node| n.opt("pitch", Ty::Rel, "server.commands.teleport.pitch.desc");
+        let yaw = |n: Node| n.opt("yaw", Ty::Rel, "server.commands.teleport.yaw.desc");
+        let roll = |n: Node| n.opt("roll", Ty::Rel, "server.commands.teleport.roll.desc");
+        let tp = Node::new("tp", "server.commands.tp.desc")
+            .aliases(&["teleport"])
+            .perm("hytale.teleport.command.tp")
+            .group()
+            .variant(
+                Node::new("", "server.commands.teleport.otherToPlayer.desc")
+                    .req("player", Ty::Player, "server.commands.argtype.player.desc")
+                    .req(
+                        "targetPlayer",
+                        Ty::Player,
+                        "server.commands.teleport.targetPlayer.desc",
+                    )
+                    .done(),
+            )
+            .variant(
+                roll(yaw(pitch(at(
+                    Node::new("", "server.commands.teleport.toCoordinates.desc").req(
+                        "player",
+                        Ty::Player,
+                        "server.commands.teleport.targetPlayer.desc",
+                    ),
+                ))))
+                .done(),
+            )
+            .variant(
+                Node::new("", "server.commands.teleport.toPlayer.desc")
+                    .req(
+                        "targetPlayer",
+                        Ty::Player,
+                        "server.commands.teleport.targetPlayer.desc",
+                    )
+                    .done(),
+            )
+            .variant(
+                roll(yaw(pitch(at(Node::new(
+                    "",
+                    "server.commands.teleport.toCoordinates.desc",
+                )))))
+                .done(),
+            )
+            .sub(
+                roll(world(yaw(pitch(at(Node::new(
+                    "all",
+                    "server.commands.tpall.desc",
+                ))))))
+                .done(),
+            )
+            .sub(Node::new("home", "server.commands.home.desc").done())
+            .sub(Node::new("top", "server.commands.top.desc").done())
+            .sub(
+                Node::new("back", "server.commands.teleport.recent.desc")
+                    .opt(
+                        "count",
+                        Ty::Int,
+                        "server.commands.teleport.back.count.desc",
+                    )
+                    .done(),
+            )
+            .sub(
+                Node::new("forward", "server.commands.teleport.next.desc")
+                    .opt(
+                        "count",
+                        Ty::Int,
+                        "server.commands.teleport.forward.count.desc",
+                    )
+                    .done(),
+            )
+            .sub(Node::new("history", "server.commands.teleport.dump.desc").done())
+            .sub(
+                who(
+                    Node::new("world", "server.commands.worldport.desc").req(
+                        "worldName",
+                        Ty::World,
+                        "server.commands.worldport.worldName.desc",
+                    ),
+                )
+                .done(),
+            );
+        let spawn_index = |n: Node| n.opt("spawnIndex", Ty::Int, "server.commands.spawn.index.desc");
+        let spawn = spawn_index(
+            Node::new("spawn", "server.commands.spawn.desc")
+                .perm("hytale.command.spawn.self")
+                .done(),
+        )
+        .variant(spawn_index(
+            Node::new("", "server.commands.spawn.other.desc")
+                .req("player", Ty::Player, "server.commands.argtype.player.desc")
+                .done(),
+        ))
+        .sub(
+            world(Node::new("set", "server.commands.spawn.set.desc"))
+                .dflt(
+                    "rotation",
+                    Ty::Rot3,
+                    "Rotation3f{x=0.0, y=0.0, z=0.0}",
+                    "server.commands.spawn.set.rotation.desc",
+                )
+                .opt(
+                    "position",
+                    Ty::Pos3,
+                    "server.commands.spawn.set.position.desc",
+                ),
+        )
+        .sub(world(Node::new(
+            "default",
+            "server.commands.spawn.set.default.desc",
+        )));
+        let name = |n: Node, d: &'static str| n.req("name", Ty::Str, d);
+        let warp = Node::new("warp", "server.commands.warp.desc")
+            .perm("hytale.teleport.command.warp")
+            .group()
+            .variant(
+                Node::new("", "server.commands.warp.go.desc")
+                    .req("warpName", Ty::Str, "server.commands.warp.warpName.desc")
+                    .done(),
+            )
+            .sub(
+                Node::new("go", "server.commands.warp.go.desc")
+                    .req("warpName", Ty::Str, "server.commands.warp.warpName.desc")
+                    .done(),
+            )
+            .sub(
+                Node::new("list", "server.commands.warp.list.desc")
+                    .opt("page", Ty::Int, "server.commands.warp.list.page.desc")
+                    .done(),
+            )
+            .sub(
+                name(
+                    Node::new("remove", "server.commands.warp.remove.desc"),
+                    "server.commands.warp.remove.name.desc",
+                )
+                .flag("force", "server.commands.warp.remove.force.desc")
+                .done(),
+            )
+            .sub(Node::new("reload", "server.commands.warp.reload.desc").done())
+            .sub(
+                name(
+                    Node::new("set", "server.commands.warp.set.desc"),
+                    "server.commands.warp.set.name.desc",
+                )
+                .flag("force", "server.commands.warp.set.force.desc")
+                .done(),
+            );
         let help = Node::new("help", "server.commands.help.desc")
             .aliases(&["?"])
             .perm("hytale.system.command.help")
@@ -950,7 +1139,17 @@ fn tree() -> &'static Vec<Node> {
         let who_cmd = Node::new("who", "server.commands.who.desc")
             .perm("hytale.system.command.who")
             .done();
-        vec![block, gamemode, give, help, player, who_cmd]
+        vec![
+            block,
+            gamemode,
+            give,
+            help,
+            player,
+            spawn,
+            tp,
+            warp,
+            who_cmd,
+        ]
     })
 }
 
@@ -1186,6 +1385,32 @@ fn check(ty: Ty, words: &[&str], env: &dyn Env) -> Result<Vec<String>, Vec<Msg>>
             }
             Ok(words.iter().map(|s| s.to_string()).collect())
         }
+        Ty::Dbl => {
+            if crate::teleport::Coord::parse(w).is_some() {
+                one(w.to_owned())
+            } else {
+                Err(vec![
+                    Msg::key("server.commands.parsing.argtype.doubleCoordinate.fail")
+                        .text("input", w),
+                ])
+            }
+        }
+        Ty::Rel => match crate::teleport::RelFloat::parse(w) {
+            Ok(_) => one(w.to_owned()),
+            Err(shown) => Err(vec![Msg::raw(&format!("Invalid float: {shown}"))]),
+        },
+        Ty::Pos3 => {
+            for x in words {
+                if crate::teleport::Coord::parse(x).is_none() {
+                    return Err(vec![
+                        Msg::key("server.commands.parsing.argtype.doubleCoordinate.fail")
+                            .text("input", x),
+                    ]);
+                }
+            }
+            Ok(words.iter().map(|s| s.to_string()).collect())
+        }
+        Ty::Rot3 => Ok(words.iter().map(|s| s.to_string()).collect()),
         Ty::Block => match env.block_key(w) {
             Some(k) => one(k),
             None => Err(not_found("BlockType", w, &env.block_keys())),

@@ -89,6 +89,8 @@ struct Entry {
     /// Id of the last `ClientTeleport` sent; the client acknowledges it in
     /// `ClientMovement`.
     teleport_id: i8,
+    /// Teleports the client has not acknowledged yet (spec 30).
+    acks: crate::teleport::Acks,
     /// What it carries.
     inv: Inventory,
     /// Creative mode (the built world's default).
@@ -319,6 +321,8 @@ pub struct Hub {
     /// Interactions and root interactions as the server runs them.
     chains: crate::chains::Book,
     effects: crate::effects::Book,
+    /// The teleport history of each player and the warps (spec 30).
+    tp: crate::teleport::State,
 }
 
 /// Who gets a player's component update.
@@ -1535,6 +1539,7 @@ impl Hub {
                     outbox: tx,
                     position: None,
                     teleport_id: 0,
+                    acks: Default::default(),
                     inv: {
                         let mut inv = self.saved_inventory(uuid).unwrap_or_default();
                         inv.set_tools(&self.tool_stacks());
@@ -1749,6 +1754,7 @@ impl Hub {
 
     pub fn leave(&self, id: i32) {
         let gone = self.inner.lock().unwrap().players.remove(&id);
+        self.tp.forget(id);
         if let Some(e) = gone {
             self.save_inventory(e.uuid, &e.inv);
             self.save_slots(e.uuid, [e.hotbar_slot, e.utility_slot, e.tools_slot]);
@@ -3921,6 +3927,7 @@ impl Hub {
     /// by key, since ids move when the assets change.
     pub fn with_world(mut self, dir: std::path::PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&dir)?;
+        self.tp.open(dir.join("warps.txt"));
         let file = dir.join("blocks.txt");
         if let Ok(text) = std::fs::read_to_string(&file) {
             let mut n = 0;
@@ -4195,13 +4202,20 @@ impl Hub {
         let Some(e) = g.players.get_mut(&id) else {
             return Ok(());
         };
-        if let Some(ack) = &m.teleport_ack
-            && ack.teleport_id == e.teleport_id
-        {
-            tracing::debug!("{} acknowledged teleport {}", e.name, ack.teleport_id);
+        // Until the client has confirmed every teleport it was sent, what it
+        // says about where it is and where it looks is about the place it
+        // was moved from (spec 30).
+        if let (Some(ack), Some(p)) = (&m.teleport_ack, &m.absolute_position) {
+            if e.acks.ack(ack.teleport_id, [p.x, p.y, p.z]) {
+                tracing::debug!("{} acknowledged teleport {}", e.name, ack.teleport_id);
+            } else if e.acks.waiting() {
+                tracing::warn!("{} sent a teleport ack that does not fit", e.name);
+            }
         }
+        let held = e.acks.waiting();
         // Absolute, or a delta in 1/10000 of a block.
-        if let Some(p) = m.absolute_position {
+        if held {
+        } else if let Some(p) = m.absolute_position {
             e.position = Some(p);
         } else if let (Some(d), Some(p)) = (&m.relative_position, e.position.as_mut())
             && (d.x, d.y, d.z) != (0, 0, 0)
@@ -4210,7 +4224,7 @@ impl Hub {
             p.y += d.y as f64 / 10000.0;
             p.z += d.z as f64 / 10000.0;
         }
-        if m.body_orientation.is_some() {
+        if m.body_orientation.is_some() && !held {
             e.body = m.body_orientation.clone();
         }
         if let Some(ms) = &m.movement_states {
@@ -4227,7 +4241,7 @@ impl Hub {
             e.gliding = ms.gliding;
             e.movement = ms.clone();
         }
-        if m.look_orientation.is_some() {
+        if m.look_orientation.is_some() && !held {
             e.look = m.look_orientation.clone();
         }
         if e.view.is_none() {
@@ -5066,33 +5080,9 @@ impl Hub {
                 Some(p) => self.tell(id, &format!("You are at {:.1} {:.1} {:.1}", p.x, p.y, p.z)),
                 None => self.tell(id, "Your position is not known yet"),
             },
-            ("tp", [x, y, z]) => {
-                let here = self.position(id);
-                let coord = |s: &str, base: Option<f64>| -> Option<f64> {
-                    match s.strip_prefix('~') {
-                        Some(rest) => {
-                            let d = if rest.is_empty() {
-                                0.0
-                            } else {
-                                rest.parse().ok()?
-                            };
-                            Some(base? + d)
-                        }
-                        None => s.parse().ok(),
-                    }
-                };
-                let to = (
-                    coord(x, here.as_ref().map(|p| p.x)),
-                    coord(y, here.as_ref().map(|p| p.y)),
-                    coord(z, here.as_ref().map(|p| p.z)),
-                );
-                match to {
-                    (Some(x), Some(y), Some(z)) => {
-                        self.teleport(id, proto::Position { x, y, z })?;
-                        self.tell(id, &format!("Teleported to {x:.1} {y:.1} {z:.1}"));
-                    }
-                    _ => self.tell(id, "Usage: /tp <x> <y> <z> (numbers, or ~ for relative)"),
-                }
+            ("tp" | "spawn" | "warp", _) => {
+                let words: Vec<&str> = std::iter::once(name).chain(args.iter().copied()).collect();
+                self.tp.run(self, id, &words);
             }
             ("player", ["stats", rest @ ..]) => self.stats_command(id, rest)?,
             ("gamemode", [mode]) => {
@@ -5192,6 +5182,139 @@ impl crate::commands::Env for Hub {
             .iter()
             .map(|t| t.key.clone())
             .collect()
+    }
+}
+
+impl crate::teleport::Host for Hub {
+    fn find(&self, name: &str) -> Option<i32> {
+        let g = self.inner.lock().unwrap();
+        g.players
+            .iter()
+            .find(|(_, e)| e.name == name)
+            .map(|(&id, _)| id)
+    }
+
+    fn name(&self, id: i32) -> String {
+        let g = self.inner.lock().unwrap();
+        g.players.get(&id).map(|e| e.name.clone()).unwrap_or_default()
+    }
+
+    fn pose(&self, id: i32) -> Option<crate::teleport::Pose> {
+        let g = self.inner.lock().unwrap();
+        let e = g.players.get(&id)?;
+        let p = e.position.as_ref()?;
+        // A player that has not turned yet faces the spawn's way.
+        let dir = |d: &Option<proto::Direction>| {
+            d.as_ref().map_or(
+                [0.0, crate::teleport::SPAWN_HEAD[1], 0.0],
+                |d| [d.pitch, d.yaw, d.roll],
+            )
+        };
+        Some(crate::teleport::Pose {
+            pos: [p.x, p.y, p.z],
+            body: dir(&e.body),
+            head: dir(&e.look),
+        })
+    }
+
+    fn players(&self) -> Vec<i32> {
+        let g = self.inner.lock().unwrap();
+        let mut v: Vec<i32> = g
+            .players
+            .iter()
+            .filter(|(_, e)| e.in_world)
+            .map(|(&id, _)| id)
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn move_to(&self, id: i32, mv: &crate::teleport::Move) {
+        let Some(from) = crate::teleport::Host::pose(self, id) else {
+            return;
+        };
+        let to = mv.apply(&from);
+        let dir = |r: [f32; 3]| proto::Direction {
+            pitch: r[0],
+            yaw: r[1],
+            roll: r[2],
+        };
+        let position = proto::Position {
+            x: to.pos[0],
+            y: to.pos[1],
+            z: to.pos[2],
+        };
+        let mut g = self.inner.lock().unwrap();
+        let Some(e) = g.players.get_mut(&id) else {
+            return;
+        };
+        e.teleport_id = e.teleport_id.wrapping_add(1);
+        e.acks.queue(e.teleport_id, to.pos);
+        e.position = Some(position.clone());
+        e.body = Some(dir(to.body));
+        e.look = Some(dir(to.head));
+        let transform = proto::ModelTransform {
+            position: Some(position),
+            body_orientation: Some(dir(to.body)),
+            look_orientation: Some(dir(to.head)),
+        };
+        let own = packet(
+            id::CLIENT_TELEPORT,
+            &proto::ClientTeleport {
+                teleport_id: e.teleport_id,
+                ignored_transform_fields: 0,
+                relative_transform_fields: 0,
+                model_transform: transform.clone(),
+                reset_velocity: true,
+            },
+        );
+        let shown = e.view.is_some();
+        if let Ok(p) = own {
+            let _ = e.outbox.send(p);
+        }
+        // Others see it where it is now.
+        if shown
+            && let Ok(p) = packet(
+                id::ENTITY_UPDATES,
+                &proto::EntityUpdates {
+                    removed: None,
+                    updates: Some(vec![proto::EntityUpdate {
+                        network_id: id,
+                        removed: None,
+                        updates: Some(vec![proto::ComponentUpdate::TransformUpdate(Box::new(
+                            proto::TransformUpdate { transform },
+                        ))]),
+                    }]),
+                },
+            )
+        {
+            for (other, o) in &g.players {
+                if *other != id && o.view.is_some() {
+                    let _ = o.outbox.send(p.clone());
+                }
+            }
+        }
+    }
+
+    fn say(&self, id: i32, m: Msg) {
+        self.tell_msg(id, m);
+    }
+
+    fn notify(&self, id: i32, m: Msg) {
+        let n = proto::Notification {
+            message: Some(m.into_inner()),
+            icon: Some("teleportation".into()),
+            ..Default::default()
+        };
+        if let Ok(p) = packet(id::NOTIFICATION, &n) {
+            self.send(id, p);
+        }
+    }
+
+    fn top(&self, x: i32, z: i32) -> Option<i32> {
+        (0..crate::support::WORLD_HEIGHT)
+            .rev()
+            .find(|&y| self.opaque(self.block_in_world(x, y, z)))
     }
 }
 
