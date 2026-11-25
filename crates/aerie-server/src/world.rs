@@ -23,6 +23,7 @@ pub mod id {
     pub const SERVER_SET_BLOCK: u32 = 140;
     pub const CHAT_MESSAGE: u32 = 211;
     pub const CUSTOM_HUD: u32 = 217;
+    pub const CUSTOM_PAGE: u32 = 218;
     pub const SYNC_INTERACTION_CHAINS: u32 = 290;
     pub const CANCEL_INTERACTION_CHAIN: u32 = 291;
     pub const PLAY_INTERACTION_FOR: u32 = 292;
@@ -306,6 +307,8 @@ pub struct Hub {
     eye_height: f64,
     /// When the last world tick ran.
     last_tick: Mutex<Option<std::time::Instant>>,
+    /// Command lines waiting for the next tick (player, line without `/`).
+    commands: Mutex<Vec<(i32, String)>>,
     /// New players see the performance panel (`--perf-hud`).
     perf_hud: bool,
     /// New players start in creative (`--game-mode creative`; adventure by
@@ -1833,41 +1836,17 @@ impl Hub {
         match packet_id {
             self::id::MOVE_ITEM_STACK => {
                 let (m, _) = proto::MoveItemStack::decode(payload, 0)?;
-                if self.swap_move(id, &m) {
-                    return Ok(());
-                }
-                self.inventory_move(id, |inv, items, _, _| {
-                    inv.move_to_slot(
-                        items,
-                        (m.from_section_id, m.from_slot_id),
-                        m.quantity,
-                        (m.to_section_id, m.to_slot_id),
-                    );
-                });
-                // Moved into the utility section: that slot becomes the
-                // active one, and the client is told.
-                if m.to_section_id != m.from_section_id && m.to_section_id == inventory::UTILITY {
-                    let changed = {
-                        let mut g = self.inner.lock().unwrap();
-                        g.players.get_mut(&id).is_some_and(|e| {
-                            let c = e.utility_slot != m.to_slot_id;
-                            e.utility_slot = m.to_slot_id;
-                            c
-                        })
-                    };
-                    if changed {
-                        self.send(
-                            id,
-                            packet(
-                                self::id::SET_ACTIVE_SLOT,
-                                &proto::SetActiveSlot {
-                                    inventory_section_id: inventory::UTILITY,
-                                    active_slot: m.to_slot_id,
-                                },
-                            )?,
+                if !self.swap_move(id, &m) {
+                    self.inventory_move(id, |inv, items, _, _| {
+                        inv.move_to_slot(
+                            items,
+                            (m.from_section_id, m.from_slot_id),
+                            m.quantity,
+                            (m.to_section_id, m.to_slot_id),
                         );
-                    }
+                    });
                 }
+                self.utility_follows(id, &m)?;
             }
             self::id::SMART_MOVE_ITEM_STACK => {
                 let (m, _) = proto::SmartMoveItemStack::decode(payload, 0)?;
@@ -2099,17 +2078,18 @@ impl Hub {
     fn swap_move(&self, id: i32, m: &proto::MoveItemStack) -> bool {
         use aerie_protocol::proto::InteractionType as IT;
         let mut g = self.inner.lock().unwrap();
+        // Either end may be an open window's slot (a chest's, say).
+        let from = Self::stack_at(&g, id, m.from_section_id, m.from_slot_id);
+        let to = Self::stack_at(&g, id, m.to_section_id, m.to_slot_id);
         let Some(e) = g.players.get_mut(&id) else {
             return false;
         };
         let active = e.hotbar_slot;
         let to_active = m.to_section_id == inventory::HOTBAR && m.to_slot_id == active;
         let from_active = m.from_section_id == inventory::HOTBAR && m.from_slot_id == active;
-        if !(to_active || from_active) || m.from_section_id >= 0 || m.to_section_id >= 0 {
+        if !(to_active || from_active) {
             return false;
         }
-        let from = e.inv.get(m.from_section_id, m.from_slot_id);
-        let to = e.inv.get(m.to_section_id, m.to_slot_id);
         let (Some(from), Some(to)) = (from, to) else {
             return false;
         };
@@ -2146,6 +2126,64 @@ impl Hub {
         e.chains
             .start_server(&self.chains, IT::SWAP_FROM, ctx, root, data);
         true
+    }
+
+    /// What a slot holds, for a player's own sections and the slots of the
+    /// window it has open (container, processing bench, structural bench),
+    /// without changing anything.
+    fn stack_at(g: &Inner, id: i32, section: i32, slot: i32) -> Option<Stack> {
+        let e = g.players.get(&id)?;
+        if section < 0 {
+            return e.inv.get(section, slot);
+        }
+        let w = e.window.as_ref().filter(|w| w.id == section)?;
+        let i = usize::try_from(slot).ok()?;
+        match w.kind {
+            crate::crafting::Kind::Container => {
+                g.containers.get(&w.block.as_ref()?.1)?.get(i)?.clone()
+            }
+            crate::crafting::Kind::Processing => g
+                .processing
+                .get(&w.block.as_ref()?.1)?
+                .slots()
+                .get(i)?
+                .clone(),
+            crate::crafting::Kind::Structural => match i {
+                0 => w.input.clone(),
+                _ => w.options.get(i - 1).map(|(s, _)| s.clone()),
+            },
+            _ => None,
+        }
+    }
+
+    /// Moved into the utility section from elsewhere: that slot becomes the
+    /// active one at once (even when the move itself waits for a swap
+    /// chain), and the client is told.
+    fn utility_follows(&self, id: i32, m: &proto::MoveItemStack) -> Result<()> {
+        if m.to_section_id == m.from_section_id || m.to_section_id != inventory::UTILITY {
+            return Ok(());
+        }
+        let changed = {
+            let mut g = self.inner.lock().unwrap();
+            g.players.get_mut(&id).is_some_and(|e| {
+                let c = e.utility_slot != m.to_slot_id;
+                e.utility_slot = m.to_slot_id;
+                c
+            })
+        };
+        if changed {
+            self.send(
+                id,
+                packet(
+                    self::id::SET_ACTIVE_SLOT,
+                    &proto::SetActiveSlot {
+                        inventory_section_id: inventory::UTILITY,
+                        active_slot: m.to_slot_id,
+                    },
+                )?,
+            );
+        }
+        Ok(())
     }
 
     /// `SetActiveSlot` (spec 14): the utility or tools slot in use. The
@@ -3898,19 +3936,6 @@ impl Hub {
         Ok(())
     }
 
-    /// Block keys containing `part`, sorted.
-    pub fn find_blocks(&self, part: &str) -> Vec<String> {
-        let part = part.to_lowercase();
-        let mut v: Vec<String> = self
-            .blocks
-            .keys()
-            .filter(|k| k.contains(&part))
-            .cloned()
-            .collect();
-        v.sort();
-        v
-    }
-
     /// Changes one block for everyone, now and for later joiners.
     pub fn set_block(&self, x: i32, y: i32, z: i32, block: i32) -> Result<()> {
         self.world_step(|hub, g, ground, out| {
@@ -4666,6 +4691,13 @@ impl Hub {
                 hub.tell_key(pid, "server.modules.interaction.failedCheckUnknown", out);
                 return;
             }
+            // The world's gameplay configuration may forbid placing (spec
+            // 15): the item goes back and the block is resent, without a
+            // message.
+            if !hub.gather.world.placement {
+                fail(g, out);
+                return;
+            }
             let cells = hub.rules.cells(block, p.rot);
             // Every cell free: air, a soft (non-solid) block, or an unknown
             // filler.
@@ -4818,6 +4850,17 @@ impl Hub {
     }
 
     /// A `ChatMessage` from a player: a command, or a line for everyone.
+    /// Runs the command lines that arrived since the last tick, in order;
+    /// called at the start of a tick.
+    pub fn run_commands(&self) {
+        let lines = std::mem::take(&mut *self.commands.lock().unwrap());
+        for (id, line) in lines {
+            if let Err(e) = self.command(id, &line) {
+                warn!("command /{line} failed: {e:#}");
+            }
+        }
+    }
+
     pub fn chat(&self, id: i32, payload: &[u8]) -> Result<()> {
         let (m, _) = proto::ChatMessage::decode(payload, 0)?;
         let text = m.message.unwrap_or_default();
@@ -4834,8 +4877,11 @@ impl Hub {
         };
         match text.strip_prefix('/') {
             Some(cmd) => {
+                // As on the official server, a command runs in the world's
+                // tick: its changes go out with that tick's (spec 28).
                 info!("{name} ran /{cmd}");
-                self.command(id, cmd)
+                self.commands.lock().unwrap().push((id, cmd.to_owned()));
+                Ok(())
             }
             None => {
                 info!("[chat] <{name}> {text}");
@@ -4875,16 +4921,31 @@ impl Hub {
     }
 
     fn command(&self, id: i32, line: &str) -> Result<()> {
+        // Words, types and counts are checked by `commands`; what reaches
+        // the match below is a valid line (or one of Aerie's own commands).
+        let line = match crate::commands::handle(line, self) {
+            crate::commands::Outcome::Replies(v) => {
+                for m in v {
+                    self.tell_msg(id, m);
+                }
+                return Ok(());
+            }
+            crate::commands::Outcome::Page(p) => {
+                self.send(id, packet(id::CUSTOM_PAGE, &p)?);
+                return Ok(());
+            }
+            crate::commands::Outcome::Unavailable => {
+                self.tell(id, "That form of the command is not available in Aerie yet");
+                return Ok(());
+            }
+            crate::commands::Outcome::Run(l) => l,
+            crate::commands::Outcome::Other => line.to_owned(),
+        };
+        let line = line.as_str();
         let mut words = line.split_whitespace();
         let name = words.next().unwrap_or("");
         let args: Vec<&str> = words.collect();
         match (name, args.as_slice()) {
-            ("help", _) => self.tell(
-                id,
-                "Commands: /help, /list, /pos, /tp <x> <y> <z>, /gamemode <creative|adventure>, \
-                 /setblock <x> <y> <z> <block>, /fill <x1> <y1> <z1> <x2> <y2> <z2> <block>, \
-                 /blocks <part of a name>, /give <item> [amount], /clear, /perf",
-            ),
             ("perf", _) => {
                 let on = self.toggle_perf(id);
                 self.tell(
@@ -4991,6 +5052,8 @@ impl Hub {
                 let name = Msg::key(&self.book.item_name(&key));
                 let msg = if left > 0 {
                     Msg::key("server.commands.give.insufficientInvSpace").int("quantity", qty)
+                } else if own {
+                    Msg::key("server.commands.give.received").int("quantity", qty)
                 } else {
                     Msg::key("server.commands.give.gave")
                         .text("targetUsername", who)
@@ -4999,44 +5062,6 @@ impl Hub {
                 self.send(id, msg.msg("item", name).packet()?);
             }
             ("entity", ["nameplate", rest @ ..]) => self.entity_nameplate(id, rest)?,
-            ("give", [item, rest @ ..]) => {
-                let qty = rest.first().and_then(|q| q.parse().ok()).unwrap_or(100);
-                // Block keys are matched case-insensitively; anything else is
-                // sent as typed (items that are not blocks).
-                let key = self
-                    .names
-                    .get(&item.to_lowercase())
-                    .cloned()
-                    .unwrap_or_else(|| item.to_string());
-                if !self.book.known(&key) {
-                    self.tell(id, &format!("No item is called {item}"));
-                    return Ok(());
-                }
-                let slot = self.give(id, &key, qty)?;
-                self.tell(id, &format!("Gave {qty} {key} (hotbar slot {})", slot + 1));
-            }
-            ("blocks", [part]) => {
-                let found = self.find_blocks(part);
-                if found.is_empty() {
-                    self.tell(id, &format!("No block matches {part}"));
-                    return Ok(());
-                }
-                let shown: Vec<&str> = found.iter().take(15).map(String::as_str).collect();
-                let more = found.len().saturating_sub(shown.len());
-                self.tell(
-                    id,
-                    &format!(
-                        "{} blocks: {}{}",
-                        found.len(),
-                        shown.join(", "),
-                        if more > 0 {
-                            format!(" and {more} more")
-                        } else {
-                            String::new()
-                        }
-                    ),
-                );
-            }
             ("setblock", [x, y, z, block]) => {
                 let here = self.position(id);
                 match (block_coords(here.as_ref(), [x, y, z]), self.block_id(block)) {
@@ -5073,10 +5098,6 @@ impl Hub {
                     (_, _, None) => self.tell(id, &format!("No block {block}; try /blocks <name>")),
                     _ => self.tell(id, "Usage: /fill <x1> <y1> <z1> <x2> <y2> <z2> <block>"),
                 }
-            }
-            ("list", _) => {
-                let names = self.names();
-                self.tell(id, &format!("{} online: {}", names.len(), names.join(", ")));
             }
             ("pos", _) => match self.position(id) {
                 Some(p) => self.tell(id, &format!("You are at {:.1} {:.1} {:.1}", p.x, p.y, p.z)),
@@ -5154,6 +5175,60 @@ impl Hub {
             _ => self.tell(id, &format!("Unknown command /{name}; try /help")),
         }
         Ok(())
+    }
+}
+
+impl crate::commands::Env for Hub {
+    fn players(&self) -> Vec<String> {
+        self.names()
+    }
+
+    fn block_key(&self, name: &str) -> Option<String> {
+        if self.keys_by_id.is_empty() {
+            return Some(name.to_owned());
+        }
+        if name.eq_ignore_ascii_case("empty") {
+            return Some("Empty".to_owned());
+        }
+        self.names.get(&name.to_lowercase()).cloned().or_else(|| {
+            let l = name.to_lowercase();
+            self.blocks.contains_key(&l).then(|| name.to_owned())
+        })
+    }
+
+    fn item_key(&self, name: &str) -> Option<String> {
+        let key = self
+            .names
+            .get(&name.to_lowercase())
+            .cloned()
+            .unwrap_or_else(|| name.to_owned());
+        self.book.known(&key).then_some(key)
+    }
+
+    fn stat_key(&self, name: &str) -> Option<String> {
+        self.stat_types
+            .types
+            .iter()
+            .find(|t| t.key.eq_ignore_ascii_case(name))
+            .map(|t| t.key.clone())
+    }
+
+    fn block_keys(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.keys_by_id.values().cloned().collect();
+        v.sort();
+        v
+    }
+
+    fn item_keys(&self) -> Vec<String> {
+        self.book.item_keys()
+    }
+
+    fn stat_keys(&self) -> Vec<String> {
+        self.stat_types
+            .types
+            .iter()
+            .map(|t| t.key.clone())
+            .collect()
     }
 }
 
@@ -5366,8 +5441,9 @@ mod tests {
         let (_b, mut rb) = hub.join("Bia", uuid::Uuid::from_u128(2));
         texts(&mut ra);
         texts(&mut rb);
-        hub.chat(a, &chat("/list")).unwrap();
-        assert_eq!(texts(&mut ra), ["2 online: Ana, Bia"]);
+        hub.chat(a, &chat("/who")).unwrap();
+        hub.run_commands();
+        assert_eq!(texts(&mut ra).len(), 1);
         assert!(texts(&mut rb).is_empty());
     }
 
@@ -5376,15 +5452,19 @@ mod tests {
         let hub = Hub::default();
         let (a, mut ra) = hub.join("Ana", uuid::Uuid::from_u128(1));
         hub.chat(a, &chat("/tp ~ 10 ~")).unwrap();
+        hub.run_commands();
         assert_eq!(
             texts(&mut ra).last().unwrap(),
             "Usage: /tp <x> <y> <z> (numbers, or ~ for relative)"
         );
         hub.chat(a, &chat("/tp 1 2 3")).unwrap();
+        hub.run_commands();
         assert_eq!(texts(&mut ra), ["#109", "Teleported to 1.0 2.0 3.0"]);
         hub.chat(a, &chat("/tp ~5 ~ ~-1")).unwrap();
+        hub.run_commands();
         assert_eq!(texts(&mut ra), ["#109", "Teleported to 6.0 2.0 2.0"]);
         hub.chat(a, &chat("/pos")).unwrap();
+        hub.run_commands();
         assert_eq!(texts(&mut ra), ["You are at 6.0 2.0 2.0"]);
     }
 
@@ -5411,14 +5491,17 @@ mod tests {
         let (a, mut ra) = hub.join("Ana", uuid::Uuid::from_u128(1));
         texts(&mut ra);
         hub.chat(a, &chat("/setblock 1 2 3 Rock_Stone")).unwrap();
+        hub.run_commands();
         // The particle at once; the block at the end of the tick.
         assert_eq!(texts(&mut ra), ["#153", "Set 1 2 3 to Rock_Stone"]);
         hub.tick();
         // The block, the column's new height, then the network tick.
         assert_eq!(texts(&mut ra), ["#140", "#183", "#5"]);
         hub.chat(a, &chat("/setblock 1 2 3 Nope")).unwrap();
+        hub.run_commands();
         assert_eq!(texts(&mut ra), ["No block Nope; try /blocks <name>"]);
         hub.chat(a, &chat("/fill 0 0 0 1 1 0 7")).unwrap();
+        hub.run_commands();
         assert_eq!(texts(&mut ra).last().unwrap(), "Filled 4 blocks with 7");
         hub.tick();
         // Four changes in one section and tick: one ServerSetBlocks.
@@ -5426,6 +5509,7 @@ mod tests {
         // Later joiners get them in their chunks.
         assert_eq!(hub.changes_in(0, 0, 0).len(), 5);
         hub.chat(a, &chat("/fill 0 0 0 100 100 100 7")).unwrap();
+        hub.run_commands();
         assert!(texts(&mut ra).last().unwrap().contains("too many"));
     }
 
@@ -5831,6 +5915,16 @@ impl crate::chains::Host for ChainHost<'_> {
         tool: Option<&str>,
         match_tool: bool,
     ) -> bool {
+        // The world's gameplay configuration may forbid gathering and
+        // breaking (spec 12): the chain fails.
+        let world = &self.hub.gather.world;
+        if !(if harvest {
+            world.gathering
+        } else {
+            world.breaking
+        }) {
+            return false;
+        }
         if harvest {
             return self
                 .hub
@@ -6512,6 +6606,11 @@ impl Hub {
         for (_, to, q) in placed {
             self.send(to, q);
         }
+        // A bench or container a chain opened: its window goes out during
+        // the chain's step, before the chain's own answer (spec 21).
+        for (pid, (x, y, z)) in out.uses {
+            let _ = self.open_bench(pid, x, y, z);
+        }
         for (to, p) in out.to {
             self.send(to, p);
         }
@@ -6525,9 +6624,6 @@ impl Hub {
         for (pid, st) in out.throws {
             self.throw_item(pid, st, 1.0);
         }
-        for (pid, (x, y, z)) in out.uses {
-            let _ = self.open_bench(pid, x, y, z);
-        }
         r
     }
 
@@ -6540,6 +6636,7 @@ impl Hub {
     /// before it, then the block and height changes of the tick go out.
     pub fn tick(&self) {
         let now = std::time::Instant::now();
+        self.run_commands();
         let dt = match self.last_tick.lock().unwrap().replace(now) {
             Some(t) => (now - t).as_secs_f32(),
             None => crate::items::DT,
