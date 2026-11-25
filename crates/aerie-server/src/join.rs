@@ -846,8 +846,8 @@ fn built(
     Ok(World { player, map, after })
 }
 
-/// The columns of the built world, nearest to where the player starts
-/// first.
+/// Makes the built terrain around the spawn once, so joins find it in the
+/// cache (spec 05).
 pub fn warm_terrain(generator: &crate::terrain::Generator) {
     for (cx, cz) in terrain_area(SPAWN) {
         for cy in 0..BUILT_SECTIONS {
@@ -856,6 +856,8 @@ pub fn warm_terrain(generator: &crate::terrain::Generator) {
     }
 }
 
+/// The columns of the built world, nearest to where the player starts
+/// first.
 fn terrain_area(start: (f64, f64, f64)) -> Vec<(i32, i32)> {
     let (ccx, ccz) = column_of(start);
     let mut area: Vec<(i32, i32)> = (ccx - BUILT_RADIUS..=ccx + BUILT_RADIUS)
