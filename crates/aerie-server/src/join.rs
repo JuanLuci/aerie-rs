@@ -32,6 +32,7 @@ mod id {
     pub const SERVER_DISCONNECT: u32 = 2;
     pub const PING: u32 = 3;
     pub const PONG: u32 = 4;
+    pub const NETWORK_TICK: u32 = 5;
     pub const SET_CLIENT_ID: u32 = 100;
     pub const SET_GAME_MODE: u32 = 101;
     pub const JOIN_WORLD: u32 = 104;
@@ -50,8 +51,6 @@ mod id {
     pub const STREAM_OPEN_RESPONSE: u32 = 461;
 }
 
-/// How long the built world waits for `ClientReady` before its chunks.
-const BUILT_READY_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long to wait for `ClientReady` before sending the world anyway.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -113,6 +112,14 @@ pub(crate) mod settings_id {
     pub const UPDATE_KNOWN_RECIPES: u32 = 228;
     pub const UPDATE_VISIBLE_HUD: u32 = 230;
     pub const UPDATE_SUN_SETTINGS: u32 = 360;
+    pub const UPDATE_POST_FX: u32 = 361;
+    pub const SET_BLOCK_PLACEMENT_OVERRIDE: u32 = 103;
+    pub const MEMORIES_STATUS: u32 = 118;
+    pub const MEMORIES_COUNT: u32 = 120;
+    pub const ARG_CACHE_INVALIDATION: u32 = 248;
+    pub const WORLD_MAP_SETTINGS: u32 = 240;
+    pub const VOICE_CONFIG: u32 = 452;
+    pub const UPDATE_CLIENT_RULE_VOLUMES: u32 = 473;
 }
 
 /// What the player's own entity is built from: the `Player` model (from the
@@ -201,6 +208,16 @@ fn world_settings(parts: &PlayerParts) -> Result<Vec<Out>> {
                 angle_radians: 0.0,
             },
         )?,
+        Out::new(
+            settings_id::UPDATE_POST_FX,
+            &proto::UpdatePostFxSettings {
+                global_intensity: 0.3,
+                power: 8.0,
+                sunshaft_scale: 4.0,
+                sun_intensity: 0.25,
+                sunshaft_intensity: 0.3,
+            },
+        )?,
     ];
     if let Some(b) = &parts.gameplay {
         v.push(Out {
@@ -236,6 +253,39 @@ fn client_tags() -> Result<Vec<Out>> {
     )?])
 }
 
+/// What follows the join message: the command argument types whose cached
+/// answers the client must drop (the list of players changed), and the world
+/// map settings, sent twice.
+fn map_and_args() -> Result<Vec<Out>> {
+    let settings = || {
+        Out::new(
+            settings_id::WORLD_MAP_SETTINGS,
+            &proto::UpdateWorldMapSettings {
+                enabled: true,
+                allow_teleport_to_coordinates: false,
+                allow_teleport_to_markers: false,
+                allow_show_on_map_toggle: true,
+                allow_compass_tracking_toggle: true,
+                allow_creating_map_markers: true,
+                allow_removing_other_players_markers: true,
+                default_scale: 128.0,
+                min_scale: 32.0,
+                max_scale: 175.0,
+            },
+        )
+    };
+    Ok(vec![
+        Out::new(
+            settings_id::ARG_CACHE_INVALIDATION,
+            &proto::ArgCacheInvalidation {
+                arg_type_ids: Some(vec!["player_ref".to_string()]),
+            },
+        )?,
+        settings()?,
+        settings()?,
+    ])
+}
+
 /// After the player: the HUD, known recipes, time settings and the time
 /// (noon of the first day), then a network tick.
 fn hud_and_time(parts: &PlayerParts) -> Result<Vec<Out>> {
@@ -248,7 +298,24 @@ fn hud_and_time(parts: &PlayerParts) -> Result<Vec<Out>> {
         H::BUILDER_TOOLS_MATERIAL_SLOT_SELECTOR,
     ];
     let visible = (0..=25).map(H).filter(|h| !hidden.contains(h)).collect();
-    let mut v = Vec::new();
+    // Block placement restrictions kept, then the memories feature locked
+    // with nothing collected.
+    let mut v = vec![
+        Out::new(
+            settings_id::SET_BLOCK_PLACEMENT_OVERRIDE,
+            &proto::SetBlockPlacementOverride { enabled: false },
+        )?,
+        Out::new(
+            settings_id::MEMORIES_STATUS,
+            &proto::UpdateMemoriesFeatureStatus {
+                is_feature_unlocked: false,
+            },
+        )?,
+        Out::new(
+            settings_id::MEMORIES_COUNT,
+            &proto::UpdateMemoriesCount { count: 0 },
+        )?,
+    ];
     if let Some(b) = &parts.movement {
         v.push(Out {
             id: settings_id::UPDATE_MOVEMENT_SETTINGS,
@@ -437,14 +504,25 @@ impl Out {
     }
 }
 
-/// What the server sends to put the player in the world.
-struct World {
-    /// Game stream packets before `JoinWorld`.
+/// What goes out before the client answers `JoinWorld`: the game stream
+/// packets that precede it, and `JoinWorld` itself. Cheap to make, so it can
+/// leave at once while the rest of the world is still being built.
+struct Head {
     before: Vec<Out>,
+    /// After the player list, still before `JoinWorld`.
+    late: Vec<Out>,
     join: Out,
-    /// Game stream packets right after `JoinWorld`: the player's own entity
-    /// and state. The client must have its player before chunks arrive.
+}
+
+/// What the server sends to put the player in the world, once the client is
+/// ready for chunks.
+struct World {
+    /// The player's own entity and state on the game stream, in the order
+    /// the official server sends them (spec 05).
     player: Vec<Out>,
+    /// Sent after the join message and the world map clear, before the
+    /// network tick.
+    map: Vec<Out>,
     /// Everything sent once the client is ready for chunks, in order, on
     /// every stream.
     after: Vec<Out>,
@@ -453,7 +531,7 @@ struct World {
 /// The part of a `probe` capture that follows setup: everything after
 /// `WorldLoadFinished`, split around `JoinWorld`. `None` if the capture has
 /// no join.
-fn from_capture(capture: &[(u32, Vec<u8>)]) -> Option<World> {
+fn from_capture(capture: &[(u32, Vec<u8>)]) -> Option<(Head, World)> {
     let start = capture
         .iter()
         .position(|(i, _)| *i == WorldLoadFinished::ID)?
@@ -467,21 +545,31 @@ fn from_capture(capture: &[(u32, Vec<u8>)]) -> Option<World> {
         id: *i,
         payload: p.clone(),
     };
-    Some(World {
-        before: rest[..j].iter().filter(keep).map(out).collect(),
-        join: out(&rest[j]),
-        player: Vec::new(),
-        after: rest[j + 1..].iter().filter(keep).map(out).collect(),
-    })
+    Some((
+        Head {
+            before: rest[..j].iter().filter(keep).map(out).collect(),
+            late: Vec::new(),
+            join: out(&rest[j]),
+        },
+        World {
+            player: Vec::new(),
+            map: Vec::new(),
+            after: rest[j + 1..].iter().filter(keep).map(out).collect(),
+        },
+    ))
 }
 
 /// Test only: the player packets of a capture (game stream, from
 /// `JoinWorld` to the first `SetColumn`), for a built world that cannot make
 /// the player's entity yet. The player is moved to the built spawn.
 fn captured_player(capture: &[(u32, Vec<u8>)]) -> Option<(Vec<Out>, Vec<Out>)> {
-    let w = from_capture(capture)?;
+    let (head, w) = from_capture(capture)?;
     let player_list = |p: &Out| matches!(p.id, id::ADD_TO_PLAYER_LIST | id::PLAYER_LIST_PING);
-    let before = w.before.into_iter().filter(|p| !player_list(p)).collect();
+    let before = head
+        .before
+        .into_iter()
+        .filter(|p| !player_list(p))
+        .collect();
     let mut player = Vec::new();
     for p in w.after {
         if p.id == id::SET_COLUMN {
@@ -653,30 +741,64 @@ enum Captured {
     Extras(Vec<Out>, Vec<Out>),
 }
 
-fn built(
-    client_id: i32,
-    layers: &[i32],
-    generator: Option<&crate::terrain::Generator>,
-    parts: &PlayerParts,
-    captured: Option<Captured>,
-    start: (f64, f64, f64),
-    overlay: Overlay,
-    opaque: &dyn Fn(i32) -> bool,
-    damage: &dyn Fn(i32, i32) -> Vec<(u32, Vec<u8>)>,
-    creative: bool,
-    view_radius: i32,
-) -> Result<World> {
-    let (ccx, ccz) = column_of(start);
+/// What precedes the built world's `JoinWorld`: the client tags (or the
+/// captured packets, test only) and `JoinWorld`.
+fn built_head(captured: &Option<Captured>) -> Result<Head> {
+    let before = match captured {
+        Some(Captured::Player(before, _) | Captured::Extras(before, _)) => before
+            .iter()
+            .map(|p| Out {
+                id: p.id,
+                payload: p.payload.clone(),
+            })
+            .collect(),
+        None => client_tags()?,
+    };
+    let late = match captured {
+        Some(_) => Vec::new(),
+        None => vec![
+            Out::new(
+                settings_id::VOICE_CONFIG,
+                &proto::VoiceConfig {
+                    voice_enabled: true,
+                    codec: proto::VoiceCodec::OPUS,
+                    sample_rate: 48000,
+                    channels: 1,
+                    max_hearing_distance: 32.0,
+                    reference_distance: 4.0,
+                    supports_voice_stream: true,
+                    max_packets_per_second: 60,
+                },
+            )?,
+            Out::new(
+                settings_id::UPDATE_CLIENT_RULE_VOLUMES,
+                &proto::UpdateClientRuleVolumes {
+                    volumes: Some(Vec::new()),
+                },
+            )?,
+        ],
+    };
     let join = Out::new(
         id::JOIN_WORLD,
         &proto::JoinWorld {
-            clear_world: true,
-            fade_in_out: true,
+            clear_world: false,
+            fade_in_out: false,
             world_uuid: WORLD_UUID,
-            min_section_y: None,
-            max_section_y: None,
+            min_section_y: Some(0),
+            max_section_y: Some(9),
         },
     )?;
+    Ok(Head { before, late, join })
+}
+
+fn built(
+    client_id: i32,
+    parts: &PlayerParts,
+    captured: Option<Captured>,
+    start: (f64, f64, f64),
+    creative: bool,
+    view_radius: i32,
+) -> Result<World> {
     let own = || -> Result<Vec<Out>> {
         let mut v = vec![
             Out::new(
@@ -702,14 +824,14 @@ fn built(
         v.extend(hud_and_time(parts)?);
         Ok(v)
     };
-    let (before, player) = match captured {
-        Some(Captured::Player(before, player)) => (before, player),
-        Some(Captured::Extras(before, extras)) => {
+    let (player, map) = match captured {
+        Some(Captured::Player(_, player)) => (player, Vec::new()),
+        Some(Captured::Extras(_, extras)) => {
             let mut p = own()?;
             p.extend(extras);
-            (before, p)
+            (p, map_and_args()?)
         }
-        None => (client_tags()?, own()?),
+        None => (own()?, map_and_args()?),
     };
     let mut after = vec![Out::new(
         id::VIEW_RADIUS,
@@ -717,29 +839,43 @@ fn built(
             value: view_radius * 32,
         },
     )?];
-    // The columns around where the player starts, nearest first.
-    let mut area: Vec<(i32, i32)> = (ccx - BUILT_RADIUS..=ccx + BUILT_RADIUS)
-        .flat_map(|x| (ccz - BUILT_RADIUS..=ccz + BUILT_RADIUS).map(move |z| (x, z)))
-        .collect();
-    area.sort_by_key(|(x, z)| (x - ccx).pow(2) + (z - ccz).pow(2));
-    for (cx, cz) in area {
-        after.extend(column(cx, cz, layers, generator, overlay, opaque)?);
-        after.extend(
-            damage(cx, cz)
-                .into_iter()
-                .map(|(id, payload)| Out { id, payload }),
-        );
-    }
     after.push(Out {
         id: id::CLEAR_WORLD_MAP,
         payload: Vec::new(),
     });
-    Ok(World {
-        before,
-        join,
-        player,
-        after,
-    })
+    Ok(World { player, map, after })
+}
+
+/// The columns of the built world, nearest to where the player starts
+/// first.
+fn terrain_area(start: (f64, f64, f64)) -> Vec<(i32, i32)> {
+    let (ccx, ccz) = column_of(start);
+    let mut area: Vec<(i32, i32)> = (ccx - BUILT_RADIUS..=ccx + BUILT_RADIUS)
+        .flat_map(|x| (ccz - BUILT_RADIUS..=ccz + BUILT_RADIUS).map(move |z| (x, z)))
+        .collect();
+    area.sort_by_key(|(x, z)| (x - ccx).pow(2) + (z - ccz).pow(2));
+    area
+}
+
+/// One column of the built world with the damage of the blocks being broken
+/// in it. Making the whole area is the slow part of a join (about a
+/// second), so it is made column by column after the player's packets are
+/// out, answering the client in between.
+fn terrain_column(
+    (cx, cz): (i32, i32),
+    layers: &[i32],
+    generator: Option<&crate::terrain::Generator>,
+    overlay: Overlay,
+    opaque: &dyn Fn(i32) -> bool,
+    damage: &dyn Fn(i32, i32) -> Vec<(u32, Vec<u8>)>,
+) -> Result<Vec<Out>> {
+    let mut out = column(cx, cz, layers, generator, overlay, opaque)?;
+    out.extend(
+        damage(cx, cz)
+            .into_iter()
+            .map(|(id, payload)| Out { id, payload }),
+    );
+    Ok(out)
 }
 
 /// The two streams the server opens before `JoinWorld`, Chunks first. QUIC
@@ -755,6 +891,32 @@ struct Streams {
 struct Ready {
     chunks: bool,
     gameplay: bool,
+    /// Where the spawn teleport goes, until it is sent.
+    spawn: Option<proto::Position>,
+}
+
+/// Writes one packet on the stream its channel names.
+async fn write_out(g: &mut Game, streams: &mut Streams, id: u32, payload: &[u8]) -> Result<()> {
+    let mut wire = Vec::new();
+    frame::encode(id, payload, &mut wire)?;
+    match table::info(id).map_or(Channel::Default, |i| i.channel) {
+        Channel::Chunks => streams.chunks.write_all(&wire).await?,
+        Channel::WorldMap => streams.world_map.write_all(&wire).await?,
+        _ => g.send.write_all(&wire).await?,
+    }
+    Ok(())
+}
+
+/// Sends what the hub has queued for this player so far, in order.
+async fn flush_outbox(
+    g: &mut Game,
+    streams: &mut Streams,
+    outbox: &mut tokio::sync::mpsc::UnboundedReceiver<world::Packet>,
+) -> Result<()> {
+    while let Ok((id, payload)) = outbox.try_recv() {
+        write_out(g, streams, id, &payload).await?;
+    }
+    Ok(())
 }
 
 /// Counts client packets by id, so movement does not flood the log, and
@@ -942,14 +1104,15 @@ async fn in_world(
         .map_or(SPAWN, |p| (p.x, p.y, p.z));
     let overlay = |x, y, z| hub.changes_in(x, y, z);
     hub.set_ground(layers.clone(), generator.clone());
-    let (world, replayed) = match replay {
-        Some(w) => {
+    let mut pending = None;
+    let (head, mut world, replayed) = match replay {
+        Some((head, world)) => {
             info!(
                 "join: replaying the captured world ({} + {} packets, test only)",
-                w.before.len(),
-                w.after.len()
+                head.before.len() + 1,
+                world.after.len()
             );
-            (w, true)
+            (head, Some(world), true)
         }
         None => {
             if layers.is_empty() {
@@ -969,33 +1132,26 @@ async fn in_world(
                             captured_player(c).map(|(b, p)| Captured::Player(b, p))
                         }
                     });
-            (
-                built(
-                    client_id,
-                    &layers,
-                    generator.as_ref(),
-                    &{
-                        // The player's own stats as saved (spec 17).
-                        let mut p = settings.player.clone();
-                        if let Some(s) = hub.stat_values(client_id) {
-                            p.stats = s;
-                        }
-                        p
-                    },
-                    captured,
-                    start,
-                    &overlay,
-                    &|b| hub.opaque(b),
-                    &|x, z| hub.damage_packets(x, z),
-                    hub.default_creative(),
-                    settings.max_view_radius,
-                )?,
-                false,
-            )
+            let head = built_head(&captured)?;
+            pending = Some(captured);
+            (head, None, false)
         }
     };
 
-    for p in &world.before {
+    // The official server sends the packets before `JoinWorld` and
+    // `JoinWorld` at once; the world follows only when the client is ready
+    // for chunks (spec 05).
+    for p in &head.before {
+        g.send_raw(p.id, &p.payload).await?;
+    }
+    if !replayed {
+        // The player list the hub queued at connect comes right after the
+        // tags (spec 27).
+        while let Ok((id, payload)) = outbox.try_recv() {
+            g.send_raw(id, &payload).await?;
+        }
+    }
+    for p in &head.late {
         g.send_raw(p.id, &p.payload).await?;
     }
     let mut streams = Streams {
@@ -1005,11 +1161,34 @@ async fn in_world(
             .await
             .context("opening the WorldMap stream")?,
     };
-    g.send_raw(world.join.id, &world.join.payload).await?;
+    g.send_raw(head.join.id, &head.join.payload).await?;
     info!("→ JoinWorld to {}", player.username);
-    for p in &world.player {
-        g.send_raw(p.id, &p.payload).await?;
+    let joined_at = std::time::Instant::now();
+    if replayed {
+        hub.announce_join(client_id);
     }
+    let world = match world.take() {
+        Some(w) => w,
+        None => {
+            let captured = pending.take().flatten();
+            let w = built(
+                client_id,
+                &{
+                    // The player's own stats as saved (spec 17).
+                    let mut p = settings.player.clone();
+                    if let Some(s) = hub.stat_values(client_id) {
+                        p.stats = s;
+                    }
+                    p
+                },
+                captured,
+                start,
+                hub.default_creative(),
+                settings.max_view_radius,
+            )?;
+            w
+        }
+    };
 
     let mut ready = Ready::default();
     let mut seen = Seen::default();
@@ -1028,22 +1207,14 @@ async fn in_world(
             Err(e) => warn!("cannot record into {}: {e}", dir.display()),
         }
     }
-    // Chunks go once the client is ready for them. The built world waits
-    // only a little: with a client that waits for chunks first, a long wait
-    // left it on "waiting for chunks" until the timeout. (Not sending at
-    // once: chunks travel on another stream and could arrive before the
-    // player exists.)
-    let wait = if replayed {
-        READY_TIMEOUT
-    } else {
-        BUILT_READY_TIMEOUT
-    };
-    let deadline = tokio::time::Instant::now() + wait;
+    // The player and the chunks go once the client is ready for chunks, as
+    // the official server does (it waits up to 30 s).
+    let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
     while !ready.chunks {
         let f = match tokio::time::timeout_at(deadline, g.next()).await {
             Ok(f) => f?,
             Err(_) => {
-                warn!("no ClientReady after {wait:?}: sending the world anyway");
+                warn!("no ClientReady after {READY_TIMEOUT:?}: sending the world anyway");
                 break;
             }
         };
@@ -1053,37 +1224,116 @@ async fn in_world(
     }
 
     let mut sent = [0usize; 4];
-    for p in &world.after {
-        let mut wire = Vec::new();
-        frame::encode(p.id, &p.payload, &mut wire)?;
-        let ch = p.channel();
-        match ch {
-            Channel::Chunks => streams.chunks.write_all(&wire).await?,
-            Channel::WorldMap => streams.world_map.write_all(&wire).await?,
-            _ => g.send.write_all(&wire).await?,
+    let mut after = world.after;
+    if replayed {
+        for p in &after {
+            write_out(g, &mut streams, p.id, &p.payload).await?;
+            sent[p.channel() as usize] += 1;
         }
-        sent[ch as usize] += 1;
+        after.clear();
+        hub.send_inventory(client_id)?;
+        hub.send_active_slots(client_id)?;
+        hub.enter_world(
+            client_id,
+            seen_by_others(client_id, &settings.player, &player.username, start)?,
+        )?;
+    } else {
+        // The view radius first, then the player up to its game mode, its
+        // inventory and active slots, the rest of the settings and the
+        // time, the join message, the world map, a network tick; the
+        // chunks follow (spec 05).
+        let mut chunks = after.into_iter();
+        if let Some(v) = chunks.next() {
+            write_out(g, &mut streams, v.id, &v.payload).await?;
+        }
+        let mut player_packets = world.player;
+        let split = player_packets
+            .iter()
+            .position(|p| p.id == id::SET_GAME_MODE)
+            .map_or(player_packets.len(), |i| i + 1);
+        let rest = player_packets.split_off(split);
+        for p in &player_packets {
+            write_out(g, &mut streams, p.id, &p.payload).await?;
+        }
+        hub.send_inventory(client_id)?;
+        hub.send_active_slots(client_id)?;
+        flush_outbox(g, &mut streams, outbox).await?;
+        let mut rest: Vec<Out> = rest;
+        let tick = rest.pop_if(|p| p.id == id::NETWORK_TICK);
+        for p in &rest {
+            write_out(g, &mut streams, p.id, &p.payload).await?;
+        }
+        hub.announce_join(client_id);
+        flush_outbox(g, &mut streams, outbox).await?;
+        for clear in chunks {
+            write_out(g, &mut streams, clear.id, &clear.payload).await?;
+        }
+        for p in &world.map {
+            write_out(g, &mut streams, p.id, &p.payload).await?;
+            if p.id == settings_id::ARG_CACHE_INVALIDATION {
+                // The official server tells everyone, once the player is in.
+                hub.send_others(client_id, &(p.id, p.payload.clone()));
+            }
+        }
+        if let Some(t) = tick {
+            write_out(g, &mut streams, t.id, &t.payload).await?;
+        }
+        hub.send_changed_inventory(client_id)?;
+        hub.enter_world(
+            client_id,
+            seen_by_others(client_id, &settings.player, &player.username, start)?,
+        )?;
+        // The spawn teleport goes out when the client says it is ready for
+        // gameplay: now if it already did, else with that packet.
+        ready.spawn = Some(proto::Position {
+            x: start.0,
+            y: start.1,
+            z: start.2,
+        });
+        if ready.gameplay
+            && let Some(at) = ready.spawn.take()
+        {
+            hub.teleport(client_id, at)?;
+        }
+        // The terrain last: it takes the longest to make. The client is
+        // answered between columns.
+        let started = std::time::Instant::now();
+        let mut build_t = Duration::ZERO;
+        for at in terrain_area(start) {
+            while let Ok(f) = tokio::time::timeout(Duration::ZERO, g.next()).await {
+                if !client_packet(&f?, hub, client_id, &mut ready, &mut seen) {
+                    return Ok(());
+                }
+            }
+            let t0 = std::time::Instant::now();
+            let out = terrain_column(
+                at,
+                &layers,
+                generator.as_ref(),
+                &overlay,
+                &|b| hub.opaque(b),
+                &|x, z| hub.damage_packets(x, z),
+            )?;
+            build_t += t0.elapsed();
+            for p in &out {
+                write_out(g, &mut streams, p.id, &p.payload).await?;
+                sent[p.channel() as usize] += 1;
+            }
+            flush_outbox(g, &mut streams, outbox).await?;
+        }
+        info!(
+            "terrain sent in {:?} (making it {:?})",
+            started.elapsed(),
+            build_t
+        );
     }
     info!(
-        "world sent: {} game, {} chunk and {} map packets",
-        sent[0], sent[1], sent[2]
+        "world sent: {} game, {} chunk and {} map packets (client ready after {:?})",
+        sent[0],
+        sent[1],
+        sent[2],
+        joined_at.elapsed()
     );
-    hub.send_inventory(client_id)?;
-    hub.send_active_slots(client_id)?;
-    hub.enter_world(
-        client_id,
-        seen_by_others(client_id, &settings.player, &player.username, start)?,
-    )?;
-    if !replayed {
-        hub.teleport(
-            client_id,
-            proto::Position {
-                x: start.0,
-                y: start.1,
-                z: start.2,
-            },
-        )?;
-    }
 
     // In the world: ping, deliver what other players cause, and read the client.
     let mut report = tokio::time::interval(Duration::from_secs(10));
@@ -1109,13 +1359,7 @@ async fn in_world(
                 }
             }
             Some((id, payload)) = outbox.recv() => {
-                let mut wire = Vec::new();
-                frame::encode(id, &payload, &mut wire)?;
-                match table::info(id).map_or(Channel::Default, |i| i.channel) {
-                    Channel::Chunks => streams.chunks.write_all(&wire).await?,
-                    Channel::WorldMap => streams.world_map.write_all(&wire).await?,
-                    _ => g.send.write_all(&wire).await?,
-                }
+                write_out(g, &mut streams, id, &payload).await?;
             }
             _ = stream_tick.tick(), if !replayed => {
                 // Columns around the player that it does not have yet, the
@@ -1206,6 +1450,11 @@ fn client_packet(f: &Frame, hub: &Hub, client_id: i32, ready: &mut Ready, seen: 
             if flags & 2 != 0 && !ready.gameplay {
                 ready.gameplay = true;
                 hub.player_ready(client_id);
+                if let Some(at) = ready.spawn.take()
+                    && let Err(e) = hub.teleport(client_id, at)
+                {
+                    warn!("cannot send the spawn teleport: {e:#}");
+                }
                 info!("← ClientReady: ready for gameplay");
             }
         }
@@ -1225,32 +1474,36 @@ mod tests {
 
     #[test]
     fn built_world_encodes() {
-        let w = built(
-            1,
-            &terrain_layers(|k| Some(k.len() as i32)),
-            None,
-            &PlayerParts::default(),
-            None,
-            SPAWN,
-            &|_, _, _| Vec::new(),
-            &|_| true,
-            &|_, _| Vec::new(),
-            false,
-            32,
-        )
-        .unwrap();
-        let solid = w
-            .after
+        let w = built(1, &PlayerParts::default(), None, SPAWN, false, 32).unwrap();
+        let layers = terrain_layers(|k| Some(k.len() as i32));
+        let terrain: Vec<Out> = terrain_area(SPAWN)
+            .into_iter()
+            .flat_map(|at| {
+                terrain_column(
+                    at,
+                    &layers,
+                    None,
+                    &|_, _, _| Vec::new(),
+                    &|_| true,
+                    &|_, _| Vec::new(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let solid = terrain
             .iter()
             .filter(|p| p.id == id::SET_CHUNK && p.payload.len() > 100)
             .count();
         let side = (2 * BUILT_RADIUS + 1) as usize;
         assert_eq!(solid, side * side * 2, "two solid sections per column");
-        for p in std::iter::once(&w.join).chain(&w.after) {
+        for p in std::iter::once(&built_head(&None).unwrap().join)
+            .chain(&w.after)
+            .chain(&terrain)
+        {
             let mut wire = Vec::new();
             frame::encode(p.id, &p.payload, &mut wire).unwrap();
         }
-        assert!(w.after.iter().any(|p| p.channel() == Channel::Chunks));
+        assert!(terrain.iter().any(|p| p.channel() == Channel::Chunks));
         // The tintmap layout matches the captured sizes (51 colours: 1490
         // bytes) at one colour.
         assert_eq!(uniform_tint(GRASS_TINT).len(), 2 + 4 + 4 + 1280);
@@ -1268,9 +1521,9 @@ mod tests {
             (100, vec![5]),
             (2, vec![]),
         ];
-        let w = from_capture(&c).unwrap();
-        assert_eq!(w.before.iter().map(|p| p.id).collect::<Vec<_>>(), [238]);
-        assert_eq!(w.join.payload, [3]);
+        let (head, w) = from_capture(&c).unwrap();
+        assert_eq!(head.before.iter().map(|p| p.id).collect::<Vec<_>>(), [238]);
+        assert_eq!(head.join.payload, [3]);
         assert_eq!(w.after.iter().map(|p| p.id).collect::<Vec<_>>(), [131, 100]);
     }
 }

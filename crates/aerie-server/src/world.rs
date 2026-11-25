@@ -1581,8 +1581,17 @@ impl Hub {
             );
             id
         };
-        self.broadcast_msg(world_line("server.general.playerJoinedWorld", name));
         (id, rx)
+    }
+
+    /// The join message, to everyone: the joiner's connection calls it where
+    /// the official server sends it, after the time packets (spec 05).
+    pub fn announce_join(&self, id: i32) {
+        let name = match self.inner.lock().unwrap().players.get(&id) {
+            Some(e) => e.name.clone(),
+            None => return,
+        };
+        self.broadcast_msg(world_line("server.general.playerJoinedWorld", &name));
     }
 
     /// How many players are in the world.
@@ -3878,6 +3887,25 @@ impl Hub {
         Ok(())
     }
 
+    /// Sends the sections that changed since the last update now instead of
+    /// at the next tick: at join, the tools resend (spec 14) goes out before
+    /// the player's entity, as the official server's order has it.
+    pub fn send_changed_inventory(&self, id: i32) -> Result<()> {
+        let p = {
+            let mut g = self.inner.lock().unwrap();
+            let Some(e) = g.players.get_mut(&id) else {
+                return Ok(());
+            };
+            if e.inv_dirty.is_empty() {
+                return Ok(());
+            }
+            let which: Vec<i32> = std::mem::take(&mut e.inv_dirty).into_iter().collect();
+            packet(id::UPDATE_PLAYER_INVENTORY, &e.inv.packet_of(&which))?
+        };
+        self.send(id, p);
+        Ok(())
+    }
+
     /// The player's active slots (hotbar, utility, tools), as the official
     /// server tells them right after the inventory at join: chains name
     /// them and are refused when they differ (spec 18).
@@ -4160,6 +4188,15 @@ impl Hub {
     pub fn send(&self, id: i32, p: Packet) {
         if let Some(e) = self.inner.lock().unwrap().players.get(&id) {
             let _ = e.outbox.send(p);
+        }
+    }
+
+    /// The same packet to every player but one.
+    pub fn send_others(&self, id: i32, p: &Packet) {
+        for (other, e) in &self.inner.lock().unwrap().players {
+            if *other != id {
+                let _ = e.outbox.send(p.clone());
+            }
         }
     }
 
