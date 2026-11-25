@@ -128,6 +128,20 @@ impl Generator {
 
     /// Section (cx, cy, cz).
     pub fn section(&self, cx: i32, cy: i32, cz: i32) -> Section {
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<(u64, i32, i32, i32), Cached>>,
+        > = std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let key = (self.seed, cx, cy, cz);
+        if let Some(c) = cache.lock().unwrap().get(&key) {
+            return unpack(c);
+        }
+        let s = self.make_section(cx, cy, cz);
+        cache.lock().unwrap().insert(key, pack(&s));
+        s
+    }
+
+    fn make_section(&self, cx: i32, cy: i32, cz: i32) -> Section {
         let mut s = Section::default();
         let (bx, by, bz) = (cx * SIZE as i32, cy * SIZE as i32, cz * SIZE as i32);
         for z in 0..SIZE {
@@ -149,6 +163,55 @@ impl Generator {
         }
         s
     }
+}
+
+/// A generated section as the cache keeps it: one id for a uniform section,
+/// else its distinct ids and one byte per block (the generator uses a few ids).
+enum Cached {
+    Uniform(i32),
+    Mixed { palette: Vec<i32>, idx: Box<[u8]> },
+}
+
+fn pack(s: &Section) -> Cached {
+    let first = s.blocks[0];
+    if s.blocks.iter().all(|&b| b == first) {
+        return Cached::Uniform(first);
+    }
+    let mut palette = Vec::new();
+    let mut idx = Vec::with_capacity(s.blocks.len());
+    for &b in &s.blocks {
+        let pos = match palette.iter().position(|&x| x == b) {
+            Some(i) => i,
+            None => {
+                let i = palette.len();
+                palette.push(b);
+                i
+            }
+        };
+        debug_assert!(pos < 256, "too many block ids in one section");
+        idx.push(pos as u8);
+    }
+    Cached::Mixed {
+        palette,
+        idx: idx.into_boxed_slice(),
+    }
+}
+
+fn unpack(c: &Cached) -> Section {
+    let mut s = Section::default();
+    match c {
+        Cached::Uniform(b) => {
+            if *b != 0 {
+                s.blocks.fill(*b);
+            }
+        }
+        Cached::Mixed { palette, idx } => {
+            for (dst, &i) in s.blocks.iter_mut().zip(idx.iter()) {
+                *dst = palette[i as usize];
+            }
+        }
+    }
+    s
 }
 
 #[cfg(test)]
@@ -194,5 +257,26 @@ mod tests {
         // Sections agree with blocks.
         let s = g.section(3, 2, -2);
         assert_eq!(s.blocks[index(5, 1, 7)], g.block(96 + 5, 65, -64 + 7));
+    }
+
+    #[test]
+    fn section_cache_returns_equal_sections() {
+        let g = generator();
+        let first = g.section(1, 2, 3);
+        let second = g.section(1, 2, 3);
+        let direct = g.make_section(1, 2, 3);
+        assert_eq!(first.blocks, second.blocks);
+        assert_eq!(first.blocks, direct.blocks);
+    }
+
+    #[test]
+    fn packed_sections_unpack_to_the_same_blocks() {
+        let g = generator();
+        let mixed = g.make_section(0, 2, 0);
+        assert!(matches!(pack(&mixed), Cached::Mixed { .. }));
+        assert_eq!(unpack(&pack(&mixed)), mixed);
+        let air = Section::default();
+        assert!(matches!(pack(&air), Cached::Uniform(0)));
+        assert_eq!(unpack(&pack(&air)), air);
     }
 }

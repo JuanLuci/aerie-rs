@@ -142,11 +142,21 @@ was the 800 ms Aerie used to spend before `JoinWorld`), so the first chunks
 arrive after the in-world packets and the last about a second and a half
 later. The official server's chunks also stream over time.
 
+The generated sections are kept for the server's lifetime, keyed by the
+seed and the section's position, in a compact form (one id for a uniform
+section, else its few distinct ids and one byte per block), and the area
+around the spawn is made in the background when the server starts. A join
+then only builds and encodes its columns: about 0.6 s instead of 1.0 s of
+work in a `fast` build, the terrain out about 1.0 s after the player's
+packets instead of 1.4 s.
+
 The spawn teleport waits for the gameplay flag of `ClientReady`; the list
 update of spec 27 comes with it.
 
 ### Not done yet
 
+- Columns are still built and encoded at every join (about 0.6 s); the
+  encoded columns without player changes could be kept too (#77).
 - `CommandTreeSync` (the command tree, about 250 KB), the builder tools'
   sound set, the spawn particles (from the gameplay configuration's spawn
   settings) and `BuilderToolsEnabledTools` after the teleport are not sent.
