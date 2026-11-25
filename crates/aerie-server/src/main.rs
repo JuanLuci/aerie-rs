@@ -485,6 +485,17 @@ async fn main() -> Result<()> {
                 }
             })?;
     }
+    if !settings.flat {
+        if let Some(palette) = crate::terrain::Palette::new(|k| settings.hub.block_id(k)) {
+            let generator = crate::terrain::Generator {
+                seed: settings.seed,
+                palette,
+            };
+            std::thread::spawn(move || {
+                crate::join::warm_terrain(&generator);
+            });
+        }
+    }
     let mode = if settings.account.is_some() {
         "authenticated"
     } else {

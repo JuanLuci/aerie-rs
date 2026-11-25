@@ -128,6 +128,20 @@ impl Generator {
 
     /// Section (cx, cy, cz).
     pub fn section(&self, cx: i32, cy: i32, cz: i32) -> Section {
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<(u64, i32, i32, i32), Section>>,
+        > = std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let key = (self.seed, cx, cy, cz);
+        if let Some(s) = cache.lock().unwrap().get(&key) {
+            return s.clone();
+        }
+        let s = self.make_section(cx, cy, cz);
+        cache.lock().unwrap().insert(key, s.clone());
+        s
+    }
+
+    fn make_section(&self, cx: i32, cy: i32, cz: i32) -> Section {
         let mut s = Section::default();
         let (bx, by, bz) = (cx * SIZE as i32, cy * SIZE as i32, cz * SIZE as i32);
         for z in 0..SIZE {
@@ -194,5 +208,15 @@ mod tests {
         // Sections agree with blocks.
         let s = g.section(3, 2, -2);
         assert_eq!(s.blocks[index(5, 1, 7)], g.block(96 + 5, 65, -64 + 7));
+    }
+
+    #[test]
+    fn section_cache_returns_equal_sections() {
+        let g = generator();
+        let first = g.section(1, 2, 3);
+        let second = g.section(1, 2, 3);
+        let direct = g.make_section(1, 2, 3);
+        assert_eq!(first.blocks, second.blocks);
+        assert_eq!(first.blocks, direct.blocks);
     }
 }
